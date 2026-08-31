@@ -1,0 +1,91 @@
+import type {
+  CacheProduct,
+  HardwareBarcodeEvent,
+  HardwareDeviceStatus,
+  HardwareGateway,
+  HardwareTransactionRequest,
+  OfflineTransactionRecord,
+  TransactionConfirmation,
+  TransactionRejection,
+  Unsubscribe
+} from '../hardware/hardware-gateway'
+
+/**
+ * DEVELOPMENT/TEST ONLY. This class must never be selected in a packaged build.
+ * It exists to exercise desktop boundaries without pretending to be real hardware.
+ */
+export class MockHardwareGateway implements HardwareGateway {
+  private connected = false
+  private readonly barcodeListeners = new Set<(event: HardwareBarcodeEvent) => void>()
+  private readonly transactionListeners = new Set<
+    (request: HardwareTransactionRequest) => void
+  >()
+  private offlineTransactions: OfflineTransactionRecord[] = []
+
+  constructor() {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('MockHardwareGateway is forbidden in production builds.')
+    }
+  }
+
+  async connect(): Promise<void> {
+    this.connected = true
+  }
+
+  async disconnect(): Promise<void> {
+    this.connected = false
+  }
+
+  async getDeviceStatus(): Promise<HardwareDeviceStatus> {
+    return {
+      deviceId: 'DEVELOPMENT-MOCK-ONLY',
+      connection: this.connected ? 'CONNECTED' : 'DISCONNECTED',
+      firmwareVersion: 'mock'
+    }
+  }
+
+  onBarcode(listener: (event: HardwareBarcodeEvent) => void): Unsubscribe {
+    this.barcodeListeners.add(listener)
+    return () => this.barcodeListeners.delete(listener)
+  }
+
+  onTransactionRequest(listener: (request: HardwareTransactionRequest) => void): Unsubscribe {
+    this.transactionListeners.add(listener)
+    return () => this.transactionListeners.delete(listener)
+  }
+
+  async confirmTransaction(_result: TransactionConfirmation): Promise<void> {
+    this.assertConnected()
+  }
+
+  async rejectTransaction(_rejection: TransactionRejection): Promise<void> {
+    this.assertConnected()
+  }
+
+  async synchronizeCache(_products: readonly CacheProduct[]): Promise<void> {
+    this.assertConnected()
+  }
+
+  async retrieveOfflineTransactions(): Promise<readonly OfflineTransactionRecord[]> {
+    this.assertConnected()
+    return this.offlineTransactions.map((record) => ({ ...record }))
+  }
+
+  emitBarcodeForTest(event: HardwareBarcodeEvent): void {
+    this.assertConnected()
+    this.barcodeListeners.forEach((listener) => listener({ ...event }))
+  }
+
+  emitTransactionRequestForTest(request: HardwareTransactionRequest): void {
+    this.assertConnected()
+    this.transactionListeners.forEach((listener) => listener({ ...request }))
+  }
+
+  setOfflineTransactionsForTest(records: readonly OfflineTransactionRecord[]): void {
+    this.offlineTransactions = records.map((record) => ({ ...record }))
+  }
+
+  private assertConnected(): void {
+    if (!this.connected) throw new Error('Development mock hardware is disconnected.')
+  }
+}

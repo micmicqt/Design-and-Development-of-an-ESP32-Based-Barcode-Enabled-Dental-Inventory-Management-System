@@ -1,0 +1,27 @@
+{
+  "name": "dental-inventory-system",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ESP32-based barcode-enabled dental inventory management system",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "npm run dev --workspace @dental-inventory/desktop",
+    "build": "npm run build --workspace @dental-inventory/protocol && npm run build --workspace @dental-inventory/desktop",
+    "build:desktop": "npm run build --workspace @dental-inventory/desktop",
+    "firmware:build": "pio run --project-dir firmware",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "allowScripts": {
+    "better-sqlite3": false,
+    "esbuild@0.25.12": true,
+    "esbuild@0.28.2": true
+  }
+}

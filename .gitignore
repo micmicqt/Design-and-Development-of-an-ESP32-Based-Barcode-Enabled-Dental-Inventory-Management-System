@@ -1,0 +1,41 @@
+# Node / Electron
+node_modules/
+npm-debug.log*
+dist/
+out/
+release/
+coverage/
+*.tsbuildinfo
+
+# PlatformIO and local Python tooling
+.pio/
+firmware/.pio/
+.platformio-core/
+.venv/
+.venv-*/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+firmware/include/secrets.h
+*.pem
+*.key
+
+# Runtime data
+.runtime/
+*.db
+*.db-shm
+*.db-wal
+logs/
+images/
+
+# Editors / operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary review artifacts
+.tmp*/
+tmp/

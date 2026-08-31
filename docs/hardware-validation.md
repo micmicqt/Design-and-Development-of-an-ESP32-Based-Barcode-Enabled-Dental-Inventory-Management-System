@@ -1,0 +1,144 @@
+# Hardware Validation Gate
+
+Status: **unresolved and blocking hardware activation**
+
+This document records what can be read from the supplied final PCB schematic and what must still be proven before Phase 2 firmware may initialize physical hardware. A GPIO appearing in the schematic is not evidence that its voltage, direction, active level, connector orientation, or application meaning is safe or correct.
+
+Phase 1 firmware must not call `pinMode`, `digitalWrite`, `Wire.begin`, `SPI.begin`, `SD.begin`, RTC/LCD initialization, scanner initialization, button initialization, LED-logic initialization, or Wi-Fi initialization. It initializes only the required development `Serial` log and prints that hardware activation is disabled.
+
+> Safety note: the required ESP32 development `Serial` log uses UART0 on GPIO1/GPIO3, which are also the scanner nets visible in the schematic. Until the scanner direction and USB-UART interaction are resolved, boot Phase 1 firmware only on a bare/disconnected development board or with the scanner UART physically disconnected.
+
+## Schematic nets recorded in Phase 1
+
+These names describe schematic connectivity only; they do not authorize peripheral activation.
+
+| Schematic function | ESP32 net | Phase 1 status |
+|---|---:|---|
+| Shared I2C SDA for LCD and DS3231 | GPIO21 | Pin visible; voltage and pull-ups unverified |
+| Shared I2C SCL for LCD and DS3231 | GPIO22 | Pin visible; voltage and pull-ups unverified |
+| MicroSD CS | GPIO5 | Pin visible; module interface and strapping behavior unverified |
+| MicroSD SCK | GPIO18 | Pin visible; module interface unverified |
+| MicroSD MOSI | GPIO23 | Pin visible; module interface unverified |
+| MicroSD MISO | GPIO19 | Pin visible; module interface unverified |
+| SW1 net | GPIO14 | Electrical behavior and application meaning unconfirmed |
+| SW2 net | GPIO12 | Electrical behavior, boot-strapping behavior, and application meaning unconfirmed |
+| Two-indicator control A | GPIO32 | D1/D2 semantic assignment and polarity unconfirmed |
+| Two-indicator control B | GPIO33 | D1/D2 semantic assignment and polarity unconfirmed |
+| Three-indicator control A | GPIO26 | D3/D4/D5 semantic assignment and polarity unconfirmed |
+| Three-indicator control B | GPIO27 | D3/D4/D5 semantic assignment and polarity unconfirmed |
+| Scanner schematic U0TXD net | GPIO1 | Connector direction/crossing and USB-UART interaction unconfirmed |
+| Scanner schematic U0RXD net | GPIO3 | Connector direction/crossing and USB-UART interaction unconfirmed |
+
+The raster schematic appears to connect ESP32 U0TXD/GPIO1 to a scanner connector pin labelled `TX`, and U0RXD/GPIO3 to a pin labelled `RX`. Connector labels alone do not establish whether they describe the scanner signals or the host signals. Confirm this against the exact GM65 module/adapter documentation and physical connector orientation; do not assume that UART is correctly crossed.
+
+## External LED logic trace to verify
+
+The following is only a provisional visual trace of the supplied schematic, not an approved LED mapping. It must be checked against the native schematic/netlist and then confirmed with an unpowered continuity test:
+
+- D1 logic input appears to be `GPIO32 AND GPIO33`.
+- D2 logic input appears to be `GPIO32 AND NOT GPIO33`.
+- D3 logic input appears to be `GPIO26 AND NOT GPIO27`.
+- D4 logic input appears to be `NOT GPIO26 AND GPIO27`.
+- D5 logic input appears to be `GPIO26 AND GPIO27`.
+
+Even if those equations are confirmed, the following meanings remain unknown:
+
+- whether D1 or D2 represents SUCCESS versus ERROR;
+- whether D3, D4, or D5 represents HIGH, LOW, or EMPTY;
+- whether a high gate output visibly turns each LED on, considering LED orientation and the common rail;
+- the safe/reset state required on each ESP32 control input.
+
+No `setStockStatus` or `setTransactionStatus` truth table may be finalized until all of those facts are recorded from the assembled PCB.
+
+## UART / GM65 questions
+
+- What is the exact GM65 scanner module and adapter-board part number and datasheet revision?
+- Do the connector labels `TX` and `RX` name signals driven by the scanner, or signals expected from the host?
+- Is the PCB UART crossed correctly (scanner TX to ESP32 RX and scanner RX to ESP32 TX)?
+- What voltage levels does the actual scanner use on TX and RX? Are they 3.3 V TTL, 5 V TTL, RS-232, or level-shifted on the module?
+- What supply voltage and peak current does the scanner require?
+- What baud rate, data bits, parity, stop bits, terminator, encoding, and scanner output mode are configured?
+- What maximum barcode length and inter-byte/frame timeout should firmware support?
+- Can UART0 be shared safely with the DevKitC USB-UART bridge during programming, reset, logging, and normal scanning?
+- Does an attached scanner drive GPIO3 or contend with GPIO1 during ESP32 flashing or boot messages?
+- Is a connector, jumper, resistor, or alternate UART routing required to isolate the scanner during upload/debug?
+
+## SW1 / SW2 questions
+
+- Which physical switch is RESTOCK and which is CHECKOUT? Do not infer this from SW1/SW2 numbering.
+- The supplied raster appears to connect the switch common rail to 5 V. Is that visual trace correct in the native schematic and on the PCB?
+- What voltage reaches GPIO14 and GPIO12 in both released and pressed states? Measure this before connecting/powering an ESP32 input.
+- Are external pull-up or pull-down resistors present? None are clearly established by the supplied drawing.
+- What active level should firmware use, and are the inputs ever floating?
+- Is hardware debouncing present, or must firmware debounce the buttons?
+- GPIO12 is an ESP32 boot-strapping pin. Can either switch state or its surrounding circuit alter the flash-voltage strap or prevent a reliable boot?
+- What happens if a switch is held during reset, power-up, flashing, or brownout recovery?
+- Is input protection or level shifting required before the switch nets are safe for the ESP32?
+
+Until these questions are answered, neither switch may be configured even as an input with an internal pull resistor.
+
+## D1-D5 / 74LS04 / 74LS08 questions
+
+- Confirm the provisional Boolean trace using the native schematic/netlist and unpowered PCB continuity measurements.
+- Map D1-D5 physically and visibly to HIGH, LOW, EMPTY, SUCCESS, and ERROR.
+- Confirm LED polarity, the common LED rail, and whether a logic-high or logic-low gate output illuminates each LED.
+- Confirm the 74LS04 and 74LS08 supply voltage on the assembled PCB.
+- Verify that 3.3 V ESP32 outputs meet the actual LS-family input thresholds with adequate margin in all operating conditions.
+- Verify that each ESP32/reset/floating state produces a safe, deterministic visible indication.
+- Verify that every unused TTL input is biased to a defined level.
+- Check the output-current budget. The shown 220-ohm LED resistors and LS-family high-level source-current capability must be evaluated against the exact LED wiring and component datasheets.
+- Confirm that each logic IC has local decoupling and that switching noise does not reset the ESP32 or corrupt the SD card.
+
+## Shared I2C / LCD / DS3231 questions
+
+- What are the exact LCD backpack/controller and DS3231 module part numbers?
+- What supply voltage is used by each module on the assembled PCB?
+- Which modules contain SDA/SCL pull-ups, what are their values, and to which voltage rail are they connected?
+- Measure the idle SDA/SCL high voltage. It must be safe for the ESP32; do not assume a 5 V-powered LCD backpack has 3.3 V-safe pull-ups.
+- Is a bidirectional I2C level shifter required?
+- What are the actual LCD and RTC I2C addresses? Do not assume a common LCD address such as `0x27` or `0x3F`.
+- Is the total pull-up resistance/bus capacitance appropriate, and what bus speed is reliable with the installed wiring?
+- Is the DS3231 oscillator running, is its backup battery installed with correct chemistry/polarity, and is its time valid after loss of main power?
+- How will an invalid RTC time be detected, displayed, and corrected without substituting PC time silently?
+
+## MicroSD / SPI questions
+
+- Is MOD2 a bare socket, a 3.3 V breakout, or a nominal 5 V module with an onboard regulator and level shifting?
+- What voltage is connected to its VCC pin, and are every input/output level and the MISO high level safe for ESP32?
+- Verify CS/SCK/MOSI/MISO connectivity and connector numbering against the physical module.
+- GPIO5 is an ESP32 strapping pin. Does the module or card pull it to a level that can affect boot?
+- Is CS held inactive deterministically during reset and when no card is installed?
+- What SPI frequency and mode are reliable for the exact module, card, trace length, and supply?
+- Is card-detect available, and what happens on removal or insertion during a write?
+- Are local bulk and high-frequency decoupling adequate for SD-card current transients?
+- Define and bench-test power-loss behavior for cache replacement, pending-record append, recovery, and archive operations before relying on offline inventory.
+
+## ESP32 board, power, and PCB questions
+
+- Confirm the exact ESP32-DevKitC/module revision, pin count, footprint orientation, and that every schematic symbol pin maps to the intended physical header pin.
+- Obtain the native final schematic, PCB layout, bill of materials, and netlist revision; the supplied raster image is insufficient for final sign-off.
+- Confirm common ground and every 5 V/3.3 V rail connection with the board unpowered first.
+- Confirm power-source priority and protection when USB and the external 5 V supply are connected together. Rule out regulator backfeed and USB-host backfeed.
+- Calculate and measure peak/steady current for the ESP32 Wi-Fi radio, scanner, LCD/backlight, RTC, SD card, and TTL/LED network.
+- Verify regulator capacity, voltage drop, brownout margin, wiring/trace current, and heat.
+- Verify bulk capacitance and one local bypass capacitor per IC/module as required by the component datasheets.
+- Record GPIO voltage at reset, boot, upload, and application start. Visible logic circuitry must remain safe before firmware takes control.
+- Check all ESP32 strapping pins used by the PCB, especially GPIO5 and GPIO12, under every connected-module and switch state.
+- Confirm ESD protection, connector polarity/keying, and whether long external wires need filtering or transient protection.
+
+## Evidence required to close the gate
+
+Before any Phase 2 hardware activation, update this document with all of the following:
+
+1. Native schematic/PCB revision identifier and approved netlist.
+2. Exact manufacturer part numbers and datasheets for the DevKitC, GM65 assembly, LCD backpack, DS3231 module, MicroSD module, 74LS04/74LS08, and LEDs.
+3. Unpowered continuity results for UART, switches, I2C, SPI, logic controls, power, and ground.
+4. Powered voltage measurements made with the ESP32 or vulnerable peripheral disconnected where necessary.
+5. Confirmed SW1/SW2 and D1-D5 application mappings.
+6. Confirmed UART direction, voltage, framing, and upload/debug isolation procedure.
+7. Confirmed I2C pull-up voltage, addresses, and safe bus arrangement.
+8. Confirmed SD voltage/level shifting and boot-safe CS behavior.
+9. Reviewed power budget, backfeed protection, decoupling, boot straps, and reset-state behavior.
+10. A signed hardware configuration/truth table that can replace the unresolved names in `firmware/include/hardware_config.h`.
+
+Only after this evidence is reviewed should a later phase add peripheral initialization or drive any GPIO.

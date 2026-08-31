@@ -1,0 +1,350 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://dental-inventory.local/schema/protocol-message-v1.json",
+  "title": "Dental Inventory Protocol v1 Message",
+  "oneOf": [
+    { "$ref": "#/$defs/deviceStatusMessage" },
+    { "$ref": "#/$defs/heartbeatMessage" },
+    { "$ref": "#/$defs/modeChangedMessage" },
+    { "$ref": "#/$defs/barcodeScannedMessage" },
+    { "$ref": "#/$defs/transactionRequestMessage" },
+    { "$ref": "#/$defs/transactionConfirmedMessage" },
+    { "$ref": "#/$defs/transactionRejectedMessage" },
+    { "$ref": "#/$defs/errorResponseMessage" }
+  ],
+  "$defs": {
+    "messageId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "deviceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "timestamp": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "barcode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "baseEnvelope": {
+      "type": "object",
+      "required": [
+        "protocol_version",
+        "type",
+        "message_id",
+        "correlation_id",
+        "device_id",
+        "sent_at",
+        "payload"
+      ],
+      "properties": {
+        "protocol_version": {},
+        "type": {},
+        "message_id": {},
+        "correlation_id": {},
+        "device_id": {},
+        "sent_at": {},
+        "payload": {}
+      }
+    },
+    "deviceStatusMessage": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": { "const": 1 },
+            "type": { "const": "device.status" },
+            "message_id": { "$ref": "#/$defs/messageId" },
+            "correlation_id": {
+              "anyOf": [
+                { "$ref": "#/$defs/messageId" },
+                { "type": "null" }
+              ]
+            },
+            "device_id": { "$ref": "#/$defs/deviceId" },
+            "sent_at": { "$ref": "#/$defs/timestamp" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "connection_status",
+                "firmware_version",
+                "hardware_activation_enabled",
+                "uptime_ms"
+              ],
+              "properties": {
+                "connection_status": {
+                  "enum": ["CONNECTED", "DISCONNECTED"]
+                },
+                "firmware_version": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                },
+                "hardware_activation_enabled": { "type": "boolean" },
+                "uptime_ms": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "heartbeatMessage": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": { "const": 1 },
+            "type": { "const": "heartbeat" },
+            "message_id": { "$ref": "#/$defs/messageId" },
+            "correlation_id": {
+              "anyOf": [
+                { "$ref": "#/$defs/messageId" },
+                { "type": "null" }
+              ]
+            },
+            "device_id": { "$ref": "#/$defs/deviceId" },
+            "sent_at": { "$ref": "#/$defs/timestamp" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["sequence", "uptime_ms"],
+              "properties": {
+                "sequence": { "type": "integer", "minimum": 0 },
+                "uptime_ms": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "modeChangedMessage": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": { "const": 1 },
+            "type": { "const": "mode.changed" },
+            "message_id": { "$ref": "#/$defs/messageId" },
+            "correlation_id": {
+              "anyOf": [
+                { "$ref": "#/$defs/messageId" },
+                { "type": "null" }
+              ]
+            },
+            "device_id": { "$ref": "#/$defs/deviceId" },
+            "sent_at": { "$ref": "#/$defs/timestamp" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["mode"],
+              "properties": {
+                "mode": { "enum": ["RESTOCK", "CHECKOUT"] }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "barcodeScannedMessage": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": { "const": 1 },
+            "type": { "const": "barcode.scanned" },
+            "message_id": { "$ref": "#/$defs/messageId" },
+            "correlation_id": {
+              "anyOf": [
+                { "$ref": "#/$defs/messageId" },
+                { "type": "null" }
+              ]
+            },
+            "device_id": { "$ref": "#/$defs/deviceId" },
+            "sent_at": { "$ref": "#/$defs/timestamp" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["barcode", "scanned_at"],
+              "properties": {
+                "barcode": { "$ref": "#/$defs/barcode" },
+                "scanned_at": { "$ref": "#/$defs/timestamp" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "transactionRequestMessage": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": { "const": 1 },
+            "type": { "const": "transaction.request" },
+            "message_id": { "$ref": "#/$defs/messageId" },
+            "correlation_id": {
+              "anyOf": [
+                { "$ref": "#/$defs/messageId" },
+                { "type": "null" }
+              ]
+            },
+            "device_id": { "$ref": "#/$defs/deviceId" },
+            "sent_at": { "$ref": "#/$defs/timestamp" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "transaction_id",
+                "mode",
+                "barcode",
+                "occurred_at",
+                "rtc_valid"
+              ],
+              "properties": {
+                "transaction_id": { "$ref": "#/$defs/messageId" },
+                "mode": { "enum": ["RESTOCK", "CHECKOUT"] },
+                "barcode": { "$ref": "#/$defs/barcode" },
+                "occurred_at": { "$ref": "#/$defs/timestamp" },
+                "rtc_valid": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "transactionConfirmedMessage": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": { "const": 1 },
+            "type": { "const": "transaction.confirmed" },
+            "message_id": { "$ref": "#/$defs/messageId" },
+            "correlation_id": {
+              "anyOf": [
+                { "$ref": "#/$defs/messageId" },
+                { "type": "null" }
+              ]
+            },
+            "device_id": { "$ref": "#/$defs/deviceId" },
+            "sent_at": { "$ref": "#/$defs/timestamp" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "transaction_id",
+                "mode",
+                "quantity",
+                "previous_stock",
+                "new_total",
+                "stock_status",
+                "transaction_status"
+              ],
+              "properties": {
+                "transaction_id": { "$ref": "#/$defs/messageId" },
+                "mode": { "enum": ["RESTOCK", "CHECKOUT"] },
+                "quantity": { "type": "integer", "minimum": 1 },
+                "previous_stock": { "type": "integer", "minimum": 0 },
+                "new_total": { "type": "integer", "minimum": 0 },
+                "stock_status": { "enum": ["HIGH", "LOW", "EMPTY"] },
+                "transaction_status": { "const": "SUCCESS" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "transactionRejectedMessage": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": { "const": 1 },
+            "type": { "const": "transaction.rejected" },
+            "message_id": { "$ref": "#/$defs/messageId" },
+            "correlation_id": {
+              "anyOf": [
+                { "$ref": "#/$defs/messageId" },
+                { "type": "null" }
+              ]
+            },
+            "device_id": { "$ref": "#/$defs/deviceId" },
+            "sent_at": { "$ref": "#/$defs/timestamp" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "transaction_id",
+                "code",
+                "message",
+                "retryable",
+                "transaction_status"
+              ],
+              "properties": {
+                "transaction_id": { "$ref": "#/$defs/messageId" },
+                "code": { "type": "string", "minLength": 1, "maxLength": 64 },
+                "message": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "retryable": { "type": "boolean" },
+                "transaction_status": { "const": "ERROR" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "errorResponseMessage": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": { "const": 1 },
+            "type": { "const": "error.response" },
+            "message_id": { "$ref": "#/$defs/messageId" },
+            "correlation_id": {
+              "anyOf": [
+                { "$ref": "#/$defs/messageId" },
+                { "type": "null" }
+              ]
+            },
+            "device_id": { "$ref": "#/$defs/deviceId" },
+            "sent_at": { "$ref": "#/$defs/timestamp" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["code", "message", "retryable"],
+              "properties": {
+                "code": { "type": "string", "minLength": 1, "maxLength": 64 },
+                "message": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "retryable": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
