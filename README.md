@@ -1,16 +1,19 @@
 # Dental Inventory System
 
-Phase 1 foundation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+Phase 2 standalone desktop application for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
 
 This repository currently provides:
 
-- a secure Electron + React + TypeScript desktop shell;
+- a secure Electron + React + TypeScript desktop inventory application;
+- SQLite-backed product inventory, stock corrections, and movement history;
+- application-managed product images stored as files beside the database;
+- search, fixed-category filtering, derived stock status, safe editing, and soft deletion;
 - SQLite migrations and one preconfigured-administrator credential slot;
 - shared, versioned TypeScript protocol types and JSON Schema validation;
 - a development/test-only `HardwareGateway` mock boundary;
 - a compile-only ESP32 PlatformIO project whose physical hardware activation is disabled.
 
-Inventory CRUD, physical scanner input, online transactions, offline transactions, synchronization, and all PCB peripheral activation are intentionally outside Phase 1.
+Physical scanner input, online kiosk transactions, offline transactions, synchronization, and all PCB peripheral activation remain intentionally outside Phase 2. Manual barcode entry is visibly identified as a development-only bridge until hardware integration is approved.
 
 ## Repository layout
 
@@ -94,7 +97,7 @@ Remove-Item Env:DENTAL_ADMIN_PASSWORD
 
 Use the same command with `reset` to replace that credential. Close the desktop application first so the maintenance operation has exclusive ownership of the database.
 
-## Run the Phase 1 Windows desktop application
+## Run the Phase 2 Windows desktop application
 
 In the same PowerShell terminal where `DENTAL_DATABASE_PATH` is set:
 
@@ -106,10 +109,22 @@ Then:
 
 1. Sign in as `admin` with the password chosen during initialization.
 2. Invalid credentials display exactly `Access Denied`.
-3. Verify the four tabs: ITEM INVENTORY, MOVEMENT HISTORY, ADD NEW ITEM, and SYNC OFFLINE.
-4. Select **Logout** to return to the login screen.
+3. Use **ADD NEW ITEM** to register a product. Barcode text retains leading zeroes, the category must be one of the six fixed choices, and stock values must be non-negative integers.
+4. Use **ITEM INVENTORY** to search by name or barcode, filter by category, and edit or safely delete products. A manual stock change creates a permanent `STOCK_CORRECTION` movement.
+5. Use **MOVEMENT HISTORY** to review persisted stock corrections newest first. **SYNC OFFLINE** remains inactive in Phase 2.
+6. Select **Logout** to return to the login screen.
 
-React communicates only through the preload's narrow authentication API. It cannot access SQLite, Node.js, the filesystem, Electron main APIs, or hardware sockets directly.
+React communicates only through narrow authentication and inventory methods exposed by the preload. It cannot access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
+
+## Product images
+
+The native image picker accepts PNG, JPG/JPEG, and WEBP files. A selected image is previewed in the renderer through a short-lived opaque token; when the product is saved, Electron copies it under:
+
+```text
+<database directory>/product-images/
+```
+
+The database stores only an application-managed relative path. Generated filenames are collision-safe, missing files render a placeholder, and replacing or deleting a product removes its obsolete managed image on a best-effort basis. Development databases therefore keep their images under `.runtime/product-images/`; normal Windows installations use `%APPDATA%\Dental Inventory System\data\product-images\`.
 
 ## Database location and migrations
 
@@ -125,7 +140,7 @@ On Windows this is normally:
 %APPDATA%\Dental Inventory System\data\inventory.db
 ```
 
-Development may override the file with `DENTAL_DATABASE_PATH`, as shown above. Migrations run automatically whenever the writable database is opened. Phase 1 creates:
+Development may override the file with `DENTAL_DATABASE_PATH`, as shown above. Migrations run automatically whenever the writable database is opened. Migration 1 creates:
 
 - `schema_migrations`
 - `configured_admin`
@@ -134,9 +149,11 @@ Development may override the file with `DENTAL_DATABASE_PATH`, as shown above. M
 
 Product status is derived by code and is not persisted.
 
+Migration 2 adds soft deletion to `products` and safely rebuilds `transactions` to permit `STOCK_CORRECTION`. Product barcodes remain immutable through normal editing and unique across active and retired rows. Transaction rows retain barcode, item-name, and category snapshots, so movement history remains readable after a product is retired.
+
 ## Desktop checks and production bundle
 
-Run all Phase 1 JavaScript checks from the root:
+Run all Phase 2 JavaScript checks from the root:
 
 ```powershell
 npm test
@@ -151,7 +168,7 @@ npm run build
 npm run preview --workspace "@dental-inventory/desktop"
 ```
 
-Creating a Windows installer is deferred; Phase 1 produces a runnable Electron development/preview application and production bundles.
+Creating a Windows installer is deferred; Phase 2 produces a runnable Electron development/preview application and production bundles.
 
 ## ESP32 firmware compilation
 

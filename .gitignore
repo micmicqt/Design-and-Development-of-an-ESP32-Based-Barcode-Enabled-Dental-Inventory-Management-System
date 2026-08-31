@@ -28,7 +28,7 @@ firmware/include/secrets.h
 *.db-shm
 *.db-wal
 logs/
-images/
+/images/
 
 # Editors / operating system
 .vscode/

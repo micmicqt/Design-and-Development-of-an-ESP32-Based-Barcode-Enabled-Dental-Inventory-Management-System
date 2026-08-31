@@ -1,5 +1,8 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import type { AuthSession } from '../../shared/ipc-contract'
+import { AddItemPage } from './pages/AddItemPage'
+import { InventoryPage } from './pages/InventoryPage'
+import { MovementHistoryPage } from './pages/MovementHistoryPage'
 
 const NAVIGATION_ITEMS = [
   'ITEM INVENTORY',
@@ -12,57 +15,29 @@ type NavigationItem = (typeof NAVIGATION_ITEMS)[number]
 
 const EMPTY_SESSION: AuthSession = { authenticated: false, username: null }
 
-const sectionContent: Record<
+const sectionMetadata: Record<
   NavigationItem,
-  { eyebrow: string; title: string; description: string; content: ReactNode }
+  { eyebrow: string; title: string; description: string }
 > = {
   'ITEM INVENTORY': {
     eyebrow: 'Inventory',
     title: 'Item Inventory',
-    description: 'Review dental supplies and their stock levels.',
-    content: (
-      <EmptyState
-        badge="Phase 2"
-        title="Inventory records will appear here"
-        message="Product search, category filters, stock indicators, and editing are intentionally deferred until the next approved phase."
-      />
-    )
+    description: 'Review, search, and maintain dental supplies and their stock levels.'
   },
   'MOVEMENT HISTORY': {
     eyebrow: 'Audit trail',
     title: 'Movement History',
-    description: 'Review chronological restock and checkout activity.',
-    content: (
-      <EmptyState
-        badge="Phase 2"
-        title="No movement records to display"
-        message="Online and synchronized offline transactions will be shown here after transaction execution is implemented."
-      />
-    )
+    description: 'Review the permanent chronological record of inventory adjustments.'
   },
   'ADD NEW ITEM': {
     eyebrow: 'Registration',
     title: 'Add New Item',
-    description: 'Register a barcode-enabled inventory product.',
-    content: (
-      <EmptyState
-        badge="Hardware disabled"
-        title="Please scan the item barcode using the hardware scanner to begin."
-        message="Scanner activation remains disabled in Phase 1 while its electrical direction and PCB connections are being verified."
-      />
-    )
+    description: 'Register a barcode-enabled inventory product.'
   },
   'SYNC OFFLINE': {
     eyebrow: 'MicroSD synchronization',
     title: 'Sync Offline',
-    description: 'Preview and import transactions recorded by the kiosk.',
-    content: (
-      <EmptyState
-        badge="Phase 2+"
-        title="Offline synchronization is not active"
-        message="The production ESP32 transport is deliberately unimplemented in this foundational phase."
-      />
-    )
+    description: 'Preview and import transactions recorded by the kiosk.'
   }
 }
 
@@ -179,7 +154,7 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
           <h2>A focused inventory workspace for dental supplies.</h2>
           <p>
             Inventory information remains on this Windows computer. Hardware activation is safely
-            disabled during Phase 1.
+            disabled during Phase 2.
           </p>
         </div>
       </aside>
@@ -190,7 +165,50 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
 function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogout: () => void }) {
   const [activeItem, setActiveItem] = useState<NavigationItem>('ITEM INVENTORY')
   const [loggingOut, setLoggingOut] = useState(false)
-  const activeSection = sectionContent[activeItem]
+  const [inventoryRefreshVersion, setInventoryRefreshVersion] = useState(0)
+  const [historyRefreshVersion, setHistoryRefreshVersion] = useState(0)
+  const [inventoryNotice, setInventoryNotice] = useState<string | null>(null)
+  const activeSection = sectionMetadata[activeItem]
+
+  useEffect(() => {
+    if (inventoryNotice === null) return undefined
+
+    const timeout = window.setTimeout(() => setInventoryNotice(null), 5_000)
+    return () => window.clearTimeout(timeout)
+  }, [inventoryNotice])
+
+  function renderActiveSection(): ReactNode {
+    switch (activeItem) {
+      case 'ITEM INVENTORY':
+        return (
+          <InventoryPage
+            refreshVersion={inventoryRefreshVersion}
+            notice={inventoryNotice}
+            onHistoryChanged={() => setHistoryRefreshVersion((current) => current + 1)}
+          />
+        )
+      case 'MOVEMENT HISTORY':
+        return <MovementHistoryPage refreshVersion={historyRefreshVersion} />
+      case 'ADD NEW ITEM':
+        return (
+          <AddItemPage
+            onCreated={(itemName) => {
+              setInventoryNotice(`${itemName} was added successfully.`)
+              setInventoryRefreshVersion((current) => current + 1)
+              setActiveItem('ITEM INVENTORY')
+            }}
+          />
+        )
+      case 'SYNC OFFLINE':
+        return (
+          <EmptyState
+            badge="Not active in Phase 2"
+            title="Offline synchronization is not active"
+            message="ESP32, Wi-Fi, and MicroSD synchronization remain disabled until a later approved phase."
+          />
+        )
+    }
+  }
 
   async function logout(): Promise<void> {
     if (loggingOut) return
@@ -275,11 +293,11 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
             </div>
             <div className="phase-indicator">
               <span>PHASE</span>
-              <strong>01</strong>
+              <strong>02</strong>
             </div>
           </section>
 
-          <section className="content-card">{activeSection.content}</section>
+          <section className="content-card">{renderActiveSection()}</section>
         </main>
       </div>
     </div>

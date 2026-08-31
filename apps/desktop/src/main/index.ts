@@ -1,34 +1,41 @@
 import { app, BrowserWindow, Menu, session } from 'electron'
 import { join } from 'node:path'
+import { resolveApplicationPaths } from './application/application-paths'
+import { createAuthSessionController } from './application/auth-session'
 import { createAuthenticationService } from './application/create-authentication-service'
+import { initializeDatabase, type SqliteDatabase } from './database'
 import {
-  initializeDatabase,
-  initializeProductionDatabase,
-  type SqliteDatabase
-} from './database'
+  ProductImageStore,
+  registerDentalImageProtocol,
+  registerDentalImageSchemePrivileges
+} from './images'
+import { createInventoryService } from './inventory'
 import { registerAuthIpcHandlers } from './ipc/register-auth-handlers'
+import { registerInventoryIpcHandlers } from './ipc/register-inventory-handlers'
 
 let mainWindow: BrowserWindow | null = null
-let disposeAuthHandlers: (() => void) | null = null
+let disposeIpcHandlers: (() => void) | null = null
+let disposeImageProtocol: (() => void) | null = null
 let database: SqliteDatabase | null = null
+let imageStore: ProductImageStore | null = null
 
 app.setName('Dental Inventory System')
+registerDentalImageSchemePrivileges()
 
-function initializeApplicationDatabase(): SqliteDatabase {
+function getDevelopmentDatabasePath(): string | undefined {
   const developmentPath = !app.isPackaged
     ? process.env.DENTAL_DATABASE_PATH?.trim()
     : undefined
-
-  if (developmentPath) {
-    return initializeDatabase({ databasePath: developmentPath })
-  }
-
-  return initializeProductionDatabase(app.getPath('userData'))
+  return developmentPath || undefined
 }
 
 function closeApplicationResources(): void {
-  disposeAuthHandlers?.()
-  disposeAuthHandlers = null
+  disposeIpcHandlers?.()
+  disposeIpcHandlers = null
+  disposeImageProtocol?.()
+  disposeImageProtocol = null
+  imageStore?.clearSelections()
+  imageStore = null
   database?.close()
   database = null
 }
@@ -46,7 +53,7 @@ function configureApplicationSecurity(): void {
   })
 }
 
-async function createMainWindow(): Promise<BrowserWindow> {
+function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1220,
     height: 780,
@@ -71,14 +78,16 @@ async function createMainWindow(): Promise<BrowserWindow> {
     if (mainWindow === window) mainWindow = null
   })
 
+  return window
+}
+
+async function loadMainWindow(window: BrowserWindow): Promise<void> {
   const developmentUrl = process.env.ELECTRON_RENDERER_URL
   if (!app.isPackaged && developmentUrl) {
     await window.loadURL(developmentUrl)
   } else {
     await window.loadFile(join(__dirname, '../renderer/index.html'))
   }
-
-  return window
 }
 
 async function startDesktopApplication(): Promise<void> {
@@ -86,13 +95,43 @@ async function startDesktopApplication(): Promise<void> {
 
   Menu.setApplicationMenu(null)
   configureApplicationSecurity()
-  database = initializeApplicationDatabase()
-  disposeAuthHandlers = registerAuthIpcHandlers(createAuthenticationService(database))
-  mainWindow = await createMainWindow()
+  const applicationPaths = resolveApplicationPaths(
+    app.getPath('userData'),
+    getDevelopmentDatabasePath()
+  )
+  database = initializeDatabase({ databasePath: applicationPaths.databasePath })
+  imageStore = new ProductImageStore(applicationPaths.productImagesDirectory)
+  await imageStore.initialize()
+
+  const authSession = createAuthSessionController()
+  const getMainWindow = (): BrowserWindow | null => mainWindow
+  const inventoryService = createInventoryService(database)
+
+  disposeImageProtocol = registerDentalImageProtocol(session.defaultSession, imageStore)
+  mainWindow = createMainWindow()
+
+  const disposeAuthHandlers = registerAuthIpcHandlers(
+    createAuthenticationService(database),
+    authSession,
+    getMainWindow
+  )
+  const disposeInventoryHandlers = registerInventoryIpcHandlers({
+    inventoryService,
+    imageStore,
+    authSession,
+    getMainWindow
+  })
+  disposeIpcHandlers = () => {
+    disposeInventoryHandlers()
+    disposeAuthHandlers()
+  }
+
+  await loadMainWindow(mainWindow)
 
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      mainWindow = await createMainWindow()
+      mainWindow = createMainWindow()
+      await loadMainWindow(mainWindow)
     }
   })
 }

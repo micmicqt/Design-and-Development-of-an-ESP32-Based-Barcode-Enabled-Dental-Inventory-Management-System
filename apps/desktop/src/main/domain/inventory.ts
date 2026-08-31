@@ -1,21 +1,16 @@
+import {
+  INVENTORY_CATEGORIES,
+  STOCK_STATUSES,
+  type InventoryCategory,
+  type StockStatus,
+} from "../../shared/ipc-contract";
+
 /**
  * The inventory categories are part of the capstone specification and are not
  * user-extensible. Keep this tuple as the single TypeScript source of truth.
  */
-export const INVENTORY_CATEGORIES = [
-  "General",
-  "Restorative & Esthetic",
-  "Endodontics",
-  "Prosthodontics",
-  "Surgery",
-  "Orthodontics",
-] as const;
-
-export type InventoryCategory = (typeof INVENTORY_CATEGORIES)[number];
-
-export const STOCK_STATUSES = ["HIGH", "LOW", "EMPTY"] as const;
-
-export type StockStatus = (typeof STOCK_STATUSES)[number];
+export { INVENTORY_CATEGORIES, STOCK_STATUSES };
+export type { InventoryCategory, StockStatus };
 
 export function isInventoryCategory(value: unknown): value is InventoryCategory {
   return (
@@ -49,4 +44,3 @@ export function deriveStockStatus(
 
   return "HIGH";
 }
-

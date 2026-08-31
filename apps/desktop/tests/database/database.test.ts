@@ -15,7 +15,7 @@ interface ProductInput {
   lowStockThreshold?: number;
 }
 
-describe("Phase 1 database migrations and constraints", () => {
+describe("database migrations and constraints", () => {
   let database: SqliteDatabase;
 
   beforeEach(() => {
@@ -68,7 +68,10 @@ describe("Phase 1 database migrations and constraints", () => {
     ]);
     expect(
       database.prepare("SELECT version, name FROM schema_migrations").all(),
-    ).toEqual([{ version: 1, name: "initial_phase_1_schema" }]);
+    ).toEqual([
+      { version: 1, name: "initial_phase_1_schema" },
+      { version: 2, name: "phase_2_inventory_crud" },
+    ]);
   });
 
   it("can re-run migration initialization without changing schema state", () => {
@@ -78,7 +81,7 @@ describe("Phase 1 database migrations and constraints", () => {
     const result = database
       .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
       .get() as { count: number };
-    expect(result.count).toBe(1);
+    expect(result.count).toBe(2);
   });
 
   it("accepts all six fixed categories and rejects any other category", () => {
