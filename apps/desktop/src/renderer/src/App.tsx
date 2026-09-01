@@ -1,5 +1,9 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import type { AuthSession } from '../../shared/ipc-contract'
+import clinicLogo from './assets/branding/any-time-dental-logo.png'
+import staffPhotoOne from './assets/branding/staff-01.jpg'
+import staffPhotoTwo from './assets/branding/staff-02.jpg'
+import staffPhotoThree from './assets/branding/staff-03.jpg'
 import { AddItemPage } from './pages/AddItemPage'
 import { InventoryPage } from './pages/InventoryPage'
 import { MovementHistoryPage } from './pages/MovementHistoryPage'
@@ -35,9 +39,9 @@ const sectionMetadata: Record<
     description: 'Register a barcode-enabled inventory product.'
   },
   'SYNC OFFLINE': {
-    eyebrow: 'MicroSD synchronization',
+    eyebrow: 'Clinic kiosk',
     title: 'Sync Offline',
-    description: 'Preview and import transactions recorded by the kiosk.'
+    description: 'Keep inventory ready for future kiosk synchronization.'
   }
 }
 
@@ -98,64 +102,82 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
   return (
     <main className="login-page">
       <section className="login-panel" aria-labelledby="login-title">
-        <div className="brand-mark brand-mark--large" aria-hidden="true">
-          <span>DI</span>
+        <header className="login-brand">
+          <span className="clinic-logo clinic-logo--login">
+            <img src={clinicLogo} alt="Any Time Dental clinic logo" />
+          </span>
+          <span className="login-brand__name">
+            <strong>Any Time Dental</strong>
+            <small>Dental care, anytime</small>
+          </span>
+        </header>
+
+        <div className="login-panel__content">
+          <p className="login-panel__kicker">STAFF PORTAL</p>
+          <h1 id="login-title">Dental Inventory Management System</h1>
+          <p className="login-panel__intro">Sign in to access and manage clinic inventory.</p>
+
+          <form className="login-form" onSubmit={submitLogin}>
+            <label htmlFor="username">Username</label>
+            <input
+              id="username"
+              name="username"
+              type="text"
+              autoComplete="username"
+              autoFocus
+              maxLength={128}
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              disabled={submitting}
+              required
+            />
+
+            <label htmlFor="password">Password</label>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              autoComplete="current-password"
+              maxLength={1024}
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              disabled={submitting}
+              required
+            />
+
+            {error !== null && (
+              <div className="access-denied" role="alert">
+                {error}
+              </div>
+            )}
+
+            <button className="primary-button" type="submit" disabled={submitting}>
+              {submitting ? 'Signing in…' : 'Sign In'}
+            </button>
+          </form>
         </div>
-        <p className="login-panel__kicker">Clinic administration</p>
-        <h1 id="login-title">Dental Inventory System</h1>
-        <p className="login-panel__intro">
-          Sign in with the configured administrator account to continue.
-        </p>
-
-        <form className="login-form" onSubmit={submitLogin}>
-          <label htmlFor="username">Username</label>
-          <input
-            id="username"
-            name="username"
-            type="text"
-            autoComplete="username"
-            autoFocus
-            maxLength={128}
-            value={username}
-            onChange={(event) => setUsername(event.target.value)}
-            disabled={submitting}
-            required
-          />
-
-          <label htmlFor="password">Password</label>
-          <input
-            id="password"
-            name="password"
-            type="password"
-            autoComplete="current-password"
-            maxLength={1024}
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            disabled={submitting}
-            required
-          />
-
-          {error !== null && (
-            <div className="access-denied" role="alert">
-              {error}
-            </div>
-          )}
-
-          <button className="primary-button" type="submit" disabled={submitting}>
-            {submitting ? 'Signing in…' : 'Sign in'}
-          </button>
-        </form>
-
-        <p className="login-panel__footnote">Authorized clinic administrator access only</p>
+        <p className="login-panel__footnote">Authorized personnel only</p>
       </section>
-      <aside className="login-context" aria-label="System overview">
-        <div>
-          <span className="context-label">LOCAL · SECURE · OFFLINE-READY</span>
-          <h2>A focused inventory workspace for dental supplies.</h2>
-          <p>
-            Inventory information remains on this Windows computer. Hardware activation is safely
-            disabled during Phase 2.
-          </p>
+      <aside className="login-context" aria-label="Any Time Dental clinic team">
+        <div className="staff-collage">
+          <figure className="staff-photo staff-photo--primary">
+            <img
+              className="staff-photo__image--uncropped"
+              src={staffPhotoOne}
+              alt="Any Time Dental clinic team"
+            />
+          </figure>
+          <figure className="staff-photo staff-photo--care">
+            <img src={staffPhotoTwo} alt="Any Time Dental dentist providing patient care" />
+          </figure>
+          <figure className="staff-photo staff-photo--reception">
+            <img src={staffPhotoThree} alt="Any Time Dental reception team" />
+          </figure>
+        </div>
+        <div className="login-context__glass">
+          <span>READY FOR EVERY PATIENT</span>
+          <h2>Smarter inventory. Smoother care.</h2>
+          <p>Keep essential clinic supplies organized, visible, and ready when they're needed.</p>
         </div>
       </aside>
     </main>
@@ -202,9 +224,9 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       case 'SYNC OFFLINE':
         return (
           <EmptyState
-            badge="Not active in Phase 2"
-            title="Offline synchronization is not active"
-            message="ESP32, Wi-Fi, and MicroSD synchronization remain disabled until a later approved phase."
+            badge="Clinic kiosk"
+            title="Offline synchronization is waiting for the kiosk"
+            message="Offline synchronization will become available when the inventory kiosk is connected."
           />
         )
     }
@@ -224,12 +246,12 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     <div className="app-shell">
       <aside className="sidebar">
         <div className="sidebar__brand">
-          <div className="brand-mark" aria-hidden="true">
-            <span>DI</span>
-          </div>
+          <span className="clinic-logo clinic-logo--sidebar">
+            <img src={clinicLogo} alt="" />
+          </span>
           <div>
-            <strong>Dental Inventory</strong>
-            <small>Clinic workspace</small>
+            <strong>Any Time Dental</strong>
+            <small>Inventory management</small>
           </div>
         </div>
 
@@ -258,8 +280,8 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
         <div className="sidebar__status">
           <span className="status-dot" aria-hidden="true" />
           <div>
-            <strong>Desktop ready</strong>
-            <small>Hardware inactive</small>
+            <strong>System ready</strong>
+            <small>Clinic inventory workspace</small>
           </div>
         </div>
       </aside>
@@ -267,7 +289,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       <div className="workspace">
         <header className="topbar">
           <div className="topbar__location">
-            <span>ADMINISTRATION</span>
+            <span>DENTAL INVENTORY MANAGEMENT SYSTEM</span>
             <strong>{activeItem}</strong>
           </div>
           <div className="account-menu">
@@ -291,9 +313,12 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
               <h1>{activeSection.title}</h1>
               <span>{activeSection.description}</span>
             </div>
-            <div className="phase-indicator">
-              <span>PHASE</span>
-              <strong>02</strong>
+            <div className="page-brand" aria-label="Any Time Dental">
+              <span className="page-brand__dot" aria-hidden="true" />
+              <div>
+                <strong>Any Time Dental</strong>
+                <small>Clinic inventory</small>
+              </div>
             </div>
           </section>
 
@@ -306,6 +331,21 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
 
 export function App() {
   const [session, setSession] = useState<AuthSession | null>(null)
+
+  useEffect(() => {
+    const preventFileNavigation = (event: DragEvent): void => {
+      if (Array.from(event.dataTransfer?.types ?? []).includes('Files')) {
+        event.preventDefault()
+      }
+    }
+
+    window.addEventListener('dragover', preventFileNavigation)
+    window.addEventListener('drop', preventFileNavigation)
+    return () => {
+      window.removeEventListener('dragover', preventFileNavigation)
+      window.removeEventListener('drop', preventFileNavigation)
+    }
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -328,7 +368,7 @@ export function App() {
     return (
       <main className="startup-screen" aria-live="polite">
         <div className="startup-spinner" aria-hidden="true" />
-        <p>Starting Dental Inventory System…</p>
+        <p>Starting Any Time Dental inventory…</p>
       </main>
     )
   }

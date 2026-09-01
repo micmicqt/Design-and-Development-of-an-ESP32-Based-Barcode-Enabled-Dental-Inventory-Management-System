@@ -1,13 +1,22 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import {
   IPC_CHANNELS,
   type CreateProductInput,
   type DeleteProductInput,
   type DesktopApi,
+  type IpcResult,
   type LoginCredentials,
   type ProductListQuery,
+  type SelectedImageDto,
   type UpdateProductInput
 } from '../shared/ipc-contract'
+
+function droppedImageFailure(message: string): Promise<IpcResult<SelectedImageDto>> {
+  return Promise.resolve({
+    ok: false,
+    error: { code: 'IMAGE_UNAVAILABLE', message }
+  })
+}
 
 const desktopApi: DesktopApi = Object.freeze({
   auth: Object.freeze({
@@ -46,12 +55,24 @@ const desktopApi: DesktopApi = Object.freeze({
       if (input.replacementImageSelectionToken !== undefined) {
         payload.replacementImageSelectionToken = input.replacementImageSelectionToken
       }
+      if (input.removeImage !== undefined) payload.removeImage = input.removeImage
 
       return ipcRenderer.invoke(IPC_CHANNELS.productsUpdate, payload)
     },
     deleteProduct: (input: DeleteProductInput) =>
       ipcRenderer.invoke(IPC_CHANNELS.productsDelete, { id: input.id }),
     selectImage: () => ipcRenderer.invoke(IPC_CHANNELS.productsSelectImage),
+    selectDroppedImage: (file: File) => {
+      try {
+        const sourcePath = webUtils.getPathForFile(file)
+        if (sourcePath.length === 0) {
+          return droppedImageFailure('The dropped image is no longer available.')
+        }
+        return ipcRenderer.invoke(IPC_CHANNELS.productsSelectDroppedImage, { sourcePath })
+      } catch {
+        return droppedImageFailure('The dropped image could not be accessed. Try browsing instead.')
+      }
+    },
     listMovementHistory: () => ipcRenderer.invoke(IPC_CHANNELS.movementHistoryList)
   })
 })

@@ -26,6 +26,7 @@ export const IPC_CHANNELS = {
   productsUpdate: 'products:update',
   productsDelete: 'products:delete',
   productsSelectImage: 'products:select-image',
+  productsSelectDroppedImage: 'products:select-dropped-image',
   movementHistoryList: 'movement-history:list'
 } as const
 
@@ -106,6 +107,8 @@ export interface UpdateProductInput {
   lowStockThreshold: number
   /** Omit (or pass null) to retain the current image. */
   replacementImageSelectionToken?: string | null
+  /** Explicitly removes the current image. Cannot be combined with a replacement token. */
+  removeImage?: boolean
 }
 
 export interface DeleteProductInput {
@@ -146,6 +149,7 @@ export interface DesktopApi {
     updateProduct: (input: UpdateProductInput) => Promise<IpcResult<ProductDto>>
     deleteProduct: (input: DeleteProductInput) => Promise<IpcResult<DeletedProductResult>>
     selectImage: () => Promise<IpcResult<SelectedImageDto | null>>
+    selectDroppedImage: (file: File) => Promise<IpcResult<SelectedImageDto>>
     listMovementHistory: () => Promise<IpcResult<MovementHistoryDto[]>>
   }
 }

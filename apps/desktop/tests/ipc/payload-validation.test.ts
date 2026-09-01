@@ -1,10 +1,12 @@
 // @vitest-environment node
 
 import { describe, expect, it } from 'vitest'
+import { resolve } from 'node:path'
 import {
   PayloadValidationError,
   validateCreateProductInput,
   validateDeleteProductInput,
+  validateDroppedImagePath,
   validateProductListQuery,
   validateUpdateProductInput
 } from '../../src/main/ipc/payload-validation'
@@ -67,6 +69,44 @@ describe('Phase 2 IPC payload validation', () => {
     })
 
     expect(result).not.toHaveProperty('replacementImageSelectionToken')
+  })
+
+  it('accepts explicit image removal and rejects conflicting or malformed image intent', () => {
+    const baseInput = {
+      id: 8,
+      itemName: 'Etchant',
+      category: 'General',
+      currentStock: 2,
+      lowStockThreshold: 1
+    }
+
+    expect(validateUpdateProductInput({ ...baseInput, removeImage: true })).toMatchObject({
+      removeImage: true
+    })
+    expect(validateUpdateProductInput({ ...baseInput, removeImage: false })).not.toHaveProperty(
+      'removeImage'
+    )
+    expect(() =>
+      validateUpdateProductInput({ ...baseInput, removeImage: 'yes' })
+    ).toThrowError(PayloadValidationError)
+    expect(() =>
+      validateUpdateProductInput({
+        ...baseInput,
+        removeImage: true,
+        replacementImageSelectionToken: '00000000-0000-4000-8000-000000000001'
+      })
+    ).toThrowError(PayloadValidationError)
+  })
+
+  it('accepts only an absolute dropped-image path from the trusted preload', () => {
+    const sourcePath = resolve('reference.png')
+    expect(validateDroppedImagePath({ sourcePath })).toBe(sourcePath)
+    expect(() => validateDroppedImagePath({ sourcePath: 'relative.png' })).toThrowError(
+      PayloadValidationError
+    )
+    expect(() => validateDroppedImagePath({ sourcePath: null })).toThrowError(
+      PayloadValidationError
+    )
   })
 
   it('validates list queries and product identifiers', () => {

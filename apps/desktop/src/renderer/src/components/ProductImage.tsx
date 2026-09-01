@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import clinicLogo from '../assets/branding/any-time-dental-logo.png'
 
 export function ProductImage({
   imageUrl,
@@ -20,7 +21,7 @@ export function ProductImage({
         role="img"
         aria-label={`No image for ${itemName}`}
       >
-        <span aria-hidden="true">DI</span>
+        <img src={clinicLogo} alt="" aria-hidden="true" />
       </div>
     )
   }

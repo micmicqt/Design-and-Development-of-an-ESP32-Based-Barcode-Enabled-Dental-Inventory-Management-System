@@ -9,6 +9,7 @@ import {
   type ProductFormDraft,
   type ProductFormErrors
 } from '../features/product-form-validation'
+import { ReferenceImagePicker } from '../components/ReferenceImagePicker'
 
 const INITIAL_FORM: ProductFormDraft = {
   barcode: '',
@@ -32,7 +33,7 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
   const [errors, setErrors] = useState<ProductFormErrors>({})
   const [selectedImage, setSelectedImage] = useState<SelectedImageDto | null>(null)
   const [submissionError, setSubmissionError] = useState<string | null>(null)
-  const [selectingImage, setSelectingImage] = useState(false)
+  const [imageProcessing, setImageProcessing] = useState(false)
   const [submitting, setSubmitting] = useState(false)
 
   function setField<Key extends keyof ProductFormDraft>(
@@ -44,28 +45,9 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
     setSubmissionError(null)
   }
 
-  async function selectReferenceImage(): Promise<void> {
-    if (selectingImage) return
-    setSelectingImage(true)
-    setSubmissionError(null)
-
-    try {
-      const result = await window.desktopApi.inventory.selectImage()
-      if (!result.ok) {
-        setSubmissionError(result.error.message)
-      } else if (result.value !== null) {
-        setSelectedImage(result.value)
-      }
-    } catch {
-      setSubmissionError('The image could not be selected. Please try again.')
-    } finally {
-      setSelectingImage(false)
-    }
-  }
-
   async function submit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
-    if (submitting) return
+    if (submitting || imageProcessing) return
 
     const validation = validateProductForm(form, { requireBarcode: true })
     setErrors(validation.errors)
@@ -102,9 +84,9 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
 
   return (
     <form className="product-form" onSubmit={submit} noValidate>
-      <div className="development-notice" role="note">
-        <strong>Development entry only</strong>
-        <span>Hardware scanner integration will replace manual barcode entry in a later phase.</span>
+      <div className="manual-entry-note" role="note">
+        <strong>Manual barcode entry</strong>
+        <span>Enter or paste the barcode printed on the item or package.</span>
       </div>
 
       {submissionError !== null && (
@@ -198,43 +180,25 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
           </div>
         </section>
 
-        <section className="image-picker" aria-labelledby="reference-image-heading">
-          <div>
-            <span className="form-label" id="reference-image-heading">
-              Reference Image
-            </span>
-            <small>Optional · PNG, JPG, JPEG, or WEBP</small>
-          </div>
-
-          {selectedImage === null ? (
-            <div className="image-picker__placeholder" role="img" aria-label="No image selected">
-              <span aria-hidden="true">+</span>
-              <p>No image selected</p>
-            </div>
-          ) : (
-            <div className="image-picker__preview">
-              <img src={selectedImage.previewDataUrl} alt="Reference image preview" />
-              <p title={selectedImage.originalName}>{selectedImage.originalName}</p>
-            </div>
-          )}
-
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={selectReferenceImage}
-            disabled={submitting || selectingImage}
-          >
-            {selectingImage
-              ? 'Opening image…'
-              : selectedImage === null
-                ? 'Select reference image'
-                : 'Replace reference image'}
-          </button>
-        </section>
+        <ReferenceImagePicker
+          selectedImage={selectedImage}
+          disabled={submitting}
+          onImageSelected={setSelectedImage}
+          onRemove={() => {
+            setSelectedImage(null)
+            setSubmissionError(null)
+          }}
+          onError={setSubmissionError}
+          onProcessingChange={setImageProcessing}
+        />
       </div>
 
       <div className="product-form__actions">
-        <button className="primary-button primary-button--inline" type="submit" disabled={submitting}>
+        <button
+          className="primary-button primary-button--inline"
+          type="submit"
+          disabled={submitting || imageProcessing}
+        >
           {submitting ? 'Saving item…' : 'Add item'}
         </button>
       </div>

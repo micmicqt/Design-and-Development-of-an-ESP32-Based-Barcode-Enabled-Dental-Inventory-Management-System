@@ -7,6 +7,7 @@ import {
 import { EditProductDialog } from '../components/EditProductDialog'
 import { ProductImage } from '../components/ProductImage'
 import { StockStatusBadge } from '../components/StockStatusBadge'
+import clinicLogo from '../assets/branding/any-time-dental-logo.png'
 
 export function InventoryPage({
   refreshVersion,
@@ -118,7 +119,9 @@ export function InventoryPage({
 
       {!loading && loadError === null && products.length === 0 ? (
         <div className="table-empty-state">
-          <span aria-hidden="true">DI</span>
+          <span className="empty-state-logo">
+            <img src={clinicLogo} alt="Any Time Dental" />
+          </span>
           <h3>{search.trim() || category ? 'No matching products' : 'No products in inventory'}</h3>
           <p>
             {search.trim() || category

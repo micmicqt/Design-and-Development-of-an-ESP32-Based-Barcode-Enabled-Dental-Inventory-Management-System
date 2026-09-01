@@ -6,6 +6,7 @@ import {
   type ProductListQuery,
   type UpdateProductInput
 } from '../../shared/ipc-contract'
+import { isAbsolute } from 'node:path'
 
 const MAX_BARCODE_LENGTH = 128
 const MAX_ITEM_NAME_LENGTH = 200
@@ -212,6 +213,17 @@ export function validateUpdateProductInput(value: unknown): UpdateProductInput {
     'replacementImageSelectionToken',
     fieldErrors
   )
+  let removeImage = false
+  if (candidate.removeImage !== undefined) {
+    if (typeof candidate.removeImage !== 'boolean') {
+      fieldErrors.removeImage = 'Image removal must be a valid choice.'
+    } else {
+      removeImage = candidate.removeImage
+    }
+  }
+  if (removeImage && replacementImageSelectionToken !== undefined) {
+    fieldErrors.removeImage = 'Choose either a replacement image or remove the current image.'
+  }
 
   throwIfInvalid(fieldErrors)
   return {
@@ -220,8 +232,28 @@ export function validateUpdateProductInput(value: unknown): UpdateProductInput {
     category,
     currentStock,
     lowStockThreshold,
-    ...(replacementImageSelectionToken === undefined ? {} : { replacementImageSelectionToken })
+    ...(replacementImageSelectionToken === undefined ? {} : { replacementImageSelectionToken }),
+    ...(removeImage ? { removeImage: true } : {})
   }
+}
+
+export function validateDroppedImagePath(value: unknown): string {
+  const candidate = asRecord(value)
+  const fieldErrors: Record<string, string> = {}
+  const sourcePath = candidate.sourcePath
+
+  if (
+    typeof sourcePath !== 'string' ||
+    sourcePath.length === 0 ||
+    sourcePath.length > 32_767 ||
+    sourcePath.includes('\0') ||
+    !isAbsolute(sourcePath)
+  ) {
+    fieldErrors.image = 'The dropped image could not be accessed.'
+  }
+
+  throwIfInvalid(fieldErrors)
+  return sourcePath as string
 }
 
 export function validateDeleteProductInput(value: unknown): DeleteProductInput {

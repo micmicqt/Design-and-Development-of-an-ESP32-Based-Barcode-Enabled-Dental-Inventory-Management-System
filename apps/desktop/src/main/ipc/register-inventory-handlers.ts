@@ -24,6 +24,7 @@ import {
   PayloadValidationError,
   validateCreateProductInput,
   validateDeleteProductInput,
+  validateDroppedImagePath,
   validateProductListQuery,
   validateUpdateProductInput
 } from './payload-validation'
@@ -216,11 +217,13 @@ export function registerInventoryIpcHandlers(
           category: input.category,
           currentStock: input.currentStock,
           lowStockThreshold: input.lowStockThreshold,
-          managedImagePath: storedImagePath
+          managedImagePath: input.removeImage === true ? null : storedImagePath
         })
 
         if (selectionToken !== undefined) {
           imageStore.discardSelection(selectionToken)
+        }
+        if (selectionToken !== undefined || input.removeImage === true) {
           await removeReplacedImage(imageStore, previousProduct?.imagePath)
         }
         return ok(toProductDto(product, imageStore))
@@ -271,6 +274,20 @@ export function registerInventoryIpcHandlers(
   )
 
   ipcMain.handle(
+    IPC_CHANNELS.productsSelectDroppedImage,
+    async (event, rawInput: unknown): Promise<IpcResult<SelectedImageDto>> => {
+      if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
+
+      try {
+        const sourcePath = validateDroppedImagePath(rawInput)
+        return ok(await imageStore.createSelectionFromPath(sourcePath))
+      } catch (error: unknown) {
+        return sanitizedFailure(error)
+      }
+    }
+  )
+
+  ipcMain.handle(
     IPC_CHANNELS.movementHistoryList,
     (event): IpcResult<MovementHistoryDto[]> => {
       if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
@@ -289,6 +306,7 @@ export function registerInventoryIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.productsUpdate)
     ipcMain.removeHandler(IPC_CHANNELS.productsDelete)
     ipcMain.removeHandler(IPC_CHANNELS.productsSelectImage)
+    ipcMain.removeHandler(IPC_CHANNELS.productsSelectDroppedImage)
     ipcMain.removeHandler(IPC_CHANNELS.movementHistoryList)
   }
 }

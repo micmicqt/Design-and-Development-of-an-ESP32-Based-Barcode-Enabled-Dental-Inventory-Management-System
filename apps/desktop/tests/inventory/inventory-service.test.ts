@@ -176,6 +176,30 @@ describe("InventoryService", () => {
     ).toBe(FIRST_IMAGE);
   });
 
+  it("clears only the managed image reference when explicitly requested", () => {
+    const original = createProduct({ managedImagePath: FIRST_IMAGE });
+
+    const updated = inventory.updateProduct({
+      id: original.id,
+      itemName: original.itemName,
+      category: original.category,
+      currentStock: original.currentStock,
+      lowStockThreshold: original.lowStockThreshold,
+      managedImagePath: null,
+    });
+
+    expect(updated).toMatchObject({
+      id: original.id,
+      barcode: original.barcode,
+      itemName: original.itemName,
+      category: original.category,
+      imagePath: "",
+      currentStock: original.currentStock,
+      lowStockThreshold: original.lowStockThreshold,
+    });
+    expect(inventory.listMovementHistory()).toEqual([]);
+  });
+
   it("atomically creates a movement snapshot for an administrative stock correction", () => {
     const original = createProduct();
 

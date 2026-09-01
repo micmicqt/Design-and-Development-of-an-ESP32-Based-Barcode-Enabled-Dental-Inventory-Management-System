@@ -170,6 +170,87 @@ describe('authenticated inventory IPC boundary', () => {
     expect(result).not.toHaveProperty('value.0.imagePath')
   })
 
+  it('validates a dropped image through the existing managed selection store', async () => {
+    authSession.signIn('admin')
+    const sourcePath = join(temporaryDirectory, 'dropped.png')
+    const selection = {
+      selectionToken: '00000000-0000-4000-8000-000000000001',
+      previewDataUrl: 'data:image/png;base64,cHJldmlldw==',
+      originalName: 'dropped.png'
+    }
+    const createSelection = vi
+      .spyOn(imageStore, 'createSelectionFromPath')
+      .mockResolvedValue(selection)
+
+    const result = (await handler(IPC_CHANNELS.productsSelectDroppedImage)(trustedEvent, {
+      sourcePath
+    })) as IpcResult<typeof selection>
+
+    expect(result).toEqual({ ok: true, value: selection })
+    expect(createSelection).toHaveBeenCalledWith(sourcePath)
+  })
+
+  it('clears an image reference before best-effort cleanup of the old managed file', async () => {
+    authSession.signIn('admin')
+    const previousProduct = {
+      ...PRODUCT,
+      imagePath: 'product-images/00000000-0000-4000-8000-000000000001.jpg'
+    }
+    vi.mocked(inventoryService.listProducts).mockReturnValue([previousProduct])
+    vi.mocked(inventoryService.updateProduct).mockReturnValue({
+      ...previousProduct,
+      imagePath: ''
+    })
+    const removeManagedImage = vi
+      .spyOn(imageStore, 'removeManagedImage')
+      .mockResolvedValue(undefined)
+
+    const result = (await handler(IPC_CHANNELS.productsUpdate)(trustedEvent, {
+      id: 1,
+      itemName: PRODUCT.itemName,
+      category: PRODUCT.category,
+      currentStock: PRODUCT.currentStock,
+      lowStockThreshold: PRODUCT.lowStockThreshold,
+      removeImage: true
+    })) as IpcResult<ProductDto>
+
+    expect(result).toMatchObject({ ok: true, value: { id: 1, imageUrl: null } })
+    expect(inventoryService.updateProduct).toHaveBeenCalledWith(
+      expect.objectContaining({ managedImagePath: null })
+    )
+    expect(removeManagedImage).toHaveBeenCalledWith(previousProduct.imagePath)
+    expect(vi.mocked(inventoryService.updateProduct).mock.invocationCallOrder[0]).toBeLessThan(
+      removeManagedImage.mock.invocationCallOrder[0] as number
+    )
+  })
+
+  it('preserves the old managed image when an explicit removal update fails', async () => {
+    authSession.signIn('admin')
+    const previousProduct = {
+      ...PRODUCT,
+      imagePath: 'product-images/00000000-0000-4000-8000-000000000001.jpg'
+    }
+    vi.mocked(inventoryService.listProducts).mockReturnValue([previousProduct])
+    vi.mocked(inventoryService.updateProduct).mockImplementation(() => {
+      throw new Error('database unavailable')
+    })
+    const removeManagedImage = vi
+      .spyOn(imageStore, 'removeManagedImage')
+      .mockResolvedValue(undefined)
+
+    const result = (await handler(IPC_CHANNELS.productsUpdate)(trustedEvent, {
+      id: 1,
+      itemName: PRODUCT.itemName,
+      category: PRODUCT.category,
+      currentStock: PRODUCT.currentStock,
+      lowStockThreshold: PRODUCT.lowStockThreshold,
+      removeImage: true
+    })) as IpcResult<ProductDto>
+
+    expect(result).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } })
+    expect(removeManagedImage).not.toHaveBeenCalled()
+  })
+
   it('maps database errors to a stable code without leaking backend details', async () => {
     authSession.signIn('admin')
     vi.mocked(inventoryService.createProduct).mockImplementation(() => {

@@ -19,6 +19,9 @@ let disposeImageProtocol: (() => void) | null = null
 let database: SqliteDatabase | null = null
 let imageStore: ProductImageStore | null = null
 
+const WINDOW_TITLE = 'Any Time Dental — Dental Inventory Management System'
+
+// Keep the internal app name stable so existing userData and database paths do not move.
 app.setName('Dental Inventory System')
 registerDentalImageSchemePrivileges()
 
@@ -61,8 +64,8 @@ function createMainWindow(): BrowserWindow {
     minHeight: 620,
     show: false,
     autoHideMenuBar: true,
-    backgroundColor: '#f4f7f6',
-    title: 'Dental Inventory System',
+    backgroundColor: '#f4f7fb',
+    title: WINDOW_TITLE,
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,

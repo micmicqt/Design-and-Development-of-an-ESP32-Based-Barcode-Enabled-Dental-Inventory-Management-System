@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { MovementHistoryDto } from '../../../shared/ipc-contract'
+import clinicLogo from '../assets/branding/any-time-dental-logo.png'
 
 function formatDateTime(value: string): string {
   const normalized = value.includes('T') ? value : value.replace(' ', 'T')
@@ -14,6 +15,12 @@ function formatDateTime(value: string): string {
     minute: '2-digit',
     second: '2-digit'
   }).format(date)
+}
+
+function getDisplayedQuantity(record: MovementHistoryDto): number {
+  if (record.action === 'CHECKOUT') return -Math.abs(record.quantity)
+  if (record.action === 'RESTOCK') return Math.abs(record.quantity)
+  return record.quantity
 }
 
 export function MovementHistoryPage({ refreshVersion }: { refreshVersion: number }) {
@@ -70,7 +77,9 @@ export function MovementHistoryPage({ refreshVersion }: { refreshVersion: number
   if (records.length === 0) {
     return (
       <div className="table-empty-state">
-        <span aria-hidden="true">DI</span>
+        <span className="empty-state-logo">
+          <img src={clinicLogo} alt="Any Time Dental" />
+        </span>
         <h3>No movement history yet</h3>
         <p>Administrative stock corrections will appear here after they are saved.</p>
       </div>
@@ -96,24 +105,38 @@ export function MovementHistoryPage({ refreshVersion }: { refreshVersion: number
             </tr>
           </thead>
           <tbody>
-            {records.map((record) => (
-              <tr key={record.transactionId}>
-                <td>
-                  <time dateTime={record.occurredAt}>{formatDateTime(record.occurredAt)}</time>
-                </td>
-                <td>
-                  <strong className="item-name">{record.itemName}</strong>
-                </td>
-                <td>{record.category}</td>
-                <td>
-                  <span className="movement-badge">{record.action.replaceAll('_', ' ')}</span>
-                </td>
-                <td>{record.quantity}</td>
-                <td>
-                  <strong className="stock-value">{record.newTotal}</strong>
-                </td>
-              </tr>
-            ))}
+            {records.map((record) => {
+              const displayedQuantity = getDisplayedQuantity(record)
+
+              return (
+                <tr key={record.transactionId}>
+                  <td>
+                    <time className="history-time" dateTime={record.occurredAt}>
+                      {formatDateTime(record.occurredAt)}
+                    </time>
+                  </td>
+                  <td>
+                    <strong className="item-name">{record.itemName}</strong>
+                  </td>
+                  <td>{record.category}</td>
+                  <td>
+                    <span className="movement-badge">
+                      {record.action.replaceAll('_', ' ')}
+                    </span>
+                  </td>
+                  <td>
+                    <span
+                      className={`movement-quantity movement-quantity--${displayedQuantity >= 0 ? 'positive' : 'negative'}`}
+                    >
+                      {displayedQuantity > 0 ? `+${displayedQuantity}` : displayedQuantity}
+                    </span>
+                  </td>
+                  <td>
+                    <strong className="stock-total">{record.newTotal}</strong>
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>

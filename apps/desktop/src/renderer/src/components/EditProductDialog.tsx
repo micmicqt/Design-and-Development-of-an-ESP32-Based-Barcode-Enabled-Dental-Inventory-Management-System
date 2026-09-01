@@ -10,7 +10,7 @@ import {
   type ProductFormDraft,
   type ProductFormErrors
 } from '../features/product-form-validation'
-import { ProductImage } from './ProductImage'
+import { ReferenceImagePicker } from './ReferenceImagePicker'
 
 function FieldError({ id, message }: { id: string; message?: string }) {
   if (!message) return null
@@ -40,6 +40,7 @@ export function EditProductDialog({
   })
   const [errors, setErrors] = useState<ProductFormErrors>({})
   const [replacementImage, setReplacementImage] = useState<SelectedImageDto | null>(null)
+  const [removeImage, setRemoveImage] = useState(false)
   const [operationError, setOperationError] = useState<string | null>(null)
   const [selectingImage, setSelectingImage] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -66,25 +67,6 @@ export function EditProductDialog({
     }
   }
 
-  async function selectReplacementImage(): Promise<void> {
-    if (busy) return
-    setSelectingImage(true)
-    setOperationError(null)
-
-    try {
-      const result = await window.desktopApi.inventory.selectImage()
-      if (!result.ok) {
-        setOperationError(result.error.message)
-      } else if (result.value !== null) {
-        setReplacementImage(result.value)
-      }
-    } catch {
-      setOperationError('The image could not be selected. Please try again.')
-    } finally {
-      setSelectingImage(false)
-    }
-  }
-
   async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
     if (busy) return
@@ -102,9 +84,11 @@ export function EditProductDialog({
         category: validation.value.category,
         currentStock: validation.value.currentStock,
         lowStockThreshold: validation.value.lowStockThreshold,
-        ...(replacementImage === null
-          ? {}
-          : { replacementImageSelectionToken: replacementImage.selectionToken })
+        ...(replacementImage !== null
+          ? { replacementImageSelectionToken: replacementImage.selectionToken }
+          : removeImage
+            ? { removeImage: true }
+            : {})
       })
 
       if (!result.ok) {
@@ -298,28 +282,28 @@ export function EditProductDialog({
               </div>
             </div>
 
-            <section className="image-picker image-picker--compact" aria-label="Reference image">
-              {replacementImage === null ? (
-                <ProductImage
-                  imageUrl={product.imageUrl}
-                  itemName={product.itemName}
-                  className="image-picker__existing"
-                />
-              ) : (
-                <div className="image-picker__preview">
-                  <img src={replacementImage.previewDataUrl} alt="Replacement image preview" />
-                  <p title={replacementImage.originalName}>{replacementImage.originalName}</p>
-                </div>
-              )}
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={selectReplacementImage}
-                disabled={busy}
-              >
-                {selectingImage ? 'Opening image…' : 'Replace reference image'}
-              </button>
-            </section>
+            <ReferenceImagePicker
+              selectedImage={replacementImage}
+              existingImage={
+                !removeImage && product.imageUrl !== null
+                  ? { imageUrl: product.imageUrl, itemName: product.itemName }
+                  : null
+              }
+              compact
+              disabled={saving || deleting}
+              onImageSelected={(image) => {
+                setReplacementImage(image)
+                setRemoveImage(false)
+                setOperationError(null)
+              }}
+              onRemove={() => {
+                setReplacementImage(null)
+                setRemoveImage(product.imageUrl !== null)
+                setOperationError(null)
+              }}
+              onError={setOperationError}
+              onProcessingChange={setSelectingImage}
+            />
           </div>
 
           <footer className="dialog__actions dialog__actions--spread">
