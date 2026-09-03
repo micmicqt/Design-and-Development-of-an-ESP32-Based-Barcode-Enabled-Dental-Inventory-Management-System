@@ -10,7 +10,11 @@ import {
   registerDentalImageSchemePrivileges
 } from './images'
 import { createInventoryService } from './inventory'
+import { resolveEsp32BaseUrl } from './hardware/hardware-configuration'
+import { Esp32HttpGateway } from './hardware/esp32-http-gateway'
+import type { HardwareStatusGateway } from './hardware/hardware-gateway'
 import { registerAuthIpcHandlers } from './ipc/register-auth-handlers'
+import { registerHardwareIpcHandlers } from './ipc/register-hardware-handlers'
 import { registerInventoryIpcHandlers } from './ipc/register-inventory-handlers'
 
 let mainWindow: BrowserWindow | null = null
@@ -18,6 +22,7 @@ let disposeIpcHandlers: (() => void) | null = null
 let disposeImageProtocol: (() => void) | null = null
 let database: SqliteDatabase | null = null
 let imageStore: ProductImageStore | null = null
+let hardwareGateway: HardwareStatusGateway | null = null
 
 const WINDOW_TITLE = 'Any Time Dental — Dental Inventory Management System'
 
@@ -39,6 +44,7 @@ function closeApplicationResources(): void {
   disposeImageProtocol = null
   imageStore?.clearSelections()
   imageStore = null
+  hardwareGateway = null
   database?.close()
   database = null
 }
@@ -109,6 +115,9 @@ async function startDesktopApplication(): Promise<void> {
   const authSession = createAuthSessionController()
   const getMainWindow = (): BrowserWindow | null => mainWindow
   const inventoryService = createInventoryService(database)
+  const esp32BaseUrl = resolveEsp32BaseUrl()
+  hardwareGateway =
+    esp32BaseUrl === null ? null : new Esp32HttpGateway({ baseUrl: esp32BaseUrl })
 
   disposeImageProtocol = registerDentalImageProtocol(session.defaultSession, imageStore)
   mainWindow = createMainWindow()
@@ -124,7 +133,13 @@ async function startDesktopApplication(): Promise<void> {
     authSession,
     getMainWindow
   })
+  const disposeHardwareHandlers = registerHardwareIpcHandlers({
+    gateway: hardwareGateway,
+    authSession,
+    getMainWindow
+  })
   disposeIpcHandlers = () => {
+    disposeHardwareHandlers()
     disposeInventoryHandlers()
     disposeAuthHandlers()
   }

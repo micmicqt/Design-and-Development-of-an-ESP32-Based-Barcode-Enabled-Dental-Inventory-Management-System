@@ -4,6 +4,30 @@
  */
 export type HardwareConnectionState = 'CONNECTED' | 'DISCONNECTED'
 
+export const ESP32_DEVICE_ID = 'dental-inventory-esp32' as const
+
+export type Esp32HardwareMode = 'idle' | 'restock' | 'checkout' | 'busy'
+
+export interface Esp32HealthResponse {
+  status: 'ok'
+  device: typeof ESP32_DEVICE_ID
+  phase: 4
+}
+
+export interface Esp32StatusResponse {
+  device: typeof ESP32_DEVICE_ID
+  online: boolean
+  mode: Esp32HardwareMode
+  rtc: boolean
+  sd: boolean
+}
+
+/** Narrow status boundary implemented during Phase 4 Step 2. */
+export interface HardwareStatusGateway {
+  healthCheck(): Promise<Esp32HealthResponse>
+  getStatus(): Promise<Esp32StatusResponse>
+}
+
 export interface HardwareDeviceStatus {
   deviceId: string
   connection: HardwareConnectionState
@@ -55,7 +79,7 @@ export interface OfflineTransactionRecord {
 
 export type Unsubscribe = () => void
 
-export interface HardwareGateway {
+export interface HardwareGateway extends HardwareStatusGateway {
   connect(): Promise<void>
   disconnect(): Promise<void>
   getDeviceStatus(): Promise<HardwareDeviceStatus>
@@ -65,12 +89,4 @@ export interface HardwareGateway {
   rejectTransaction(rejection: TransactionRejection): Promise<void>
   synchronizeCache(products: readonly CacheProduct[]): Promise<void>
   retrieveOfflineTransactions(): Promise<readonly OfflineTransactionRecord[]>
-}
-
-/**
- * Phase 1 intentionally has no production ESP32 implementation. A real class
- * will be added only when Wi-Fi transport work is approved in a later phase.
- */
-export function createProductionHardwareGateway(): never {
-  throw new Error('Production ESP32 HardwareGateway is not implemented in Phase 1.')
 }

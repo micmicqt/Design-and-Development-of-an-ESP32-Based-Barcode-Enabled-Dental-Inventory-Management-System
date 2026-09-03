@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
-import type { AuthSession } from '../../shared/ipc-contract'
+import type { AuthSession, HardwareMode, HardwareStatusDto } from '../../shared/ipc-contract'
 import clinicLogo from './assets/branding/any-time-dental-logo.png'
 import staffPhotoOne from './assets/branding/staff-01.jpg'
 import staffPhotoTwo from './assets/branding/staff-02.jpg'
@@ -18,6 +18,24 @@ const NAVIGATION_ITEMS = [
 type NavigationItem = (typeof NAVIGATION_ITEMS)[number]
 
 const EMPTY_SESSION: AuthSession = { authenticated: false, username: null }
+const HARDWARE_POLL_INTERVAL_MS = 4_000
+const OFFLINE_HARDWARE_STATUS: HardwareStatusDto = {
+  connection: 'OFFLINE',
+  device: null,
+  mode: null,
+  rtc: null,
+  sd: null
+}
+
+function formatHardwareMode(mode: HardwareMode | null): string {
+  if (mode === null) return 'Unavailable'
+  return mode.charAt(0).toUpperCase() + mode.slice(1)
+}
+
+function formatHardwareAvailability(value: boolean | null): string {
+  if (value === null) return 'Unavailable'
+  return value ? 'Available' : 'Unavailable'
+}
 
 const sectionMetadata: Record<
   NavigationItem,
@@ -190,7 +208,20 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
   const [inventoryRefreshVersion, setInventoryRefreshVersion] = useState(0)
   const [historyRefreshVersion, setHistoryRefreshVersion] = useState(0)
   const [inventoryNotice, setInventoryNotice] = useState<string | null>(null)
+  const [hardwareStatus, setHardwareStatus] = useState<HardwareStatusDto | null>(null)
   const activeSection = sectionMetadata[activeItem]
+  const hardwareConnectionLabel =
+    hardwareStatus === null
+      ? 'Checking…'
+      : hardwareStatus.connection === 'CONNECTED'
+        ? 'Connected'
+        : 'Offline'
+  const hardwareStatusModifier =
+    hardwareStatus === null
+      ? 'is-checking'
+      : hardwareStatus.connection === 'CONNECTED'
+        ? 'is-connected'
+        : 'is-offline'
 
   useEffect(() => {
     if (inventoryNotice === null) return undefined
@@ -198,6 +229,35 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     const timeout = window.setTimeout(() => setInventoryNotice(null), 5_000)
     return () => window.clearTimeout(timeout)
   }, [inventoryNotice])
+
+  useEffect(() => {
+    let active = true
+    let pollTimer: number | undefined
+
+    async function pollHardwareStatus(): Promise<void> {
+      const pollStartedAt = Date.now()
+      try {
+        const status = await window.desktopApi.hardware.getStatus()
+        if (active) setHardwareStatus(status)
+      } catch {
+        if (active) setHardwareStatus(OFFLINE_HARDWARE_STATUS)
+      } finally {
+        if (active) {
+          const elapsedMs = Date.now() - pollStartedAt
+          const nextPollDelayMs = Math.max(0, HARDWARE_POLL_INTERVAL_MS - elapsedMs)
+          pollTimer = window.setTimeout(() => {
+            void pollHardwareStatus()
+          }, nextPollDelayMs)
+        }
+      }
+    }
+
+    void pollHardwareStatus()
+    return () => {
+      active = false
+      if (pollTimer !== undefined) window.clearTimeout(pollTimer)
+    }
+  }, [])
 
   function renderActiveSection(): ReactNode {
     switch (activeItem) {
@@ -277,12 +337,45 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           </div>
         </nav>
 
-        <div className="sidebar__status">
-          <span className="status-dot" aria-hidden="true" />
-          <div>
-            <strong>System ready</strong>
-            <small>Clinic inventory workspace</small>
+        <div
+          className={`sidebar__status ${hardwareStatusModifier}`}
+          role="status"
+          aria-live="polite"
+          aria-label="ESP32 hardware status"
+        >
+          <div className="sidebar__status-summary">
+            <span className="status-dot" aria-hidden="true" />
+            <div>
+              <strong>ESP32</strong>
+              <small>{hardwareConnectionLabel}</small>
+            </div>
           </div>
+          <dl className="hardware-status-details">
+            <div>
+              <dt>Hardware mode</dt>
+              <dd>
+                {hardwareStatus === null
+                  ? 'Checking…'
+                  : formatHardwareMode(hardwareStatus.mode)}
+              </dd>
+            </div>
+            <div>
+              <dt>RTC</dt>
+              <dd>
+                {hardwareStatus === null
+                  ? 'Checking…'
+                  : formatHardwareAvailability(hardwareStatus.rtc)}
+              </dd>
+            </div>
+            <div>
+              <dt>MicroSD</dt>
+              <dd>
+                {hardwareStatus === null
+                  ? 'Checking…'
+                  : formatHardwareAvailability(hardwareStatus.sd)}
+              </dd>
+            </div>
+          </dl>
         </div>
       </aside>
 

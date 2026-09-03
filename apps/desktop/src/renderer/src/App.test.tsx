@@ -1,8 +1,9 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   DesktopApi,
+  HardwareStatusDto,
   InventoryCategory,
   MovementHistoryDto,
   ProductDto,
@@ -39,10 +40,12 @@ function installDesktopApi(api: DesktopApi): void {
 
 function createDesktopApi({
   authenticated = true,
-  inventory = {}
+  inventory = {},
+  hardware = {}
 }: {
   authenticated?: boolean
   inventory?: Partial<DesktopApi['inventory']>
+  hardware?: Partial<DesktopApi['hardware']>
 } = {}): DesktopApi {
   return {
     auth: {
@@ -79,6 +82,16 @@ function createDesktopApi({
       }),
       listMovementHistory: vi.fn().mockResolvedValue({ ok: true, value: [] }),
       ...inventory
+    },
+    hardware: {
+      getStatus: vi.fn().mockResolvedValue({
+        connection: 'OFFLINE',
+        device: null,
+        mode: null,
+        rtc: null,
+        sd: null
+      }),
+      ...hardware
     }
   }
 }
@@ -258,6 +271,126 @@ describe('Phase 2 desktop application', () => {
     expect(logout).toHaveBeenCalledOnce()
   })
 
+  it('shows connected ESP32, mode, RTC, and MicroSD status in the shell', async () => {
+    installDesktopApi(
+      createDesktopApi({
+        hardware: {
+          getStatus: vi.fn().mockResolvedValue({
+            connection: 'CONNECTED',
+            device: 'dental-inventory-esp32',
+            mode: 'restock',
+            rtc: true,
+            sd: true
+          })
+        }
+      })
+    )
+
+    render(<App />)
+    const status = await screen.findByRole('status', { name: 'ESP32 hardware status' })
+
+    expect(await within(status).findByText('Connected')).toBeVisible()
+    expect(within(status).getByText('Restock')).toBeVisible()
+    expect(within(status).getAllByText('Available')).toHaveLength(2)
+  })
+
+  it('shows a clean offline state when hardware polling fails', async () => {
+    installDesktopApi(
+      createDesktopApi({
+        hardware: {
+          getStatus: vi.fn().mockRejectedValue(new Error('network unavailable'))
+        }
+      })
+    )
+
+    render(<App />)
+    const status = await screen.findByRole('status', { name: 'ESP32 hardware status' })
+
+    expect(await within(status).findByText('Offline')).toBeVisible()
+    expect(within(status).getAllByText('Unavailable')).toHaveLength(3)
+    expect(screen.getByRole('heading', { name: 'Item Inventory' })).toBeVisible()
+  })
+
+  it('polls every four seconds without continuing after the shell unmounts', async () => {
+    vi.useFakeTimers()
+    const getStatus = vi.fn().mockResolvedValue({
+      connection: 'CONNECTED',
+      device: 'dental-inventory-esp32',
+      mode: 'idle',
+      rtc: true,
+      sd: true
+    })
+    installDesktopApi(createDesktopApi({ hardware: { getStatus } }))
+
+    try {
+      const view = render(<App />)
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(getStatus).toHaveBeenCalledOnce()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4_000)
+      })
+      expect(getStatus).toHaveBeenCalledTimes(2)
+
+      view.unmount()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(8_000)
+      })
+      expect(getStatus).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('never overlaps polling when a hardware request remains pending', async () => {
+    vi.useFakeTimers()
+    const connectedStatus: HardwareStatusDto = {
+      connection: 'CONNECTED',
+      device: 'dental-inventory-esp32',
+      mode: 'idle',
+      rtc: true,
+      sd: true
+    }
+    let resolveFirstRequest!: (value: HardwareStatusDto) => void
+    const firstRequest = new Promise<HardwareStatusDto>((resolve) => {
+      resolveFirstRequest = resolve
+    })
+    const getStatus = vi
+      .fn()
+      .mockReturnValueOnce(firstRequest)
+      .mockResolvedValue(connectedStatus)
+    installDesktopApi(createDesktopApi({ hardware: { getStatus } }))
+
+    try {
+      const view = render(<App />)
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(getStatus).toHaveBeenCalledOnce()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(8_000)
+      })
+      expect(getStatus).toHaveBeenCalledOnce()
+
+      await act(async () => {
+        resolveFirstRequest(connectedStatus)
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(getStatus).toHaveBeenCalledTimes(2)
+      view.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('uses Any Time Dental shell branding and clinic-facing inactive sync guidance', async () => {
     const user = userEvent.setup()
     installDesktopApi(createDesktopApi())
@@ -433,9 +566,7 @@ describe('Phase 2 desktop application', () => {
     await completeRequiredAddFields(user)
     await user.click(screen.getByRole('button', { name: 'Add item' }))
 
-    expect(await screen.findByRole('status')).toHaveTextContent(
-      'Composite Resin was added successfully.'
-    )
+    expect(await screen.findByText('Composite Resin was added successfully.')).toBeVisible()
     expect(await screen.findByText('Composite Resin')).toBeVisible()
     expect(createProduct).toHaveBeenCalledWith({
       barcode: '00012345',

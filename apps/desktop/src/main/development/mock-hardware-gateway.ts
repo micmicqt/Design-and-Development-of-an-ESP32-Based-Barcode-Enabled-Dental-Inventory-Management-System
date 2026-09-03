@@ -4,6 +4,8 @@ import type {
   HardwareDeviceStatus,
   HardwareGateway,
   HardwareTransactionRequest,
+  Esp32HealthResponse,
+  Esp32StatusResponse,
   OfflineTransactionRecord,
   TransactionConfirmation,
   TransactionRejection,
@@ -41,6 +43,26 @@ export class MockHardwareGateway implements HardwareGateway {
       deviceId: 'DEVELOPMENT-MOCK-ONLY',
       connection: this.connected ? 'CONNECTED' : 'DISCONNECTED',
       firmwareVersion: 'mock'
+    }
+  }
+
+  async healthCheck(): Promise<Esp32HealthResponse> {
+    this.assertConnected()
+    return {
+      status: 'ok',
+      device: 'dental-inventory-esp32',
+      phase: 4
+    }
+  }
+
+  async getStatus(): Promise<Esp32StatusResponse> {
+    this.assertConnected()
+    return {
+      device: 'dental-inventory-esp32',
+      online: true,
+      mode: 'idle',
+      rtc: true,
+      sd: true
     }
   }
 

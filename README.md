@@ -114,7 +114,17 @@ Then:
 5. Use **MOVEMENT HISTORY** to review persisted stock corrections newest first. **SYNC OFFLINE** remains inactive in Phase 2.
 6. Select **Logout** to return to the login screen.
 
-React communicates only through narrow authentication and inventory methods exposed by the preload. It cannot access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
+React communicates only through narrow authentication, inventory, and hardware-status methods exposed by the preload. It cannot access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
+
+### Local ESP32 status connection
+
+For local development, copy `apps/desktop/.env.example` to `apps/desktop/.env.local` and replace the example address with the ESP32's current LAN address:
+
+```env
+DENTAL_ESP32_BASE_URL=http://192.168.1.100
+```
+
+The local file is ignored by Git because the address can change with DHCP. Electron main—not React—uses this URL to call the ESP32 `/health` and `/status` endpoints. Status requests time out after 2.5 seconds and appear as **Offline** without interrupting inventory features. No Wi-Fi credential or device token is stored in the desktop configuration.
 
 ## Product images
 

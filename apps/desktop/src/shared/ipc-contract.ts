@@ -27,8 +27,21 @@ export const IPC_CHANNELS = {
   productsDelete: 'products:delete',
   productsSelectImage: 'products:select-image',
   productsSelectDroppedImage: 'products:select-dropped-image',
-  movementHistoryList: 'movement-history:list'
+  movementHistoryList: 'movement-history:list',
+  hardwareGetStatus: 'hardware:get-status'
 } as const
+
+export type HardwareConnectionStatus = 'CONNECTED' | 'OFFLINE'
+
+export type HardwareMode = 'idle' | 'restock' | 'checkout' | 'busy'
+
+export interface HardwareStatusDto {
+  connection: HardwareConnectionStatus
+  device: string | null
+  mode: HardwareMode | null
+  rtc: boolean | null
+  sd: boolean | null
+}
 
 export interface LoginCredentials {
   username: string
@@ -151,5 +164,8 @@ export interface DesktopApi {
     selectImage: () => Promise<IpcResult<SelectedImageDto | null>>
     selectDroppedImage: (file: File) => Promise<IpcResult<SelectedImageDto>>
     listMovementHistory: () => Promise<IpcResult<MovementHistoryDto[]>>
+  }
+  hardware: {
+    getStatus: () => Promise<HardwareStatusDto>
   }
 }

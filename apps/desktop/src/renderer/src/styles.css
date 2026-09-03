@@ -1699,15 +1699,37 @@ button:focus-visible {
 }
 
 .sidebar__status {
+  display: block;
   padding: 14px;
   background: rgb(255 255 255 / 7%);
   border-color: rgb(255 255 255 / 11%);
   border-radius: 10px;
 }
 
+.sidebar__status-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sidebar__status-summary > div {
+  display: grid;
+  gap: 2px;
+}
+
 .status-dot {
   background: #5dc6ff;
   box-shadow: 0 0 0 4px rgb(93 198 255 / 13%);
+}
+
+.sidebar__status.is-connected .status-dot {
+  background: #5ed7a0;
+  box-shadow: 0 0 0 4px rgb(94 215 160 / 14%);
+}
+
+.sidebar__status.is-offline .status-dot {
+  background: #ff7787;
+  box-shadow: 0 0 0 4px rgb(255 119 135 / 14%);
 }
 
 .sidebar__status strong {
@@ -1716,6 +1738,49 @@ button:focus-visible {
 
 .sidebar__status small {
   color: #8fb6dc;
+}
+
+.sidebar__status.is-connected small {
+  color: #9fe7c6;
+}
+
+.sidebar__status.is-offline small {
+  color: #ffb0ba;
+}
+
+.hardware-status-details {
+  display: grid;
+  gap: 7px;
+  margin: 13px 0 0;
+  padding-top: 11px;
+  border-top: 1px solid rgb(255 255 255 / 10%);
+}
+
+.hardware-status-details div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.hardware-status-details dt,
+.hardware-status-details dd {
+  margin: 0;
+  font-size: 9px;
+  line-height: 1.25;
+}
+
+.hardware-status-details dt {
+  color: #7fa8cf;
+}
+
+.hardware-status-details dd {
+  overflow: hidden;
+  color: #dbeeff;
+  font-weight: 700;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .workspace {
