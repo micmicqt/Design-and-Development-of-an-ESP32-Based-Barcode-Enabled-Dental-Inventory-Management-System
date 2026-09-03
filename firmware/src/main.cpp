@@ -5,10 +5,13 @@
 #include <RTClib.h>
 #include <SD.h>
 #include <SPI.h>
+#include <WebServer.h>
+#include <WiFi.h>
 #include <Wire.h>
 
 #include "hardware_config.h"
 #include "protocol_config.h"
+#include "secrets.h"
 
 namespace {
 
@@ -24,6 +27,13 @@ constexpr uint32_t kBarcodeIdleTimeoutMs = 100UL;
 constexpr uint32_t kIndicatorFeedbackMs = 1000UL;
 constexpr uint32_t kLcdFeedbackMs = 2000UL;
 constexpr size_t kMaximumBarcodeLength = 256U;
+constexpr uint16_t kHttpServerPort = 80U;
+constexpr uint32_t kWiFiConnectionTimeoutMs = 15000UL;
+constexpr uint32_t kWiFiRetryBackoffMs = 30000UL;
+constexpr uint32_t kWiFiProgressIntervalMs = 2000UL;
+constexpr char kWiFiSsidPlaceholder[] = "replace-with-local-wifi-ssid";
+constexpr char kWiFiPasswordPlaceholder[] =
+    "replace-with-local-wifi-password";
 
 struct TransactionProfile {
   uint8_t buttonGpio;
@@ -85,11 +95,19 @@ enum class CsvAppendResult : uint8_t {
   kWriteFailed,
 };
 
+enum class WiFiConnectionState : uint8_t {
+  kDisabled,
+  kConnecting,
+  kWaitingToRetry,
+  kConnected,
+};
+
 LiquidCrystal_I2C lcd(dental::hardware::kLcdI2cAddress,
                       dental::hardware::kLcdColumnCount,
                       dental::hardware::kLcdRowCount);
 RTC_DS3231 rtc;
 HardwareSerial scannerSerial(2);
+WebServer httpServer(kHttpServerPort);
 
 bool lcdAvailable = false;
 bool rtcAvailable = false;
@@ -112,6 +130,11 @@ uint32_t workflowStateStartedMs = 0UL;
 bool feedbackIndicatorIsOn = false;
 const TransactionProfile* activeTransaction = nullptr;
 bool buttonsMustBeReleased = false;
+
+WiFiConnectionState wiFiConnectionState = WiFiConnectionState::kDisabled;
+uint32_t wiFiStateStartedMs = 0UL;
+uint32_t lastWiFiProgressMs = 0UL;
+bool httpServerRunning = false;
 
 size_t acknowledgementMatchIndex = 0U;
 String barcodeBuffer;
@@ -144,6 +167,135 @@ void showInitializationScreen() {
 void showIdleScreen() {
   showLcdScreen("Any Time Dental", "System Ready", "Restock / Checkout",
                 "Press a button");
+}
+
+const char* currentHttpMode() {
+  if (workflowState == WorkflowState::kIdle) {
+    return "idle";
+  }
+  if (activeTransaction == &kRestockTransaction) {
+    return "restock";
+  }
+  if (activeTransaction == &kCheckoutTransaction) {
+    return "checkout";
+  }
+  return "busy";
+}
+
+void handleHealthRequest() {
+  httpServer.send(
+      200, "application/json",
+      "{\"status\":\"ok\",\"device\":\"dental-inventory-esp32\",\"phase\":4}");
+}
+
+void handleStatusRequest() {
+  String response;
+  response.reserve(128U);
+  response =
+      "{\"device\":\"dental-inventory-esp32\",\"online\":true,\"mode\":\"";
+  response += currentHttpMode();
+  response += "\",\"rtc\":";
+  response += rtcAvailable ? "true" : "false";
+  response += ",\"sd\":";
+  response += microSdAvailable ? "true" : "false";
+  response += '}';
+
+  httpServer.send(200, "application/json", response);
+}
+
+void configureHttpRoutes() {
+  httpServer.on("/health", HTTP_GET, handleHealthRequest);
+  httpServer.on("/status", HTTP_GET, handleStatusRequest);
+}
+
+bool wiFiCredentialsAreConfigured() {
+  return strlen(WIFI_SSID) > 0U &&
+         strcmp(WIFI_SSID, kWiFiSsidPlaceholder) != 0 &&
+         strcmp(WIFI_PASSWORD, kWiFiPasswordPlaceholder) != 0;
+}
+
+void beginWiFiConnectionAttempt(uint32_t nowMs) {
+  Serial.println("WiFi connection attempt started");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  wiFiConnectionState = WiFiConnectionState::kConnecting;
+  wiFiStateStartedMs = nowMs;
+  lastWiFiProgressMs = nowMs;
+}
+
+void handleWiFiConnected() {
+  wiFiConnectionState = WiFiConnectionState::kConnected;
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  httpServer.begin();
+  httpServerRunning = true;
+  Serial.println("HTTP server started on port 80");
+}
+
+void initializeWiFi() {
+  configureHttpRoutes();
+
+  if (!wiFiCredentialsAreConfigured()) {
+    wiFiConnectionState = WiFiConnectionState::kDisabled;
+    Serial.println(
+        "WiFi credentials are not configured; hardware workflow remains available");
+    return;
+  }
+
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  WiFi.mode(WIFI_STA);
+  beginWiFiConnectionAttempt(millis());
+}
+
+void serviceWiFi(uint32_t nowMs) {
+  if (wiFiConnectionState == WiFiConnectionState::kDisabled) {
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wiFiConnectionState != WiFiConnectionState::kConnected) {
+      handleWiFiConnected();
+    }
+    if (httpServerRunning) {
+      httpServer.handleClient();
+    }
+    return;
+  }
+
+  if (wiFiConnectionState == WiFiConnectionState::kConnected) {
+    if (httpServerRunning) {
+      httpServer.stop();
+      httpServerRunning = false;
+    }
+    Serial.println("WiFi disconnected; hardware workflow remains available");
+    Serial.println("WiFi retry scheduled after 30 seconds");
+    wiFiConnectionState = WiFiConnectionState::kWaitingToRetry;
+    wiFiStateStartedMs = nowMs;
+  }
+
+  if (wiFiConnectionState == WiFiConnectionState::kConnecting) {
+    if (nowMs - lastWiFiProgressMs >= kWiFiProgressIntervalMs) {
+      lastWiFiProgressMs = nowMs;
+      Serial.println("WiFi connection in progress...");
+    }
+
+    if (nowMs - wiFiStateStartedMs >= kWiFiConnectionTimeoutMs) {
+      WiFi.disconnect(false, false);
+      Serial.println(
+          "WiFi connection timeout; hardware workflow remains available");
+      Serial.println("WiFi retry scheduled after 30 seconds");
+      wiFiConnectionState = WiFiConnectionState::kWaitingToRetry;
+      wiFiStateStartedMs = nowMs;
+    }
+    return;
+  }
+
+  if (wiFiConnectionState == WiFiConnectionState::kWaitingToRetry &&
+      nowMs - wiFiStateStartedMs >= kWiFiRetryBackoffMs) {
+    beginWiFiConnectionAttempt(nowMs);
+  }
 }
 
 bool i2cAddressResponds(uint8_t address) {
@@ -672,6 +824,8 @@ void setup() {
     Serial.println("Integrated dual-mode workflow initialization: SUCCESS");
     showIdleScreen();
   }
+
+  initializeWiFi();
 }
 
 void loop() {
@@ -681,5 +835,6 @@ void loop() {
   serviceButtons(millis());
   serviceScanner(millis());
   serviceWorkflowTimeouts(millis());
+  serviceWiFi(millis());
   delay(1UL);
 }
