@@ -9,11 +9,16 @@
 namespace dental {
 namespace hardware {
 
-// Shared LCD/RTC I2C nets. Bus voltage and pull-ups are not yet verified.
+// Verified Phase 3 breadboard LCD/RTC I2C bus (both modules powered at 3.3 V).
 static constexpr uint8_t kI2cSdaGpio = 21;
 static constexpr uint8_t kI2cSclGpio = 22;
+static constexpr uint8_t kLcdI2cAddress = 0x27;
+static constexpr uint8_t kLcdColumnCount = 20;
+static constexpr uint8_t kLcdRowCount = 4;
+static constexpr uint8_t kDs3231I2cAddress = 0x68;
 
-// MicroSD SPI nets. Module voltage and level shifting are not yet verified.
+// Verified Phase 3 breadboard MicroSD SPI nets. The tested module is powered
+// from 5 V and provides its own regulation/logic buffering.
 static constexpr uint8_t kMicroSdChipSelectGpio = 5;
 static constexpr uint8_t kMicroSdClockGpio = 18;
 static constexpr uint8_t kMicroSdMosiGpio = 23;
@@ -24,13 +29,12 @@ static constexpr uint8_t kMicroSdMisoGpio = 19;
 static constexpr uint8_t kSwitch1NetGpio = 14;
 static constexpr uint8_t kSwitch2NetGpio = 12;
 
-// Two-indicator logic-network controls only. The D1/D2 assignment to
-// SUCCESS/ERROR and the visible active polarity are unconfirmed.
+// Verified two-indicator logic controls: 00=off, 11=D1 SUCCESS, 10=D2 ERROR.
 static constexpr uint8_t kTwoIndicatorControlAGpio = 32;
 static constexpr uint8_t kTwoIndicatorControlBGpio = 33;
 
-// Three-indicator logic-network controls only. The D3/D4/D5 assignment to
-// HIGH/LOW/EMPTY and the visible active polarity are unconfirmed.
+// Verified three-indicator logic controls: 00=off, 10=D3 HIGH, 01=D4 LOW,
+// 11=D5 EMPTY.
 static constexpr uint8_t kThreeIndicatorControlAGpio = 26;
 static constexpr uint8_t kThreeIndicatorControlBGpio = 27;
 
@@ -40,6 +44,17 @@ static constexpr uint8_t kThreeIndicatorControlBGpio = 27;
 static constexpr uint8_t kScannerSchematicU0TxdNetGpio = 1;
 static constexpr uint8_t kScannerSchematicU0RxdNetGpio = 3;
 
+// Temporary Phase 3 breadboard mapping for the GM65 hardware test. This keeps
+// the scanner off UART0 so GPIO1/GPIO3 remain available for USB flashing and
+// debug Serial. It does not replace the final PCB schematic mapping above.
+static constexpr uint8_t kScannerTestUartRxGpio = 16;
+static constexpr uint8_t kScannerTestUartTxGpio = 17;
+
+// Verified Phase 3 breadboard transaction-button assignments. These diagnostic
+// mappings remain separate from the unresolved final-PCB switch-net semantics.
+static constexpr uint8_t kRestockTestButtonGpio = 13;
+static constexpr uint8_t kCheckoutTestButtonGpio = 14;
+
 // This hard compile-time gate prevents Phase 1 from being mistaken for an
 // electrically approved hardware build.
 static constexpr bool kPhase1HardwareActivationEnabled = false;
@@ -48,4 +63,3 @@ static_assert(!kPhase1HardwareActivationEnabled,
 
 }  // namespace hardware
 }  // namespace dental
-
