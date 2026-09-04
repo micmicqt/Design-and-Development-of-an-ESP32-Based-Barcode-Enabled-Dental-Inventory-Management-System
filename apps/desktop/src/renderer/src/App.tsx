@@ -1,5 +1,10 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
-import type { AuthSession, HardwareMode, HardwareStatusDto } from '../../shared/ipc-contract'
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import type {
+  AuthSession,
+  HardwareMode,
+  HardwareStatusDto,
+  HardwareTransactionEvent
+} from '../../shared/ipc-contract'
 import clinicLogo from './assets/branding/any-time-dental-logo.png'
 import staffPhotoOne from './assets/branding/staff-01.jpg'
 import staffPhotoTwo from './assets/branding/staff-02.jpg'
@@ -19,6 +24,7 @@ type NavigationItem = (typeof NAVIGATION_ITEMS)[number]
 
 const EMPTY_SESSION: AuthSession = { authenticated: false, username: null }
 const HARDWARE_POLL_INTERVAL_MS = 4_000
+const HARDWARE_EVENT_POLL_INTERVAL_MS = 1_000
 const OFFLINE_HARDWARE_STATUS: HardwareStatusDto = {
   connection: 'OFFLINE',
   device: null,
@@ -209,6 +215,15 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
   const [historyRefreshVersion, setHistoryRefreshVersion] = useState(0)
   const [inventoryNotice, setInventoryNotice] = useState<string | null>(null)
   const [hardwareStatus, setHardwareStatus] = useState<HardwareStatusDto | null>(null)
+  const [pendingHardwareEvent, setPendingHardwareEvent] =
+    useState<HardwareTransactionEvent | null>(null)
+  const [acknowledgingHardwareEvent, setAcknowledgingHardwareEvent] = useState(false)
+  const [hardwareEventError, setHardwareEventError] = useState<string | null>(null)
+  const hardwareEventRequest = useRef<Promise<HardwareTransactionEvent | null> | null>(null)
+  const hardwareAcknowledgementInFlight = useRef(false)
+  const hardwareEventDialog = useRef<HTMLElement | null>(null)
+  const hardwareEventDismissButton = useRef<HTMLButtonElement | null>(null)
+  const hardwareEventPreviousFocus = useRef<HTMLElement | null>(null)
   const activeSection = sectionMetadata[activeItem]
   const hardwareConnectionLabel =
     hardwareStatus === null
@@ -259,6 +274,64 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     }
   }, [])
 
+  useEffect(() => {
+    if (loggingOut || pendingHardwareEvent !== null) return undefined
+
+    let active = true
+    let pollTimer: number | undefined
+
+    async function pollHardwareEvent(): Promise<void> {
+      const pollStartedAt = Date.now()
+      let eventReceived = false
+
+      try {
+        // Reuse an outstanding request during StrictMode effect replay, too.
+        hardwareEventRequest.current ??= window.desktopApi.hardware.getNextTransactionEvent()
+        const event = await hardwareEventRequest.current
+        if (active && event !== null) {
+          eventReceived = true
+          hardwareEventPreviousFocus.current =
+            document.activeElement instanceof HTMLElement ? document.activeElement : null
+          setHardwareEventError(null)
+          setPendingHardwareEvent(event)
+        }
+      } catch {
+        // Event delivery is best-effort while the device is unavailable. Inventory remains usable.
+      } finally {
+        hardwareEventRequest.current = null
+        if (active && !eventReceived) {
+          const elapsedMs = Date.now() - pollStartedAt
+          const nextPollDelayMs = Math.max(0, HARDWARE_EVENT_POLL_INTERVAL_MS - elapsedMs)
+          pollTimer = window.setTimeout(() => {
+            void pollHardwareEvent()
+          }, nextPollDelayMs)
+        }
+      }
+    }
+
+    void pollHardwareEvent()
+    return () => {
+      active = false
+      if (pollTimer !== undefined) window.clearTimeout(pollTimer)
+    }
+  }, [loggingOut, pendingHardwareEvent])
+
+  useEffect(() => {
+    if (pendingHardwareEvent !== null) {
+      // A disabled ACK button cannot retain focus; keep it inside the dialog while waiting.
+      const target = acknowledgingHardwareEvent
+        ? hardwareEventDialog.current
+        : hardwareEventDismissButton.current
+      target?.focus()
+      return
+    }
+
+    if (hardwareEventPreviousFocus.current?.isConnected) {
+      hardwareEventPreviousFocus.current.focus()
+    }
+    hardwareEventPreviousFocus.current = null
+  }, [pendingHardwareEvent, acknowledgingHardwareEvent])
+
   function renderActiveSection(): ReactNode {
     switch (activeItem) {
       case 'ITEM INVENTORY':
@@ -302,9 +375,39 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     }
   }
 
+  async function dismissHardwareEvent(): Promise<void> {
+    if (pendingHardwareEvent === null || hardwareAcknowledgementInFlight.current) return
+
+    const eventId = pendingHardwareEvent.eventId
+    hardwareAcknowledgementInFlight.current = true
+    setAcknowledgingHardwareEvent(true)
+    setHardwareEventError(null)
+
+    try {
+      const result = await window.desktopApi.hardware.acknowledgeTransactionEvent(eventId)
+      if (!result.ok || result.value.eventId !== eventId) {
+        setHardwareEventError(
+          'Could not acknowledge this scan. Check the ESP32 connection and try again.'
+        )
+        return
+      }
+
+      setPendingHardwareEvent((currentEvent) =>
+        currentEvent?.eventId === eventId ? null : currentEvent
+      )
+    } catch {
+      setHardwareEventError(
+        'Could not acknowledge this scan. Check the ESP32 connection and try again.'
+      )
+    } finally {
+      hardwareAcknowledgementInFlight.current = false
+      setAcknowledgingHardwareEvent(false)
+    }
+  }
+
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className="sidebar" inert={pendingHardwareEvent !== null}>
         <div className="sidebar__brand">
           <span className="clinic-logo clinic-logo--sidebar">
             <img src={clinicLogo} alt="" />
@@ -379,7 +482,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
         </div>
       </aside>
 
-      <div className="workspace">
+      <div className="workspace" inert={pendingHardwareEvent !== null}>
         <header className="topbar">
           <div className="topbar__location">
             <span>DENTAL INVENTORY MANAGEMENT SYSTEM</span>
@@ -418,6 +521,72 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           <section className="content-card">{renderActiveSection()}</section>
         </main>
       </div>
+
+      {pendingHardwareEvent !== null && (
+        <div className="dialog-backdrop hardware-event-backdrop">
+          <section
+            ref={hardwareEventDialog}
+            className="dialog hardware-event-dialog"
+            role="dialog"
+            tabIndex={-1}
+            aria-modal="true"
+            aria-labelledby="hardware-event-title"
+            aria-describedby="hardware-event-description"
+            onKeyDown={(event) => {
+              if (event.key !== 'Tab') return
+              event.preventDefault()
+              const target = acknowledgingHardwareEvent
+                ? hardwareEventDialog.current
+                : hardwareEventDismissButton.current
+              target?.focus()
+            }}
+          >
+            <div className="hardware-event-dialog__brand" aria-hidden="true">
+              <span className="clinic-logo hardware-event-dialog__logo">
+                <img src={clinicLogo} alt="" />
+              </span>
+              <span>Any Time Dental</span>
+            </div>
+
+            <p className="dialog__eyebrow">Hardware transaction</p>
+            <h2 id="hardware-event-title">
+              {pendingHardwareEvent.mode.toUpperCase()} SCAN DETECTED
+            </h2>
+            <p id="hardware-event-description" className="hardware-event-dialog__intro">
+              A barcode scan was received from the clinic inventory kiosk.
+            </p>
+
+            <dl className="hardware-event-details">
+              <div>
+                <dt>Barcode</dt>
+                <dd>{pendingHardwareEvent.barcode}</dd>
+              </div>
+              <div>
+                <dt>Scanned</dt>
+                <dd>{pendingHardwareEvent.timestamp}</dd>
+              </div>
+            </dl>
+
+            {hardwareEventError !== null && (
+              <div className="form-alert form-alert--error" role="alert">
+                {hardwareEventError}
+              </div>
+            )}
+
+            <div className="dialog__actions hardware-event-dialog__actions">
+              <button
+                ref={hardwareEventDismissButton}
+                className="primary-button primary-button--inline"
+                type="button"
+                onClick={() => void dismissHardwareEvent()}
+                disabled={acknowledgingHardwareEvent}
+              >
+                {acknowledgingHardwareEvent ? 'Acknowledging…' : 'Dismiss'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   )
 }

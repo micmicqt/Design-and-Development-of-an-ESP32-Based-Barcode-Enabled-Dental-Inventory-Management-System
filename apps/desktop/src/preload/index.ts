@@ -76,7 +76,11 @@ const desktopApi: DesktopApi = Object.freeze({
     listMovementHistory: () => ipcRenderer.invoke(IPC_CHANNELS.movementHistoryList)
   }),
   hardware: Object.freeze({
-    getStatus: () => ipcRenderer.invoke(IPC_CHANNELS.hardwareGetStatus)
+    getStatus: () => ipcRenderer.invoke(IPC_CHANNELS.hardwareGetStatus),
+    getNextTransactionEvent: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareGetNextTransactionEvent),
+    acknowledgeTransactionEvent: (eventId: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent, eventId)
   })
 })
 

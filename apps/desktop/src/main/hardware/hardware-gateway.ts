@@ -1,3 +1,5 @@
+import type { HardwareTransactionEvent } from '../../shared/ipc-contract'
+
 /**
  * Boundary for the future real ESP32 transport. No renderer component may use
  * sockets directly; it will call main-process services backed by this gateway.
@@ -26,6 +28,21 @@ export interface Esp32StatusResponse {
 export interface HardwareStatusGateway {
   healthCheck(): Promise<Esp32HealthResponse>
   getStatus(): Promise<Esp32StatusResponse>
+}
+
+/** Polling/acknowledgement boundary for Phase 4 hardware scan delivery. */
+export interface HardwareTransactionEventGateway extends HardwareStatusGateway {
+  getNextTransactionEvent(): Promise<HardwareTransactionEvent | null>
+  acknowledgeTransactionEvent(eventId: string): Promise<void>
+}
+
+export function isValidHardwareTransactionEventId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 63 &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value)
+  )
 }
 
 export interface HardwareDeviceStatus {
@@ -79,7 +96,7 @@ export interface OfflineTransactionRecord {
 
 export type Unsubscribe = () => void
 
-export interface HardwareGateway extends HardwareStatusGateway {
+export interface HardwareGateway extends HardwareTransactionEventGateway {
   connect(): Promise<void>
   disconnect(): Promise<void>
   getDeviceStatus(): Promise<HardwareDeviceStatus>

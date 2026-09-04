@@ -8,10 +8,13 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <bootloader_random.h>
+#include <esp_system.h>
 
 #include "hardware_config.h"
 #include "protocol_config.h"
 #include "secrets.h"
+#include "transaction_event_queue.h"
 
 namespace {
 
@@ -31,6 +34,9 @@ constexpr uint16_t kHttpServerPort = 80U;
 constexpr uint32_t kWiFiConnectionTimeoutMs = 15000UL;
 constexpr uint32_t kWiFiRetryBackoffMs = 30000UL;
 constexpr uint32_t kWiFiProgressIntervalMs = 2000UL;
+using dental::events::AcknowledgementResult;
+using dental::events::PendingTransactionEvent;
+using dental::events::appendJsonString;
 constexpr char kWiFiSsidPlaceholder[] = "replace-with-local-wifi-ssid";
 constexpr char kWiFiPasswordPlaceholder[] =
     "replace-with-local-wifi-password";
@@ -102,6 +108,9 @@ enum class WiFiConnectionState : uint8_t {
   kConnected,
 };
 
+static_assert(kMaximumBarcodeLength == dental::events::kMaximumBarcodeLength,
+              "The delivery queue must preserve the complete scanner barcode.");
+
 LiquidCrystal_I2C lcd(dental::hardware::kLcdI2cAddress,
                       dental::hardware::kLcdColumnCount,
                       dental::hardware::kLcdRowCount);
@@ -135,6 +144,10 @@ WiFiConnectionState wiFiConnectionState = WiFiConnectionState::kDisabled;
 uint32_t wiFiStateStartedMs = 0UL;
 uint32_t lastWiFiProgressMs = 0UL;
 bool httpServerRunning = false;
+
+dental::events::PendingEventQueue pendingEvents;
+uint64_t nextEventSequence = 1ULL;
+char bootSessionIdentifier[40U] = {};
 
 size_t acknowledgementMatchIndex = 0U;
 String barcodeBuffer;
@@ -182,6 +195,75 @@ const char* currentHttpMode() {
   return "busy";
 }
 
+void initializeEventSession() {
+  const uint64_t chipIdentifier = ESP.getEfuseMac();
+  // setup calls this before peripherals/Wi-Fi start. Enable true hardware
+  // entropy while RF is off, then disable it before any normal initialization.
+  bootloader_random_enable();
+  const uint32_t sessionRandomHigh = esp_random();
+  const uint32_t sessionRandomLow = esp_random();
+  bootloader_random_disable();
+  snprintf(bootSessionIdentifier, sizeof(bootSessionIdentifier),
+           "%04lX%08lX-%08lX%08lX",
+           static_cast<unsigned long>((chipIdentifier >> 32U) & 0xFFFFU),
+           static_cast<unsigned long>(chipIdentifier & 0xFFFFFFFFULL),
+           static_cast<unsigned long>(sessionRandomHigh),
+           static_cast<unsigned long>(sessionRandomLow));
+  nextEventSequence = 1ULL;
+  Serial.print("Hardware event boot session: ");
+  Serial.println(bootSessionIdentifier);
+}
+
+const PendingTransactionEvent* oldestPendingEvent() {
+  return pendingEvents.oldest();
+}
+
+String serializePendingEvent(const PendingTransactionEvent& event) {
+  String response;
+  response.reserve(384U);
+  response += "{\"eventId\":";
+  appendJsonString(response, event.eventId);
+  response += ",\"mode\":";
+  appendJsonString(response, event.mode);
+  response += ",\"barcode\":";
+  appendJsonString(response, event.barcode);
+  response += ",\"timestamp\":";
+  appendJsonString(response, event.timestamp);
+  response += '}';
+  return response;
+}
+
+bool enqueuePendingEvent(const TransactionProfile& transaction,
+                         const char* timestamp, const String& barcode) {
+  if (pendingEvents.full()) {
+    Serial.println(
+        "WARNING: Hardware event queue full; SD record preserved but live "
+        "delivery unavailable");
+    return false;
+  }
+
+  PendingTransactionEvent event = {};
+  if (!dental::events::formatEventId(event.eventId, bootSessionIdentifier,
+                                    nextEventSequence)) {
+    Serial.println(
+        "WARNING: Hardware event ID generation failed; SD record preserved "
+        "but live delivery unavailable");
+    return false;
+  }
+
+  const char* mode =
+      &transaction == &kRestockTransaction ? "restock" : "checkout";
+  snprintf(event.mode, sizeof(event.mode), "%s", mode);
+  barcode.toCharArray(event.barcode, sizeof(event.barcode));
+  snprintf(event.timestamp, sizeof(event.timestamp), "%s", timestamp);
+
+  ++nextEventSequence;
+  pendingEvents.enqueue(event);
+  Serial.print("Hardware transaction event queued: ");
+  Serial.println(event.eventId);
+  return true;
+}
+
 void handleHealthRequest() {
   httpServer.send(
       200, "application/json",
@@ -203,9 +285,56 @@ void handleStatusRequest() {
   httpServer.send(200, "application/json", response);
 }
 
+void handleNextEventRequest() {
+  const PendingTransactionEvent* event = oldestPendingEvent();
+  if (event == nullptr) {
+    httpServer.send(204, "application/json", "");
+    return;
+  }
+
+  httpServer.send(200, "application/json", serializePendingEvent(*event));
+}
+
+void sendAcknowledgementError(int statusCode, const char* errorCode) {
+  String response = "{\"acknowledged\":false,\"error\":";
+  appendJsonString(response, errorCode);
+  response += '}';
+  httpServer.send(statusCode, "application/json", response);
+}
+
+void handleEventAcknowledgementRequest() {
+  char requestedEventId[dental::events::kEventIdCapacity] = {};
+  const String body = httpServer.arg("plain");
+  if (!dental::events::parseAcknowledgementBody(
+          body.c_str(), body.length(), requestedEventId)) {
+    sendAcknowledgementError(400, "invalid_request");
+    return;
+  }
+
+  const AcknowledgementResult result = pendingEvents.acknowledge(requestedEventId);
+  if (result == AcknowledgementResult::kEmpty) {
+    sendAcknowledgementError(404, "no_pending_event");
+    return;
+  }
+  if (result == AcknowledgementResult::kMismatch) {
+    sendAcknowledgementError(409, "event_id_mismatch");
+    return;
+  }
+
+  String response = "{\"acknowledged\":true,\"eventId\":";
+  appendJsonString(response, requestedEventId);
+  response += '}';
+  Serial.print("Hardware transaction event acknowledged: ");
+  Serial.println(requestedEventId);
+  httpServer.send(200, "application/json", response);
+}
+
 void configureHttpRoutes() {
   httpServer.on("/health", HTTP_GET, handleHealthRequest);
   httpServer.on("/status", HTTP_GET, handleStatusRequest);
+  httpServer.on("/events/next", HTTP_GET, handleNextEventRequest);
+  httpServer.on("/events/ack", HTTP_POST,
+                handleEventAcknowledgementRequest);
 }
 
 bool wiFiCredentialsAreConfigured() {
@@ -533,6 +662,7 @@ void completeBarcode() {
     return;
   }
 
+  enqueuePendingEvent(*activeTransaction, timestamp, barcodeBuffer);
   beginSuccessFeedback(timestamp, barcodeBuffer);
 }
 
@@ -754,6 +884,7 @@ void setup() {
   Serial.println();
   Serial.println("Dental Inventory System");
   Serial.println("Final Dual-Mode Integrated Hardware Diagnostic");
+  initializeEventSession();
 
   configureLedOutputs();
   Serial.println("LED initialization: SUCCESS - all indicators off");

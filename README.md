@@ -118,6 +118,11 @@ React communicates only through narrow authentication, inventory, and hardware-s
 
 ### Local ESP32 status connection
 
+Phase 4 Step 3 adds temporary hardware scan delivery over this same gateway. See
+[the event delivery contract and verification guide](docs/phase4-step3-event-delivery.md)
+for the current firmware/desktop behavior and RAM-queue limitations. Earlier phase
+descriptions below are historical; this guide describes the active Step 3 firmware.
+
 For local development, copy `apps/desktop/.env.example` to `apps/desktop/.env.local` and replace the example address with the ESP32's current LAN address:
 
 ```env

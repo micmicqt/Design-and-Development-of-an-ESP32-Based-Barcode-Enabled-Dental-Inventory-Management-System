@@ -1,9 +1,11 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { StrictMode } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   DesktopApi,
   HardwareStatusDto,
+  HardwareTransactionEvent,
   InventoryCategory,
   MovementHistoryDto,
   ProductDto,
@@ -91,6 +93,11 @@ function createDesktopApi({
         rtc: null,
         sd: null
       }),
+      getNextTransactionEvent: vi.fn().mockResolvedValue(null),
+      acknowledgeTransactionEvent: vi.fn().mockResolvedValue({
+        ok: false,
+        error: { code: 'INTERNAL_ERROR', message: 'Not configured for this test.' }
+      }),
       ...hardware
     }
   }
@@ -138,6 +145,296 @@ async function completeRequiredAddFields(
   await user.clear(screen.getByLabelText('Low Stock Threshold'))
   await user.type(screen.getByLabelText('Low Stock Threshold'), values.threshold ?? '5')
 }
+
+describe('Phase 4 hardware transaction event delivery', () => {
+  const restockEvent: HardwareTransactionEvent = {
+    eventId: 'device-boot-0001',
+    mode: 'restock',
+    barcode: '0001234500123',
+    timestamp: '2026-09-04 12:34:56'
+  }
+
+  async function settle(): Promise<void> {
+    await act(async () => {
+      await Promise.resolve()
+    })
+  }
+
+  async function advance(milliseconds: number): Promise<void> {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(milliseconds)
+    })
+  }
+
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it.each(['restock', 'checkout'] as const)(
+    'shows one %s scan modal with unchanged barcode and timestamp, without inventory writes',
+    async (mode) => {
+      const event = { ...restockEvent, mode }
+      const getNextTransactionEvent = vi.fn().mockResolvedValue(event)
+      const acknowledgeTransactionEvent = vi.fn().mockImplementation(async () => {
+        getNextTransactionEvent.mockResolvedValue(null)
+        return { ok: true, value: { eventId: event.eventId } }
+      })
+      const api = createDesktopApi({
+        hardware: { getNextTransactionEvent, acknowledgeTransactionEvent }
+      })
+      installDesktopApi(api)
+
+      render(<App />)
+      await settle()
+      const dialog = screen.getByRole('dialog', { name: `${mode.toUpperCase()} SCAN DETECTED` })
+      expect(within(dialog).getByText('0001234500123')).toBeVisible()
+      expect(within(dialog).getByText('2026-09-04 12:34:56')).toBeVisible()
+      expect(within(dialog).getAllByRole('button')).toHaveLength(1)
+      expect(within(dialog).queryByRole('spinbutton')).not.toBeInTheDocument()
+
+      // The same FIFO head would be returned again, but polling pauses while it is pending.
+      await advance(10_000)
+      expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+      expect(screen.getAllByRole('dialog')).toHaveLength(1)
+      expect(acknowledgeTransactionEvent).not.toHaveBeenCalled()
+
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Dismiss' }))
+      await settle()
+      expect(acknowledgeTransactionEvent).toHaveBeenCalledWith(event.eventId)
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
+      expect(api.inventory.createProduct).not.toHaveBeenCalled()
+      expect(api.inventory.updateProduct).not.toHaveBeenCalled()
+      expect(api.inventory.deleteProduct).not.toHaveBeenCalled()
+      expect(api.inventory.listMovementHistory).not.toHaveBeenCalled()
+    }
+  )
+
+  it('polls empty results once per second and cancels its timer on unmount', async () => {
+    const getNextTransactionEvent = vi.fn().mockResolvedValue(null)
+    installDesktopApi(createDesktopApi({ hardware: { getNextTransactionEvent } }))
+    const view = render(<App />)
+    await settle()
+    expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+
+    await advance(999)
+    expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+    await advance(1)
+    expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
+    view.unmount()
+    await advance(5_000)
+    expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
+  })
+
+  it('shares an in-flight poll during StrictMode replay and never overlaps slow requests', async () => {
+    let resolveEvent!: (event: HardwareTransactionEvent | null) => void
+    const getNextTransactionEvent = vi.fn().mockReturnValue(
+      new Promise<HardwareTransactionEvent | null>((resolve) => {
+        resolveEvent = resolve
+      })
+    )
+    installDesktopApi(createDesktopApi({ hardware: { getNextTransactionEvent } }))
+    render(<StrictMode><App /></StrictMode>)
+    await settle()
+    await advance(10_000)
+    expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+
+    await act(async () => resolveEvent(restockEvent))
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
+    expect(screen.getByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })).toBeVisible()
+    await advance(10_000)
+    expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+  })
+
+  it('retries after transport failure while inventory navigation remains usable', async () => {
+    const getNextTransactionEvent = vi.fn()
+      .mockRejectedValueOnce(new Error('ESP32 unavailable'))
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue(restockEvent)
+    installDesktopApi(createDesktopApi({ hardware: { getNextTransactionEvent } }))
+    render(<App />)
+    await settle()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Search inventory')).toBeEnabled()
+    expect(screen.getByLabelText('Filter by category')).toBeEnabled()
+    fireEvent.click(screen.getByRole('tab', { name: 'MOVEMENT HISTORY' }))
+    await settle()
+    expect(screen.getByRole('heading', { name: 'Movement History' })).toBeVisible()
+
+    await advance(1_000)
+    expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await advance(1_000)
+    expect(getNextTransactionEvent).toHaveBeenCalledTimes(3)
+    expect(screen.getByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })).toBeVisible()
+  })
+
+  it('keeps the modal for rejected, failed, or mismatched acknowledgements and allows retry', async () => {
+    const checkoutEvent: HardwareTransactionEvent = {
+      ...restockEvent, eventId: 'device-boot-0002', mode: 'checkout'
+    }
+    const getNextTransactionEvent = vi.fn()
+      .mockResolvedValueOnce(restockEvent)
+      .mockResolvedValue(checkoutEvent)
+    const acknowledgeTransactionEvent = vi.fn()
+      .mockResolvedValueOnce({ ok: false, error: { code: 'INTERNAL_ERROR', message: 'Offline' } })
+      .mockRejectedValueOnce(new Error('Disconnected during ACK'))
+      .mockResolvedValueOnce({ ok: true, value: { eventId: 'wrong-event' } })
+      .mockResolvedValueOnce({ ok: true, value: { eventId: restockEvent.eventId } })
+    installDesktopApi(createDesktopApi({
+      hardware: { getNextTransactionEvent, acknowledgeTransactionEvent }
+    }))
+    render(<App />)
+    await settle()
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+      await settle()
+      expect(screen.getByRole('alert')).toHaveTextContent('Could not acknowledge this scan.')
+      expect(screen.getByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })).toBeVisible()
+      expect(screen.getByRole('button', { name: 'Dismiss' })).toBeEnabled()
+      expect(screen.getByRole('button', { name: 'Dismiss' })).toHaveFocus()
+      await advance(2_000)
+      expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+      expect(acknowledgeTransactionEvent).toHaveBeenCalledTimes(attempt)
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await settle()
+    expect(screen.queryByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })).not.toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'CHECKOUT SCAN DETECTED' })).toBeVisible()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
+    expect(acknowledgeTransactionEvent).toHaveBeenCalledTimes(4)
+  })
+
+  it('does not dismiss or issue another ACK while acknowledgement is outstanding', async () => {
+    let completeAcknowledgement!: (value: { ok: true; value: { eventId: string } }) => void
+    const acknowledgeTransactionEvent = vi.fn().mockReturnValue(
+      new Promise((resolve) => { completeAcknowledgement = resolve })
+    )
+    const getNextTransactionEvent = vi.fn()
+      .mockResolvedValueOnce(restockEvent)
+      .mockResolvedValue(null)
+    installDesktopApi(createDesktopApi({
+      hardware: { getNextTransactionEvent, acknowledgeTransactionEvent }
+    }))
+    render(<App />)
+    await settle()
+
+    const dismiss = screen.getByRole('button', { name: 'Dismiss' })
+    fireEvent.click(dismiss)
+    fireEvent.click(dismiss)
+    expect(screen.getByRole('button', { name: 'Acknowledging…' })).toBeDisabled()
+    await advance(5_000)
+    expect(acknowledgeTransactionEvent).toHaveBeenCalledOnce()
+    expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+    expect(screen.getByRole('dialog')).toBeVisible()
+
+    await act(async () => completeAcknowledgement({
+      ok: true, value: { eventId: restockEvent.eventId }
+    }))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
+  })
+
+  it('contains keyboard focus while pending and restores the previous control only after ACK', async () => {
+    vi.useRealTimers()
+    const user = userEvent.setup()
+    let resolveEvent!: (event: HardwareTransactionEvent) => void
+    const getNextTransactionEvent = vi.fn()
+      .mockReturnValueOnce(new Promise((resolve) => { resolveEvent = resolve }))
+      .mockResolvedValue(null)
+    let completeAcknowledgement!: (value: { ok: true; value: { eventId: string } }) => void
+    const acknowledgeTransactionEvent = vi.fn().mockReturnValue(
+      new Promise((resolve) => { completeAcknowledgement = resolve })
+    )
+    const api = createDesktopApi({
+      hardware: { getNextTransactionEvent, acknowledgeTransactionEvent }
+    })
+    installDesktopApi(api)
+    render(<App />)
+    await settle()
+    const search = screen.getByLabelText('Search inventory')
+    search.focus()
+    const navigation = screen.getByRole('navigation', { name: 'Primary navigation' })
+    const logout = screen.getByRole('button', { name: 'Logout' })
+
+    await act(async () => resolveEvent(restockEvent))
+    const dialog = screen.getByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })
+    const dismiss = within(dialog).getByRole('button', { name: 'Dismiss' })
+    expect(dismiss).toHaveFocus()
+    // JSDOM does not enforce native inert behavior: assert the browser containment contract,
+    // and separately exercise the dialog's actual Tab/Shift+Tab handling with userEvent.
+    expect(navigation.closest('.sidebar')).toHaveAttribute('inert')
+    expect(logout.closest('.workspace')).toHaveAttribute('inert')
+    await user.tab()
+    expect(dismiss).toHaveFocus()
+    await user.tab({ shift: true })
+    expect(dismiss).toHaveFocus()
+    await user.keyboard('{Escape}')
+    expect(dialog).toBeVisible()
+    expect(acknowledgeTransactionEvent).not.toHaveBeenCalled()
+    expect(api.auth.logout).not.toHaveBeenCalled()
+
+    fireEvent.click(dismiss)
+    expect(dialog).toHaveFocus()
+    expect(screen.getByRole('button', { name: 'Acknowledging…' })).toBeDisabled()
+    await user.tab()
+    expect(dialog).toHaveFocus()
+    await user.tab({ shift: true })
+    expect(dialog).toHaveFocus()
+    expect(logout.closest('.workspace')).toHaveAttribute('inert')
+
+    await act(async () => completeAcknowledgement({
+      ok: true, value: { eventId: restockEvent.eventId }
+    }))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(search).toHaveFocus()
+    expect(navigation.closest('.sidebar')).not.toHaveAttribute('inert')
+    expect(logout.closest('.workspace')).not.toHaveAttribute('inert')
+    expect(api.inventory.updateProduct).not.toHaveBeenCalled()
+    expect(api.auth.logout).not.toHaveBeenCalled()
+  })
+
+  it.each(['logout', 'unmount'] as const)(
+    'ignores a late in-flight event after %s without acknowledging or resuming polling',
+    async (cleanupMethod) => {
+      let resolveEvent!: (event: HardwareTransactionEvent) => void
+      const getNextTransactionEvent = vi.fn().mockReturnValue(
+        new Promise((resolve) => { resolveEvent = resolve })
+      )
+      const api = createDesktopApi({ hardware: { getNextTransactionEvent } })
+      installDesktopApi(api)
+      const view = render(<App />)
+      await settle()
+
+      if (cleanupMethod === 'logout') {
+        fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+        await settle()
+        expect(screen.getByRole('button', { name: 'Sign In' })).toBeVisible()
+      } else {
+        view.unmount()
+      }
+
+      await act(async () => resolveEvent(restockEvent))
+      await advance(5_000)
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+      expect(api.hardware.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+    }
+  )
+
+  it('does not poll hardware events before administrator login', async () => {
+    const api = createDesktopApi({ authenticated: false })
+    installDesktopApi(api)
+    render(<App />)
+    await settle()
+    await advance(5_000)
+    expect(screen.getByRole('button', { name: 'Sign In' })).toBeVisible()
+    expect(api.hardware.getNextTransactionEvent).not.toHaveBeenCalled()
+  })
+})
 
 describe('Phase 2 desktop application', () => {
   beforeEach(() => {

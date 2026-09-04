@@ -28,7 +28,9 @@ export const IPC_CHANNELS = {
   productsSelectImage: 'products:select-image',
   productsSelectDroppedImage: 'products:select-dropped-image',
   movementHistoryList: 'movement-history:list',
-  hardwareGetStatus: 'hardware:get-status'
+  hardwareGetStatus: 'hardware:get-status',
+  hardwareGetNextTransactionEvent: 'hardware:get-next-transaction-event',
+  hardwareAcknowledgeTransactionEvent: 'hardware:acknowledge-transaction-event'
 } as const
 
 export type HardwareConnectionStatus = 'CONNECTED' | 'OFFLINE'
@@ -41,6 +43,15 @@ export interface HardwareStatusDto {
   mode: HardwareMode | null
   rtc: boolean | null
   sd: boolean | null
+}
+
+export type HardwareTransactionMode = 'restock' | 'checkout'
+
+export interface HardwareTransactionEvent {
+  eventId: string
+  mode: HardwareTransactionMode
+  barcode: string
+  timestamp: string
 }
 
 export interface LoginCredentials {
@@ -167,5 +178,9 @@ export interface DesktopApi {
   }
   hardware: {
     getStatus: () => Promise<HardwareStatusDto>
+    getNextTransactionEvent: () => Promise<HardwareTransactionEvent | null>
+    acknowledgeTransactionEvent: (
+      eventId: string
+    ) => Promise<IpcResult<{ eventId: string }>>
   }
 }

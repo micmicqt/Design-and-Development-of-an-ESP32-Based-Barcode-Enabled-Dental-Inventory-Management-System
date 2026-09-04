@@ -1,3 +1,4 @@
+import type { HardwareTransactionEvent } from '../../shared/ipc-contract'
 import type {
   CacheProduct,
   HardwareBarcodeEvent,
@@ -23,6 +24,7 @@ export class MockHardwareGateway implements HardwareGateway {
     (request: HardwareTransactionRequest) => void
   >()
   private offlineTransactions: OfflineTransactionRecord[] = []
+  private transactionEvents: HardwareTransactionEvent[] = []
 
   constructor() {
     if (process.env.NODE_ENV === 'production') {
@@ -64,6 +66,24 @@ export class MockHardwareGateway implements HardwareGateway {
       rtc: true,
       sd: true
     }
+  }
+
+  async getNextTransactionEvent(): Promise<HardwareTransactionEvent | null> {
+    this.assertConnected()
+    const event = this.transactionEvents[0]
+    return event === undefined ? null : { ...event }
+  }
+
+  async acknowledgeTransactionEvent(eventId: string): Promise<void> {
+    this.assertConnected()
+    if (this.transactionEvents[0]?.eventId !== eventId) {
+      throw new Error('No matching development mock event.')
+    }
+    this.transactionEvents.shift()
+  }
+
+  setTransactionEventsForTest(events: readonly HardwareTransactionEvent[]): void {
+    this.transactionEvents = events.map((event) => ({ ...event }))
   }
 
   onBarcode(listener: (event: HardwareBarcodeEvent) => void): Unsubscribe {

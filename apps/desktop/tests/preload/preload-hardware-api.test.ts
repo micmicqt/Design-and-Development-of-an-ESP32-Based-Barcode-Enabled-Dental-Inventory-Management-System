@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { beforeAll, describe, expect, it, vi } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DesktopApi } from '../../src/shared/ipc-contract'
 import { IPC_CHANNELS } from '../../src/shared/ipc-contract'
 
@@ -28,6 +28,8 @@ describe('preload hardware API', () => {
     api = exposure[1] as DesktopApi
   })
 
+  beforeEach(() => electronMock.invoke.mockReset())
+
   it('exposes only a parameter-free hardware status invocation', async () => {
     const expected = {
       connection: 'CONNECTED',
@@ -40,5 +42,73 @@ describe('preload hardware API', () => {
 
     await expect(api.hardware.getStatus()).resolves.toEqual(expected)
     expect(electronMock.invoke).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetStatus)
+  })
+
+  it('exposes a parameter-free next-event invocation and preserves barcode text', async () => {
+    const event = {
+      eventId: 'device-session-1',
+      mode: 'checkout',
+      barcode: '00012345',
+      timestamp: '2026-09-04 12:00:00'
+    }
+    electronMock.invoke.mockResolvedValueOnce(event)
+
+    await expect(api.hardware.getNextTransactionEvent()).resolves.toEqual(event)
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareGetNextTransactionEvent
+    )
+  })
+
+  it('preserves a no-event result without fabricating a scan', async () => {
+    electronMock.invoke.mockResolvedValueOnce(null)
+
+    await expect(api.hardware.getNextTransactionEvent()).resolves.toBeNull()
+  })
+
+  it('forwards only the event ID to the fixed acknowledgement channel', async () => {
+    const result = { ok: true, value: { eventId: 'device-session-1' } }
+    electronMock.invoke.mockResolvedValueOnce(result)
+
+    await expect(api.hardware.acknowledgeTransactionEvent('device-session-1')).resolves.toEqual(result)
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareAcknowledgeTransactionEvent,
+      'device-session-1'
+    )
+  })
+
+  it('preserves acknowledgement failure for the renderer to retain the pending event', async () => {
+    const result = {
+      ok: false,
+      error: { code: 'INTERNAL_ERROR', message: 'Acknowledgement failed. Try again.' }
+    }
+    electronMock.invoke.mockResolvedValueOnce(result)
+
+    await expect(api.hardware.acknowledgeTransactionEvent('device-session-1')).resolves.toEqual(result)
+  })
+
+  it('does not forward an extra URL argument for event retrieval', async () => {
+    const callWithUnexpectedArgument = api.hardware.getNextTransactionEvent as (
+      unexpected: unknown
+    ) => Promise<unknown>
+    electronMock.invoke.mockResolvedValueOnce(null)
+
+    await callWithUnexpectedArgument('http://untrusted.example/arbitrary')
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareGetNextTransactionEvent
+    )
+  })
+
+  it('keeps the exposed hardware surface narrow and frozen without network access', () => {
+    expect(Object.isFrozen(api)).toBe(true)
+    expect(Object.isFrozen(api.hardware)).toBe(true)
+    expect(Object.keys(api.hardware).sort()).toEqual([
+      'acknowledgeTransactionEvent',
+      'getNextTransactionEvent',
+      'getStatus'
+    ])
+    expect(api.hardware).not.toHaveProperty('baseUrl')
+    expect(api.hardware).not.toHaveProperty('fetch')
+    expect(api.hardware).not.toHaveProperty('request')
+    expect(api.hardware).not.toHaveProperty('invoke')
   })
 })

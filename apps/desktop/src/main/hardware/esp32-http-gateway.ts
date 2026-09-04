@@ -3,8 +3,13 @@ import {
   type Esp32HardwareMode,
   type Esp32HealthResponse,
   type Esp32StatusResponse,
-  type HardwareStatusGateway
+  type HardwareTransactionEventGateway,
+  isValidHardwareTransactionEventId
 } from './hardware-gateway'
+import type {
+  HardwareTransactionEvent,
+  HardwareTransactionMode
+} from '../../shared/ipc-contract'
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_500
 const HARDWARE_MODES: readonly Esp32HardwareMode[] = [
@@ -13,6 +18,10 @@ const HARDWARE_MODES: readonly Esp32HardwareMode[] = [
   'checkout',
   'busy'
 ]
+const TRANSACTION_MODES: readonly HardwareTransactionMode[] = ['restock', 'checkout']
+const TRANSACTION_EVENT_KEYS = ['barcode', 'eventId', 'mode', 'timestamp'] as const
+const ACKNOWLEDGEMENT_KEYS = ['acknowledged', 'eventId'] as const
+const NO_CONTENT = Symbol('HTTP 204')
 
 export interface HardwareHttpResponse {
   ok: boolean
@@ -23,13 +32,14 @@ export interface HardwareHttpResponse {
 export type HardwareFetch = (
   url: string,
   options: {
-    method: 'GET'
+    method: 'GET' | 'POST'
     headers: Readonly<Record<string, string>>
     signal: AbortSignal
+    body?: string
   }
 ) => Promise<HardwareHttpResponse>
 
-export type HardwareGatewayErrorCode = 'UNAVAILABLE' | 'INVALID_RESPONSE'
+export type HardwareGatewayErrorCode = 'UNAVAILABLE' | 'INVALID_RESPONSE' | 'REJECTED'
 
 export class HardwareGatewayError extends Error {
   readonly code: HardwareGatewayErrorCode
@@ -49,6 +59,66 @@ export interface Esp32HttpGatewayOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function hasExactlyKeys(
+  value: Record<string, unknown>,
+  expectedKeys: readonly string[]
+): boolean {
+  const keys = Object.keys(value).sort()
+  const expected = [...expectedKeys].sort()
+  return (
+    keys.length === expectedKeys.length &&
+    keys.every((key, index) => key === expected[index])
+  )
+}
+
+function isValidBarcode(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 256 &&
+    value.trim().length > 0 &&
+    /^[\x20-\x7E]+$/.test(value) &&
+    !value.includes(',')
+  )
+}
+
+function isValidRtcTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(value)
+  if (match === null) return false
+
+  const values = match.slice(1).map(Number)
+  const [year, month, day, hour, minute, second] = values
+  if (
+    year === undefined ||
+    month === undefined ||
+    day === undefined ||
+    hour === undefined ||
+    minute === undefined ||
+    second === undefined ||
+    year < 2000 ||
+    year > 2099 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return false
+  }
+
+  const parsed = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month - 1 &&
+    parsed.getUTCDate() === day &&
+    parsed.getUTCHours() === hour &&
+    parsed.getUTCMinutes() === minute &&
+    parsed.getUTCSeconds() === second
+  )
 }
 
 function normalizeBaseUrl(value: string): string {
@@ -112,9 +182,47 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
   }
 }
 
+function validateTransactionEvent(value: unknown): HardwareTransactionEvent {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, TRANSACTION_EVENT_KEYS) ||
+    !isValidHardwareTransactionEventId(value.eventId) ||
+    typeof value.mode !== 'string' ||
+    !TRANSACTION_MODES.includes(value.mode as HardwareTransactionMode) ||
+    !isValidBarcode(value.barcode) ||
+    !isValidRtcTimestamp(value.timestamp)
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The ESP32 transaction event response is invalid.'
+    )
+  }
+
+  return {
+    eventId: value.eventId,
+    mode: value.mode as HardwareTransactionMode,
+    barcode: value.barcode,
+    timestamp: value.timestamp
+  }
+}
+
+function validateAcknowledgement(value: unknown, expectedEventId: string): void {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ACKNOWLEDGEMENT_KEYS) ||
+    value.acknowledged !== true ||
+    value.eventId !== expectedEventId
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The ESP32 transaction acknowledgement response is invalid.'
+    )
+  }
+}
+
 const defaultFetch: HardwareFetch = (url, options) => fetch(url, options)
 
-export class Esp32HttpGateway implements HardwareStatusGateway {
+export class Esp32HttpGateway implements HardwareTransactionEventGateway {
   private readonly baseUrl: string
   private readonly requestTimeoutMs: number
   private readonly fetcher: HardwareFetch
@@ -136,23 +244,77 @@ export class Esp32HttpGateway implements HardwareStatusGateway {
     return validateStatusResponse(await this.request('/status'))
   }
 
-  private async request(path: '/health' | '/status'): Promise<unknown> {
+  async getNextTransactionEvent(): Promise<HardwareTransactionEvent | null> {
+    const response = await this.request('/events/next', { allowNoContent: true })
+    return response === NO_CONTENT ? null : validateTransactionEvent(response)
+  }
+
+  async acknowledgeTransactionEvent(eventId: string): Promise<void> {
+    if (!isValidHardwareTransactionEventId(eventId)) {
+      throw new HardwareGatewayError(
+        'INVALID_RESPONSE',
+        'The transaction event ID is invalid.'
+      )
+    }
+
+    const response = await this.request('/events/ack', {
+      method: 'POST',
+      body: JSON.stringify({ eventId })
+    })
+    validateAcknowledgement(response, eventId)
+  }
+
+  private async request(
+    path: '/health' | '/status' | '/events/next' | '/events/ack',
+    options: {
+      method?: 'GET' | 'POST'
+      body?: string
+      allowNoContent?: boolean
+    } = {}
+  ): Promise<unknown> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs)
+    const method = options.method ?? 'GET'
 
     try {
       const response = await this.fetcher(`${this.baseUrl}${path}`, {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-        signal: controller.signal
+        method,
+        headers:
+          method === 'POST'
+            ? { Accept: 'application/json', 'Content-Type': 'application/json' }
+            : { Accept: 'application/json' },
+        signal: controller.signal,
+        ...(options.body === undefined ? {} : { body: options.body })
       })
+      if (options.allowNoContent === true && response.status === 204) return NO_CONTENT
       if (!response.ok) {
+        if (method === 'POST' && response.status >= 400 && response.status < 500) {
+          throw new HardwareGatewayError(
+            'REJECTED',
+            'The ESP32 rejected the transaction acknowledgement.'
+          )
+        }
         throw new HardwareGatewayError(
           'UNAVAILABLE',
           `The ESP32 returned HTTP ${response.status}.`
         )
       }
-      return await response.json()
+
+      if (path.startsWith('/events/') && response.status !== 200) {
+        throw new HardwareGatewayError(
+          'INVALID_RESPONSE',
+          'The ESP32 returned an unexpected event response status.'
+        )
+      }
+
+      try {
+        return await response.json()
+      } catch {
+        throw new HardwareGatewayError(
+          'INVALID_RESPONSE',
+          'The ESP32 returned malformed JSON.'
+        )
+      }
     } catch (error: unknown) {
       if (error instanceof HardwareGatewayError) throw error
       throw new HardwareGatewayError('UNAVAILABLE', 'The ESP32 is unavailable.')
