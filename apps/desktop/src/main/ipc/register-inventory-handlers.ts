@@ -22,6 +22,7 @@ import {
 import { isTrustedMainFrame, type MainWindowProvider } from './ipc-security'
 import {
   PayloadValidationError,
+  validateBarcodeLookupPayload,
   validateCreateProductInput,
   validateDeleteProductInput,
   validateDroppedImagePath,
@@ -145,6 +146,21 @@ export function registerInventoryIpcHandlers(
   options: RegisterInventoryIpcHandlersOptions
 ): () => void {
   const { inventoryService, imageStore, authSession, getMainWindow } = options
+
+  ipcMain.handle(
+    IPC_CHANNELS.productsFindByBarcode,
+    (event, rawBarcode: unknown): IpcResult<ProductDto | null> => {
+      if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
+
+      try {
+        const barcode = validateBarcodeLookupPayload(rawBarcode)
+        const product = inventoryService.findProductByBarcode(barcode)
+        return ok(product === null ? null : toProductDto(product, imageStore))
+      } catch (error: unknown) {
+        return sanitizedFailure(error)
+      }
+    }
+  )
 
   ipcMain.handle(
     IPC_CHANNELS.productsList,
@@ -301,6 +317,7 @@ export function registerInventoryIpcHandlers(
   )
 
   return () => {
+    ipcMain.removeHandler(IPC_CHANNELS.productsFindByBarcode)
     ipcMain.removeHandler(IPC_CHANNELS.productsList)
     ipcMain.removeHandler(IPC_CHANNELS.productsCreate)
     ipcMain.removeHandler(IPC_CHANNELS.productsUpdate)

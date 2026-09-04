@@ -137,6 +137,22 @@ export function validateProductListQuery(value: unknown): ProductListQuery {
   return { search, category }
 }
 
+/** Validate scanner text without trimming, case folding, or numeric conversion. */
+export function validateBarcodeLookupPayload(value: unknown): string {
+  if (
+    typeof value !== 'string' ||
+    value.trim().length === 0 ||
+    value.length > 256 ||
+    Array.from(value).some((character) => {
+      const code = character.charCodeAt(0)
+      return code < 32 || code === 127
+    })
+  ) {
+    throw new PayloadValidationError({ barcode: 'Barcode must be valid text, 1–256 characters long.' })
+  }
+  return value
+}
+
 export function validateCreateProductInput(value: unknown): CreateProductInput {
   const candidate = asRecord(value)
   const fieldErrors: Record<string, string> = {}

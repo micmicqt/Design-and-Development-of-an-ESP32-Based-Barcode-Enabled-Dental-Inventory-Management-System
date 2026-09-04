@@ -2426,6 +2426,55 @@ button:focus-visible {
   justify-content: flex-end;
 }
 
+.hardware-transaction-product {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 20px 0;
+}
+
+.hardware-transaction-product > .product-image,
+.hardware-transaction-product > .product-image-placeholder {
+  flex: 0 0 76px;
+  width: 76px;
+  height: 76px;
+  object-fit: contain;
+}
+
+.hardware-transaction-product h3,
+.hardware-transaction-product p {
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+
+.hardware-transaction-product p {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.hardware-transaction-quantity {
+  margin-top: 20px;
+}
+
+.hardware-pending-scan {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 18px;
+  padding: 14px 18px;
+  background: #edf5ff;
+  border: 1px solid #cddff2;
+  border-radius: 12px;
+}
+
+.hardware-pending-scan p {
+  margin: 0;
+  color: var(--navy-deep);
+  font-size: 13px;
+}
+
 .icon-button {
   color: #49637d;
   background: #f4f8fc;

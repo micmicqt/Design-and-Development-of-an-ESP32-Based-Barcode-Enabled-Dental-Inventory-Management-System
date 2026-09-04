@@ -29,6 +29,8 @@ const desktopApi: DesktopApi = Object.freeze({
     logout: () => ipcRenderer.invoke(IPC_CHANNELS.authLogout)
   }),
   inventory: Object.freeze({
+    findProductByBarcode: (barcode: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.productsFindByBarcode, barcode),
     listProducts: (query: ProductListQuery) =>
       ipcRenderer.invoke(IPC_CHANNELS.productsList, {
         search: query.search,

@@ -118,6 +118,11 @@ React communicates only through narrow authentication, inventory, and hardware-s
 
 ### Local ESP32 status connection
 
+Phase 5 Step 1 adds exact barcode lookup and quantity review on the desktop,
+without changing stock or history. See [the lookup and quantity workflow guide](docs/phase5-step1-quantity-workflow.md)
+for known/unknown scans, deferred review, and acknowledgement behavior. The
+verified Phase 4 firmware and HTTP event contract remain unchanged.
+
 Phase 4 Step 3 adds temporary hardware scan delivery over this same gateway. See
 [the event delivery contract and verification guide](docs/phase4-step3-event-delivery.md)
 for the current firmware/desktop behavior and RAM-queue limitations. Earlier phase

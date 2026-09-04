@@ -111,4 +111,51 @@ describe('preload hardware API', () => {
     expect(api.hardware).not.toHaveProperty('request')
     expect(api.hardware).not.toHaveProperty('invoke')
   })
+
+  it.each(['0012345', ' 0012345 '])(
+    'forwards exact barcode text through only the fixed lookup channel: %s',
+    async (barcode) => {
+      const result = { ok: true, value: null }
+      electronMock.invoke.mockResolvedValueOnce(result)
+
+      await expect(api.inventory.findProductByBarcode(barcode)).resolves.toEqual(result)
+      expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+        IPC_CHANNELS.productsFindByBarcode,
+        barcode
+      )
+    }
+  )
+
+  it('does not expose database queries or generic IPC for barcode lookup', async () => {
+    const callWithExtraArgument = api.inventory.findProductByBarcode as (
+      barcode: string,
+      unexpected: unknown
+    ) => Promise<unknown>
+    electronMock.invoke.mockResolvedValueOnce({ ok: true, value: null })
+
+    await callWithExtraArgument('00123', { sql: 'SELECT * FROM configured_admin' })
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.productsFindByBarcode,
+      '00123'
+    )
+    expect(Object.isFrozen(api.inventory)).toBe(true)
+    expect(api.inventory).not.toHaveProperty('query')
+    expect(api.inventory).not.toHaveProperty('execute')
+    expect(api.inventory).not.toHaveProperty('database')
+    expect(api.inventory).not.toHaveProperty('invoke')
+  })
+
+  it('passes barcode lookup errors back without acknowledging a hardware event', async () => {
+    const result = {
+      ok: false,
+      error: { code: 'INTERNAL_ERROR', message: 'Unable to complete the request.' }
+    }
+    electronMock.invoke.mockResolvedValueOnce(result)
+
+    await expect(api.inventory.findProductByBarcode('00123')).resolves.toEqual(result)
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.productsFindByBarcode,
+      '00123'
+    )
+  })
 })

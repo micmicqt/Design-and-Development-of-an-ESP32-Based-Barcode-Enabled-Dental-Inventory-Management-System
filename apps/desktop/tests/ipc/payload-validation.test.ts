@@ -4,12 +4,29 @@ import { describe, expect, it } from 'vitest'
 import { resolve } from 'node:path'
 import {
   PayloadValidationError,
+  validateBarcodeLookupPayload,
   validateCreateProductInput,
   validateDeleteProductInput,
   validateDroppedImagePath,
   validateProductListQuery,
   validateUpdateProductInput
 } from '../../src/main/ipc/payload-validation'
+
+describe('exact barcode lookup IPC validation', () => {
+  it.each(['001234567890', ' 001234567890 ', 'ABC-123', 'A'.repeat(256)])(
+    'preserves the exact lookup text: %s',
+    (barcode) => {
+      expect(validateBarcodeLookupPayload(barcode)).toBe(barcode)
+    }
+  )
+
+  it.each([
+    undefined, null, 123, true, {}, ['00123'], { barcode: '00123' },
+    '', '   ', 'A'.repeat(257), '001\u0000', '001\r', '001\n'
+  ])('rejects invalid lookup payload: %j', (payload) => {
+    expect(() => validateBarcodeLookupPayload(payload)).toThrowError(PayloadValidationError)
+  })
+})
 
 describe('Phase 2 IPC payload validation', () => {
   it('preserves leading zeroes while normalizing a product barcode', () => {

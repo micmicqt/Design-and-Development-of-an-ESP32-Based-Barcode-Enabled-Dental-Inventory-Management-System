@@ -55,6 +55,7 @@ const PRODUCT: ProductRecord = {
 function createService(): InventoryService {
   return {
     listProducts: vi.fn(() => [PRODUCT]),
+    findProductByBarcode: vi.fn(() => PRODUCT),
     createProduct: vi.fn(() => PRODUCT),
     updateProduct: vi.fn(() => PRODUCT),
     deleteProduct: vi.fn(() => PRODUCT),
@@ -168,6 +169,121 @@ describe('authenticated inventory IPC boundary', () => {
       ]
     })
     expect(result).not.toHaveProperty('value.0.imagePath')
+  })
+
+  it.each(['00123', ' 00123 ', 'A'.repeat(256)])(
+    'passes an exact barcode string to the lookup service without normalization: %s',
+    (barcode) => {
+      authSession.signIn('admin')
+      vi.mocked(inventoryService.findProductByBarcode).mockReturnValue({ ...PRODUCT, barcode })
+
+      const result = handler(IPC_CHANNELS.productsFindByBarcode)(trustedEvent, barcode)
+
+      expect(inventoryService.findProductByBarcode).toHaveBeenCalledExactlyOnceWith(barcode)
+      expect(result).toMatchObject({ ok: true, value: { barcode, currentStock: 2, status: 'HIGH' } })
+      expect(inventoryService.createProduct).not.toHaveBeenCalled()
+      expect(inventoryService.updateProduct).not.toHaveBeenCalled()
+      expect(inventoryService.deleteProduct).not.toHaveBeenCalled()
+      expect(inventoryService.listMovementHistory).not.toHaveBeenCalled()
+      expect(inventoryService.listProducts).not.toHaveBeenCalled()
+    }
+  )
+
+  it('returns a successful null lookup for an unregistered barcode', () => {
+    authSession.signIn('admin')
+    vi.mocked(inventoryService.findProductByBarcode).mockReturnValue(null)
+
+    const result = handler(IPC_CHANNELS.productsFindByBarcode)(trustedEvent, 'unknown-001')
+
+    expect(result).toEqual({ ok: true, value: null })
+    expect(inventoryService.findProductByBarcode).toHaveBeenCalledExactlyOnceWith('unknown-001')
+    expect(inventoryService.createProduct).not.toHaveBeenCalled()
+    expect(inventoryService.updateProduct).not.toHaveBeenCalled()
+    expect(inventoryService.deleteProduct).not.toHaveBeenCalled()
+  })
+
+  it('uses the existing managed-image DTO sanitization for a found product', () => {
+    authSession.signIn('admin')
+    const imagePath = 'product-images/00000000-0000-4000-8000-000000000001.jpg'
+    vi.mocked(inventoryService.findProductByBarcode).mockReturnValue({ ...PRODUCT, imagePath })
+    const toRendererUrl = vi.spyOn(imageStore, 'toRendererUrl')
+
+    const result = handler(IPC_CHANNELS.productsFindByBarcode)(trustedEvent, PRODUCT.barcode)
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { imageUrl: 'dental-image://product/00000000-0000-4000-8000-000000000001.jpg' }
+    })
+    expect(toRendererUrl).toHaveBeenCalledExactlyOnceWith(imagePath)
+    expect(result).not.toHaveProperty('value.imagePath')
+  })
+
+  it('does not expose an unmanaged image path in a barcode lookup result', () => {
+    authSession.signIn('admin')
+    vi.mocked(inventoryService.findProductByBarcode).mockReturnValue({
+      ...PRODUCT,
+      imagePath: 'C:/private/clinic/photo.jpg'
+    })
+
+    const result = handler(IPC_CHANNELS.productsFindByBarcode)(trustedEvent, PRODUCT.barcode)
+
+    expect(result).toMatchObject({ ok: true, value: { imageUrl: null } })
+    expect(JSON.stringify(result)).not.toContain('C:/private')
+  })
+
+  it('blocks barcode lookup when signed out, from another window, or from a subframe', () => {
+    const lookup = handler(IPC_CHANNELS.productsFindByBarcode)
+    expect(lookup(trustedEvent, PRODUCT.barcode)).toMatchObject({
+      ok: false, error: { code: 'UNAUTHORIZED' }
+    })
+
+    authSession.signIn('admin')
+    for (const event of [
+      { ...trustedEvent, sender: { isDestroyed: () => false, mainFrame: {} } },
+      { ...trustedEvent, senderFrame: {} }
+    ]) {
+      expect(lookup(event, PRODUCT.barcode)).toMatchObject({
+        ok: false, error: { code: 'UNAUTHORIZED' }
+      })
+    }
+    expect(inventoryService.findProductByBarcode).not.toHaveBeenCalled()
+  })
+
+  it.each([undefined, null, 123, {}, ['00123'], '', ' ', 'A'.repeat(257), '001\u0000', '001\n'])(
+    'rejects invalid barcode lookup payload before service access: %j',
+    (payload) => {
+      authSession.signIn('admin')
+      const result = handler(IPC_CHANNELS.productsFindByBarcode)(trustedEvent, payload)
+
+      expect(result).toMatchObject({ ok: false, error: { code: 'VALIDATION_ERROR' } })
+      expect(inventoryService.findProductByBarcode).not.toHaveBeenCalled()
+    }
+  )
+
+  it('sanitizes unexpected lookup errors without returning database details', () => {
+    authSession.signIn('admin')
+    vi.mocked(inventoryService.findProductByBarcode).mockImplementation(() => {
+      throw new Error('SQLITE_ERROR C:/private/clinic/inventory.db')
+    })
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      const result = handler(IPC_CHANNELS.productsFindByBarcode)(trustedEvent, PRODUCT.barcode)
+
+      expect(result).toEqual({
+        ok: false,
+        error: { code: 'INTERNAL_ERROR', message: 'Unable to complete the request.' }
+      })
+      expect(JSON.stringify(result)).not.toContain('SQLITE_ERROR')
+      expect(JSON.stringify(result)).not.toContain('C:/private')
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it('disposes the barcode lookup handler with the other inventory handlers', () => {
+    expect(electronMock.handlers.has(IPC_CHANNELS.productsFindByBarcode)).toBe(true)
+    dispose()
+    expect(electronMock.handlers.has(IPC_CHANNELS.productsFindByBarcode)).toBe(false)
   })
 
   it('validates a dropped image through the existing managed selection store', async () => {

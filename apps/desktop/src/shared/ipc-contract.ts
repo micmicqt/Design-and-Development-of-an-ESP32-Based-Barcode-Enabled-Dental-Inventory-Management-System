@@ -22,6 +22,7 @@ export const IPC_CHANNELS = {
   authLogin: 'auth:login',
   authLogout: 'auth:logout',
   productsList: 'products:list',
+  productsFindByBarcode: 'products:find-by-barcode',
   productsCreate: 'products:create',
   productsUpdate: 'products:update',
   productsDelete: 'products:delete',
@@ -169,6 +170,8 @@ export interface DesktopApi {
   }
   inventory: {
     listProducts: (query: ProductListQuery) => Promise<IpcResult<ProductDto[]>>
+    /** Exact active-product lookup. A successful null result means unregistered. */
+    findProductByBarcode: (barcode: string) => Promise<IpcResult<ProductDto | null>>
     createProduct: (input: CreateProductInput) => Promise<IpcResult<ProductDto>>
     updateProduct: (input: UpdateProductInput) => Promise<IpcResult<ProductDto>>
     deleteProduct: (input: DeleteProductInput) => Promise<IpcResult<DeletedProductResult>>

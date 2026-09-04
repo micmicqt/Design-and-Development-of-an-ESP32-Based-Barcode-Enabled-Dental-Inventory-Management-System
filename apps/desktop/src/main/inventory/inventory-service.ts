@@ -168,10 +168,36 @@ export interface InventoryServiceOptions {
 
 export interface InventoryService {
   listProducts(query?: ProductQuery): ProductRecord[];
+  findProductByBarcode(barcode: string): ProductRecord | null;
   createProduct(input: CreateProductInput): ProductRecord;
   updateProduct(input: UpdateProductInput): ProductRecord;
   deleteProduct(input: DeleteProductInput): ProductRecord;
   listMovementHistory(): MovementHistoryRecord[];
+}
+
+function validateLookupBarcode(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new InventoryValidationError("Barcode / SKU must be text.");
+  }
+  if (!/\S/u.test(value)) {
+    throw new InventoryValidationError("Barcode / SKU is required.");
+  }
+  if (value.length > MAX_BARCODE_LENGTH) {
+    throw new InventoryValidationError(
+      `Barcode / SKU must contain at most ${MAX_BARCODE_LENGTH} characters.`,
+    );
+  }
+  if (Array.from(value).some((character) => {
+    const code = character.charCodeAt(0);
+    return code < 32 || code === 127;
+  })) {
+    throw new InventoryValidationError("Barcode / SKU must not contain control characters.");
+  }
+
+  // Lookup must preserve the exact scanner text, including leading zeroes,
+  // case and surrounding spaces. The existing create/search normalization is
+  // intentionally not reused or changed here.
+  return value;
 }
 
 function normalizeRequiredText(
@@ -380,6 +406,11 @@ export function createInventoryService(
     FROM products
     WHERE id = ? AND deleted_at IS NULL
   `);
+  const findActiveProductByBarcodeStatement = database.prepare(`
+    SELECT ${productColumns}
+    FROM products
+    WHERE barcode = ? COLLATE BINARY AND deleted_at IS NULL
+  `);
   const insertProductStatement = database.prepare(`
     INSERT INTO products (
       barcode,
@@ -489,6 +520,13 @@ export function createInventoryService(
       const normalized = normalizeQuery(query);
       const rows = listProductsStatement.all(normalized) as ProductRow[];
       return rows.map(productFromRow);
+    },
+
+    findProductByBarcode(barcode) {
+      const row = findActiveProductByBarcodeStatement.get(
+        validateLookupBarcode(barcode),
+      ) as ProductRow | undefined;
+      return row ? productFromRow(row) : null;
     },
 
     createProduct(input) {

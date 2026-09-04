@@ -65,6 +65,7 @@ function createDesktopApi({
     },
     inventory: {
       listProducts: vi.fn().mockResolvedValue({ ok: true, value: [] }),
+      findProductByBarcode: vi.fn().mockResolvedValue({ ok: true, value: null }),
       createProduct: vi.fn().mockResolvedValue({
         ok: false,
         error: { code: 'INTERNAL_ERROR', message: 'Not configured for this test.' }
@@ -170,7 +171,7 @@ describe('Phase 4 hardware transaction event delivery', () => {
   afterEach(() => vi.useRealTimers())
 
   it.each(['restock', 'checkout'] as const)(
-    'shows one %s scan modal with unchanged barcode and timestamp, without inventory writes',
+    'shows one unknown %s scan with unchanged barcode and timestamp, and rejects only explicitly',
     async (mode) => {
       const event = { ...restockEvent, mode }
       const getNextTransactionEvent = vi.fn().mockResolvedValue(event)
@@ -185,10 +186,12 @@ describe('Phase 4 hardware transaction event delivery', () => {
 
       render(<App />)
       await settle()
-      const dialog = screen.getByRole('dialog', { name: `${mode.toUpperCase()} SCAN DETECTED` })
+      const dialog = screen.getByRole('dialog', { name: `${mode.toUpperCase()} TRANSACTION` })
       expect(within(dialog).getByText('0001234500123')).toBeVisible()
       expect(within(dialog).getByText('2026-09-04 12:34:56')).toBeVisible()
-      expect(within(dialog).getAllByRole('button')).toHaveLength(1)
+      expect(within(dialog).getAllByRole('button')).toHaveLength(2)
+      expect(within(dialog).getByRole('heading', { name: 'ITEM NOT FOUND' })).toBeVisible()
+      expect(api.inventory.findProductByBarcode).toHaveBeenCalledWith(event.barcode)
       expect(within(dialog).queryByRole('spinbutton')).not.toBeInTheDocument()
 
       // The same FIFO head would be returned again, but polling pauses while it is pending.
@@ -197,7 +200,7 @@ describe('Phase 4 hardware transaction event delivery', () => {
       expect(screen.getAllByRole('dialog')).toHaveLength(1)
       expect(acknowledgeTransactionEvent).not.toHaveBeenCalled()
 
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Dismiss' }))
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Reject scan' }))
       await settle()
       expect(acknowledgeTransactionEvent).toHaveBeenCalledWith(event.eventId)
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
@@ -241,7 +244,7 @@ describe('Phase 4 hardware transaction event delivery', () => {
 
     await act(async () => resolveEvent(restockEvent))
     expect(screen.getAllByRole('dialog')).toHaveLength(1)
-    expect(screen.getByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })).toBeVisible()
+    expect(screen.getByRole('dialog', { name: 'RESTOCK TRANSACTION' })).toBeVisible()
     await advance(10_000)
     expect(getNextTransactionEvent).toHaveBeenCalledOnce()
   })
@@ -266,7 +269,7 @@ describe('Phase 4 hardware transaction event delivery', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     await advance(1_000)
     expect(getNextTransactionEvent).toHaveBeenCalledTimes(3)
-    expect(screen.getByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })).toBeVisible()
+    expect(screen.getByRole('dialog', { name: 'RESTOCK TRANSACTION' })).toBeVisible()
   })
 
   it('keeps the modal for rejected, failed, or mismatched acknowledgements and allows retry', async () => {
@@ -288,22 +291,22 @@ describe('Phase 4 hardware transaction event delivery', () => {
     await settle()
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
-      fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Reject scan' }))
       await settle()
-      expect(screen.getByRole('alert')).toHaveTextContent('Could not acknowledge this scan.')
-      expect(screen.getByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })).toBeVisible()
-      expect(screen.getByRole('button', { name: 'Dismiss' })).toBeEnabled()
-      expect(screen.getByRole('button', { name: 'Dismiss' })).toHaveFocus()
+      expect(screen.getByText('Could not acknowledge this scan. Check the ESP32 connection and try again.')).toBeVisible()
+      expect(screen.getByRole('dialog', { name: 'RESTOCK TRANSACTION' })).toBeVisible()
+      expect(screen.getByRole('button', { name: 'Reject scan' })).toBeEnabled()
+      expect(screen.getByRole('button', { name: 'Reject scan' })).toHaveFocus()
       await advance(2_000)
       expect(getNextTransactionEvent).toHaveBeenCalledOnce()
       expect(acknowledgeTransactionEvent).toHaveBeenCalledTimes(attempt)
     }
 
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reject scan' }))
     await settle()
-    expect(screen.queryByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })).not.toBeInTheDocument()
-    expect(screen.getByRole('dialog', { name: 'CHECKOUT SCAN DETECTED' })).toBeVisible()
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: 'RESTOCK TRANSACTION' })).not.toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'CHECKOUT TRANSACTION' })).toBeVisible()
+    expect(screen.queryByText('Could not acknowledge this scan. Check the ESP32 connection and try again.')).not.toBeInTheDocument()
     expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
     expect(acknowledgeTransactionEvent).toHaveBeenCalledTimes(4)
   })
@@ -322,7 +325,7 @@ describe('Phase 4 hardware transaction event delivery', () => {
     render(<App />)
     await settle()
 
-    const dismiss = screen.getByRole('button', { name: 'Dismiss' })
+    const dismiss = screen.getByRole('button', { name: 'Reject scan' })
     fireEvent.click(dismiss)
     fireEvent.click(dismiss)
     expect(screen.getByRole('button', { name: 'Acknowledging…' })).toBeDisabled()
@@ -361,15 +364,15 @@ describe('Phase 4 hardware transaction event delivery', () => {
     const logout = screen.getByRole('button', { name: 'Logout' })
 
     await act(async () => resolveEvent(restockEvent))
-    const dialog = screen.getByRole('dialog', { name: 'RESTOCK SCAN DETECTED' })
-    const dismiss = within(dialog).getByRole('button', { name: 'Dismiss' })
+    const dialog = screen.getByRole('dialog', { name: 'RESTOCK TRANSACTION' })
+    const dismiss = within(dialog).getByRole('button', { name: 'Reject scan' })
     expect(dismiss).toHaveFocus()
     // JSDOM does not enforce native inert behavior: assert the browser containment contract,
     // and separately exercise the dialog's actual Tab/Shift+Tab handling with userEvent.
     expect(navigation.closest('.sidebar')).toHaveAttribute('inert')
     expect(logout.closest('.workspace')).toHaveAttribute('inert')
     await user.tab()
-    expect(dismiss).toHaveFocus()
+    expect(within(dialog).getByRole('button', { name: 'Review later' })).toHaveFocus()
     await user.tab({ shift: true })
     expect(dismiss).toHaveFocus()
     await user.keyboard('{Escape}')
@@ -433,6 +436,261 @@ describe('Phase 4 hardware transaction event delivery', () => {
     await advance(5_000)
     expect(screen.getByRole('button', { name: 'Sign In' })).toBeVisible()
     expect(api.hardware.getNextTransactionEvent).not.toHaveBeenCalled()
+  })
+})
+
+describe('Phase 5 barcode lookup and quantity review', () => {
+  const event: HardwareTransactionEvent = {
+    eventId: 'device-phase5-0001', mode: 'restock', barcode: '00012345',
+    timestamp: '2026-09-04 12:34:56'
+  }
+
+  async function settle(): Promise<void> {
+    await act(async () => { await Promise.resolve() })
+  }
+
+  function installKnownItem(mode: HardwareTransactionEvent['mode'] = 'restock') {
+    const api = createDesktopApi({
+      inventory: {
+        findProductByBarcode: vi.fn().mockResolvedValue({ ok: true, value: product({
+          imageUrl: 'dental-image://product/00000000-0000-4000-8000-000000000001.jpg'
+        }) })
+      },
+      hardware: { getNextTransactionEvent: vi.fn().mockResolvedValue({ ...event, mode }) }
+    })
+    installDesktopApi(api)
+    return api
+  }
+
+  function expectNoWritesOrAcknowledgement(api: DesktopApi): void {
+    expect(api.inventory.createProduct).not.toHaveBeenCalled()
+    expect(api.inventory.updateProduct).not.toHaveBeenCalled()
+    expect(api.inventory.deleteProduct).not.toHaveBeenCalled()
+    expect(api.hardware.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  }
+
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it.each(['restock', 'checkout'] as const)('populates %s from exact lookup and validates without changing stock', async (mode) => {
+    const api = installKnownItem(mode)
+    render(<App />)
+    await settle()
+    const dialog = screen.getByRole('dialog', { name: `${mode.toUpperCase()} TRANSACTION` })
+    expect(api.inventory.findProductByBarcode).toHaveBeenCalledWith('00012345')
+    expect(within(dialog).getByRole('heading', { name: 'Composite Resin' })).toBeVisible()
+    expect(within(dialog).getByText('Restorative & Esthetic')).toBeVisible()
+    expect(within(dialog).getByText('00012345')).toBeVisible()
+    expect(within(dialog).getByText('2026-09-04 12:34:56')).toBeVisible()
+    expect(within(dialog).getByText('12')).toBeVisible()
+    expect(within(dialog).getByText('HIGH')).toBeVisible()
+    expect(within(dialog).getByRole('img', { name: 'Composite Resin reference' })).toHaveAttribute(
+      'src', 'dental-image://product/00000000-0000-4000-8000-000000000001.jpg'
+    )
+    const quantity = within(dialog).getByLabelText(`Quantity to ${mode === 'restock' ? 'ADD' : 'REMOVE'}`)
+    expect(quantity).toHaveFocus()
+    expectNoWritesOrAcknowledgement(api)
+    fireEvent.change(quantity, { target: { value: '3' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Validate' }))
+    await settle()
+    expect(api.inventory.findProductByBarcode).toHaveBeenCalledTimes(2)
+    expect(within(dialog).getByRole('status')).toHaveTextContent(
+      'Quantity 3 validated. Ready for Phase 5 Step 2 database transaction.'
+    )
+    expect(within(dialog).getByText('12')).toBeVisible()
+    expect(within(dialog).queryByRole('button', { name: 'Reject scan' })).not.toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
+    expect(api.hardware.getNextTransactionEvent).toHaveBeenCalledOnce()
+    expectNoWritesOrAcknowledgement(api)
+    expect(api.inventory.listMovementHistory).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['', 'Enter a quantity.'],
+    ['0', 'Quantity must be greater than zero.'],
+    ['-1', 'Quantity must be a positive whole number.'],
+    ['1.5', 'Quantity must be a positive whole number.'],
+    ['abc', 'Quantity must be a positive whole number.'],
+    ['10001', 'Quantity must not exceed 10,000 per scan.']
+  ])('rejects quantity %j and preserves the pending event', async (value, errorMessage) => {
+    const api = installKnownItem()
+    render(<App />)
+    await settle()
+    fireEvent.change(screen.getByLabelText('Quantity to ADD'), { target: { value } })
+    fireEvent.click(screen.getByRole('button', { name: 'Validate' }))
+    await settle()
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByRole('alert')).toHaveTextContent(errorMessage)
+    expect(within(dialog).queryByText(/Ready for Phase 5 Step 2/)).not.toBeInTheDocument()
+    expectNoWritesOrAcknowledgement(api)
+  })
+
+  it('checks checkout against newly read stock instead of the initial dialog snapshot', async () => {
+    const api = installKnownItem('checkout')
+    vi.mocked(api.inventory.findProductByBarcode)
+      .mockResolvedValueOnce({ ok: true, value: product() })
+      .mockResolvedValueOnce({ ok: true, value: product({ currentStock: 2, status: 'LOW' }) })
+    render(<App />)
+    await settle()
+    expect(within(screen.getByRole('dialog')).getByText('12')).toBeVisible()
+    fireEvent.change(screen.getByLabelText('Quantity to REMOVE'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Validate' }))
+    await settle()
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('Insufficient stock. Only 2 available for checkout.')
+    expect(within(dialog).getByText('2')).toBeVisible()
+    expect(within(dialog).getByText('LOW')).toBeVisible()
+    expectNoWritesOrAcknowledgement(api)
+  })
+
+  it('clearly blocks checkout when current stock is zero', async () => {
+    const api = installKnownItem('checkout')
+    vi.mocked(api.inventory.findProductByBarcode).mockResolvedValue({
+      ok: true, value: product({ currentStock: 0, status: 'EMPTY' })
+    })
+    render(<App />)
+    await settle()
+    expect(screen.getByRole('alert')).toHaveTextContent('Checkout cannot proceed: this item has no available stock.')
+    fireEvent.change(screen.getByLabelText('Quantity to REMOVE'), { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Validate' }))
+    await settle()
+    expect(screen.getAllByRole('alert').every((alert) => alert.textContent?.includes('no available stock'))).toBe(true)
+    expectNoWritesOrAcknowledgement(api)
+  })
+
+  it('supports Review later and resumes with fresh data without clearing or acknowledging the scan', async () => {
+    const api = installKnownItem()
+    vi.mocked(api.inventory.findProductByBarcode)
+      .mockResolvedValueOnce({ ok: true, value: product() })
+      .mockResolvedValueOnce({ ok: true, value: product({ itemName: 'Updated Item', currentStock: 7 }) })
+    render(<App />)
+    await settle()
+    fireEvent.change(screen.getByLabelText('Quantity to ADD'), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Review later' }))
+    await settle()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.getByText('A RESTOCK scan is pending. Stock is unchanged.')).toBeVisible()
+    expect(screen.getByLabelText('Search inventory')).toBeEnabled()
+    expect(screen.getByLabelText('Filter by category')).toBeEnabled()
+    fireEvent.change(screen.getByLabelText('Search inventory'), { target: { value: '00012345' } })
+    fireEvent.change(screen.getByLabelText('Filter by category'), { target: { value: 'General' } })
+    fireEvent.click(screen.getByRole('tab', { name: 'MOVEMENT HISTORY' }))
+    await settle()
+    expect(screen.getByRole('heading', { name: 'Movement History' })).toBeVisible()
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(api.hardware.getNextTransactionEvent).toHaveBeenCalledOnce()
+    expectNoWritesOrAcknowledgement(api)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume pending scan' }))
+    await settle()
+    expect(api.inventory.findProductByBarcode).toHaveBeenCalledTimes(2)
+    expect(within(screen.getByRole('dialog')).getByRole('heading', { name: 'Updated Item' })).toBeVisible()
+    expect(within(screen.getByRole('dialog')).getByText('7')).toBeVisible()
+    expect(screen.getByLabelText('Quantity to ADD')).toHaveValue('2')
+    expectNoWritesOrAcknowledgement(api)
+  })
+
+  it('serializes lookup when a loading scan is reviewed later and resumed before its response', async () => {
+    let finishFirstLookup!: (result: { ok: true; value: ProductDto }) => void
+    const api = installKnownItem()
+    vi.mocked(api.inventory.findProductByBarcode)
+      .mockReturnValueOnce(new Promise((resolve) => { finishFirstLookup = resolve }))
+      .mockResolvedValueOnce({ ok: true, value: product({ itemName: 'Fresh Item', currentStock: 4 }) })
+    render(<App />)
+    await settle()
+    expect(screen.getByText('Looking up barcode in inventory…')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Review later' }))
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Resume pending scan' }))
+    await settle()
+    expect(api.inventory.findProductByBarcode).toHaveBeenCalledOnce()
+    await act(async () => finishFirstLookup({ ok: true, value: product() }))
+    expect(api.inventory.findProductByBarcode).toHaveBeenCalledTimes(2)
+    expect(within(screen.getByRole('dialog')).getByText('Fresh Item')).toBeVisible()
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
+    expectNoWritesOrAcknowledgement(api)
+  })
+
+  it.each(['rejected promise', 'error result'] as const)('does not classify %s as an unknown barcode and supports retry', async (failure) => {
+    const api = installKnownItem()
+    const lookup = vi.mocked(api.inventory.findProductByBarcode)
+    if (failure === 'rejected promise') lookup.mockRejectedValueOnce(new Error('Database temporarily unavailable'))
+    else lookup.mockResolvedValueOnce({ ok: false, error: { code: 'INTERNAL_ERROR', message: 'Unavailable' } })
+    render(<App />)
+    await settle()
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not look up this barcode.')
+    expect(screen.queryByText('ITEM NOT FOUND')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reject scan' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Review later' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry lookup' }))
+    await settle()
+    expect(screen.getByLabelText('Quantity to ADD')).toBeVisible()
+    expectNoWritesOrAcknowledgement(api)
+  })
+
+  it('recognizes an item removed before Validate without treating it as a successful quantity review', async () => {
+    const api = installKnownItem()
+    vi.mocked(api.inventory.findProductByBarcode)
+      .mockResolvedValueOnce({ ok: true, value: product() })
+      .mockResolvedValueOnce({ ok: true, value: null })
+    render(<App />)
+    await settle()
+    fireEvent.change(screen.getByLabelText('Quantity to ADD'), { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Validate' }))
+    await settle()
+    expect(screen.getByRole('heading', { name: 'ITEM NOT FOUND' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Reject scan' })).toBeEnabled()
+    expect(screen.queryByText(/Ready for Phase 5 Step 2/)).not.toBeInTheDocument()
+    expectNoWritesOrAcknowledgement(api)
+  })
+
+  it('allows only one fresh lookup/validation while Validate is outstanding', async () => {
+    let finishValidation!: (result: { ok: true; value: ProductDto }) => void
+    const api = installKnownItem()
+    vi.mocked(api.inventory.findProductByBarcode)
+      .mockResolvedValueOnce({ ok: true, value: product() })
+      .mockReturnValueOnce(new Promise((resolve) => { finishValidation = resolve }))
+    render(<App />)
+    await settle()
+    fireEvent.change(screen.getByLabelText('Quantity to ADD'), { target: { value: '2' } })
+    const validateButton = screen.getByRole('button', { name: 'Validate' })
+    fireEvent.click(validateButton)
+    fireEvent.click(validateButton)
+    await settle()
+    expect(api.inventory.findProductByBarcode).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('button', { name: 'Validating…' })).toBeDisabled()
+    expect(screen.getByLabelText('Quantity to ADD')).toBeDisabled()
+    await act(async () => finishValidation({ ok: true, value: product() }))
+    expect(within(screen.getByRole('dialog')).getByRole('status')).toHaveTextContent('Quantity 2 validated.')
+    expectNoWritesOrAcknowledgement(api)
+  })
+
+  it('keeps keyboard focus inside known-item controls and returns it to Resume pending scan', async () => {
+    vi.useRealTimers()
+    const user = userEvent.setup()
+    const api = installKnownItem()
+    render(<App />)
+    await settle()
+    const dialog = screen.getByRole('dialog', { name: 'RESTOCK TRANSACTION' })
+    const quantity = screen.getByLabelText('Quantity to ADD')
+    const validateButton = screen.getByRole('button', { name: 'Validate' })
+    expect(quantity).toHaveFocus()
+    await user.tab({ shift: true })
+    expect(validateButton).toHaveFocus()
+    await user.tab()
+    expect(quantity).toHaveFocus()
+    await user.tab()
+    expect(within(dialog).getByRole('button', { name: 'Review later' })).toHaveFocus()
+    await user.click(within(dialog).getByRole('button', { name: 'Review later' }))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    const resume = screen.getByRole('button', { name: 'Resume pending scan' })
+    await user.click(resume)
+    await settle()
+    expect(screen.getByLabelText('Quantity to ADD')).toHaveFocus()
+    await user.click(screen.getByRole('button', { name: 'Review later' }))
+    expect(screen.getByRole('button', { name: 'Resume pending scan' })).toHaveFocus()
+    expectNoWritesOrAcknowledgement(api)
   })
 })
 

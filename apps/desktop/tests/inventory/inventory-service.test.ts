@@ -53,6 +53,134 @@ describe("InventoryService", () => {
     });
   }
 
+  describe("findProductByBarcode", () => {
+    it("returns the exact active product with its existing image and derived status", () => {
+      const product = createProduct({
+        managedImagePath: FIRST_IMAGE,
+        initialStock: 3,
+        lowStockThreshold: 4,
+      });
+
+      expect(inventory.findProductByBarcode(product.barcode)).toEqual(product);
+      expect(inventory.findProductByBarcode(product.barcode)).toMatchObject({
+        imagePath: FIRST_IMAGE,
+        currentStock: 3,
+        status: "LOW",
+      });
+    });
+
+    it("distinguishes leading-zero barcodes from their numeric-looking counterpart", () => {
+      const padded = createProduct({ barcode: "0000123456" });
+      const unpadded = createProduct({ barcode: "123456" });
+
+      expect(inventory.findProductByBarcode("0000123456")).toEqual(padded);
+      expect(inventory.findProductByBarcode("123456")).toEqual(unpadded);
+      expect(inventory.findProductByBarcode("00123456")).toBeNull();
+    });
+
+    it.each([
+      "sku-AbC-001",
+      "SKU-ABC-001",
+      " SKU-AbC-001",
+      "SKU-AbC-001 ",
+      "AbC-001",
+      "SKU-AbC-001-extra",
+    ])("does not normalize or partially match %j", (barcode) => {
+      createProduct({ barcode: "SKU-AbC-001" });
+      expect(inventory.findProductByBarcode(barcode)).toBeNull();
+    });
+
+    it("preserves whitespace when it is actually present in stored barcode text", () => {
+      const product = createProduct({ barcode: "space-sensitive" });
+      // Fixture establishes stored text without changing createProduct's
+      // pre-existing normalization behavior.
+      database
+        .prepare("UPDATE products SET barcode = ? WHERE id = ?")
+        .run(" space-sensitive ", product.id);
+
+      expect(inventory.findProductByBarcode(" space-sensitive ")).toMatchObject({
+        id: product.id,
+        barcode: " space-sensitive ",
+      });
+      expect(inventory.findProductByBarcode("space-sensitive")).toBeNull();
+    });
+
+    it.each(["SKU%_001", "' OR 1=1 --", 'ABC"\\001'])(
+      "matches SQL-special characters literally for %j",
+      (barcode) => {
+        const product = createProduct({ barcode });
+        createProduct({ barcode: "unrelated" });
+
+        expect(inventory.findProductByBarcode(barcode)).toEqual(product);
+        expect(inventory.findProductByBarcode(`${barcode}%`)).toBeNull();
+      },
+    );
+
+    it("returns null for unknown and soft-deleted barcodes", () => {
+      const product = createProduct();
+      inventory.deleteProduct({ id: product.id });
+
+      expect(inventory.findProductByBarcode("unknown")).toBeNull();
+      expect(inventory.findProductByBarcode(product.barcode)).toBeNull();
+    });
+
+    it("accepts the maximum supported barcode length without truncating it", () => {
+      const barcode = `00${"x".repeat(254)}`;
+      const product = createProduct({ barcode });
+      expect(inventory.findProductByBarcode(barcode)).toEqual(product);
+      expect(inventory.findProductByBarcode(barcode.slice(1))).toBeNull();
+    });
+
+    it.each([
+      ["blank", ""],
+      ["whitespace only", "   "],
+      ["numeric", 123456],
+      ["null", null],
+      ["undefined", undefined],
+      ["overlong", "x".repeat(257)],
+      ["NUL", "abc\u0000def"],
+      ["tab", "abc\tdef"],
+      ["newline", "abc\ndef"],
+      ["carriage return", "abc\rdef"],
+      ["DEL", "abc\u007Fdef"],
+    ])("rejects %s lookup input", (_label, barcode) => {
+      expect(() => inventory.findProductByBarcode(barcode as string)).toThrow(
+        InventoryValidationError,
+      );
+    });
+
+    it("performs read-only lookups without changing products or permanent history", () => {
+      const product = createProduct({ managedImagePath: FIRST_IMAGE });
+      inventory.updateProduct({
+        id: product.id,
+        itemName: product.itemName,
+        category: product.category,
+        currentStock: 2,
+        lowStockThreshold: product.lowStockThreshold,
+      });
+      const productsBefore = database.prepare("SELECT * FROM products").all();
+      const historyBefore = database.prepare("SELECT * FROM transactions").all();
+      const changesBefore = database.prepare("SELECT total_changes() AS count").get();
+      database.pragma("query_only = ON");
+
+      expect(inventory.findProductByBarcode(product.barcode)).toMatchObject({
+        currentStock: 2,
+        status: "LOW",
+      });
+      expect(inventory.findProductByBarcode("unknown")).toBeNull();
+      expect(inventory.findProductByBarcode("' OR 1=1 --")).toBeNull();
+      expect(() => inventory.findProductByBarcode(123 as unknown as string)).toThrow(
+        InventoryValidationError,
+      );
+      expect(database.prepare("SELECT * FROM products").all()).toEqual(productsBefore);
+      expect(database.prepare("SELECT * FROM transactions").all()).toEqual(historyBefore);
+      expect(database.prepare("SELECT total_changes() AS count").get()).toEqual(changesBefore);
+      expect(inventory.listProducts()).toHaveLength(1);
+      expect(inventory.listMovementHistory()).toHaveLength(1);
+      expect(transactionSequence).toBe(1);
+    });
+  });
+
   it("creates a persistent product while preserving leading zeroes", () => {
     const created = createProduct({ managedImagePath: FIRST_IMAGE });
 
