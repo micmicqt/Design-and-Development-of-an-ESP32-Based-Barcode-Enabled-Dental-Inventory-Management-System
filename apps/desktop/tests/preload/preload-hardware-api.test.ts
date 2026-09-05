@@ -86,6 +86,35 @@ describe('preload hardware API', () => {
     await expect(api.hardware.acknowledgeTransactionEvent('device-session-1')).resolves.toEqual(result)
   })
 
+  it('exposes fixed receipt, processing, and ACK-retry channels with copied payloads', async () => {
+    const receiptResult = { ok: true, value: null }
+    electronMock.invoke.mockResolvedValueOnce(receiptResult)
+    await expect(api.hardware.getTransactionReceipt('evt-1')).resolves.toEqual(receiptResult)
+    expect(electronMock.invoke).toHaveBeenLastCalledWith(
+      IPC_CHANNELS.hardwareGetTransactionReceipt,
+      'evt-1'
+    )
+
+    const processResult = { ok: true, value: { receipt: {}, acknowledged: false } }
+    electronMock.invoke.mockResolvedValueOnce(processResult)
+    const input = { eventId: 'evt-1', quantity: 2, database: 'untrusted' }
+    await expect(api.hardware.processTransaction(input)).resolves.toEqual(processResult)
+    expect(electronMock.invoke).toHaveBeenLastCalledWith(
+      IPC_CHANNELS.hardwareProcessTransaction,
+      { eventId: 'evt-1', quantity: 2 }
+    )
+
+    const retryResult = { ok: true, value: { receipt: {}, acknowledged: true } }
+    electronMock.invoke.mockResolvedValueOnce(retryResult)
+    await expect(api.hardware.retryTransactionAcknowledgement('evt-1')).resolves.toEqual(
+      retryResult
+    )
+    expect(electronMock.invoke).toHaveBeenLastCalledWith(
+      IPC_CHANNELS.hardwareRetryTransactionAcknowledgement,
+      'evt-1'
+    )
+  })
+
   it('does not forward an extra URL argument for event retrieval', async () => {
     const callWithUnexpectedArgument = api.hardware.getNextTransactionEvent as (
       unexpected: unknown
@@ -104,7 +133,10 @@ describe('preload hardware API', () => {
     expect(Object.keys(api.hardware).sort()).toEqual([
       'acknowledgeTransactionEvent',
       'getNextTransactionEvent',
-      'getStatus'
+      'getStatus',
+      'getTransactionReceipt',
+      'processTransaction',
+      'retryTransactionAcknowledgement'
     ])
     expect(api.hardware).not.toHaveProperty('baseUrl')
     expect(api.hardware).not.toHaveProperty('fetch')

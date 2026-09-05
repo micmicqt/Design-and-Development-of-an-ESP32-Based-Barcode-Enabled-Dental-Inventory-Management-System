@@ -31,7 +31,10 @@ export const IPC_CHANNELS = {
   movementHistoryList: 'movement-history:list',
   hardwareGetStatus: 'hardware:get-status',
   hardwareGetNextTransactionEvent: 'hardware:get-next-transaction-event',
-  hardwareAcknowledgeTransactionEvent: 'hardware:acknowledge-transaction-event'
+  hardwareAcknowledgeTransactionEvent: 'hardware:acknowledge-transaction-event',
+  hardwareGetTransactionReceipt: 'hardware:get-transaction-receipt',
+  hardwareProcessTransaction: 'hardware:process-transaction',
+  hardwareRetryTransactionAcknowledgement: 'hardware:retry-transaction-acknowledgement'
 } as const
 
 export type HardwareConnectionStatus = 'CONNECTED' | 'OFFLINE'
@@ -53,6 +56,29 @@ export interface HardwareTransactionEvent {
   mode: HardwareTransactionMode
   barcode: string
   timestamp: string
+}
+
+/** Durable snapshot of a committed online transaction, not live product stock. */
+export interface HardwareTransactionReceipt extends HardwareTransactionEvent {
+  transactionId: string
+  productId: number
+  itemName: string
+  category: InventoryCategory
+  quantity: number
+  previousStock: number
+  newTotal: number
+  status: StockStatus
+}
+
+export interface ProcessHardwareTransactionInput {
+  eventId: string
+  quantity: number
+}
+
+/** ok=true always means SQLite committed, even when the later ACK failed. */
+export interface HardwareTransactionOutcome {
+  receipt: HardwareTransactionReceipt
+  acknowledged: boolean
 }
 
 export interface LoginCredentials {
@@ -185,5 +211,8 @@ export interface DesktopApi {
     acknowledgeTransactionEvent: (
       eventId: string
     ) => Promise<IpcResult<{ eventId: string }>>
+    getTransactionReceipt: (eventId: string) => Promise<IpcResult<HardwareTransactionReceipt | null>>
+    processTransaction: (input: ProcessHardwareTransactionInput) => Promise<IpcResult<HardwareTransactionOutcome>>
+    retryTransactionAcknowledgement: (eventId: string) => Promise<IpcResult<HardwareTransactionOutcome>>
   }
 }

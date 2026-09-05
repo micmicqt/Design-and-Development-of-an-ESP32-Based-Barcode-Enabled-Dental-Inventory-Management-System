@@ -8,6 +8,8 @@ import {
   validateCreateProductInput,
   validateDeleteProductInput,
   validateDroppedImagePath,
+  validateHardwareTransactionEventIdPayload,
+  validateProcessHardwareTransactionInput,
   validateProductListQuery,
   validateUpdateProductInput
 } from '../../src/main/ipc/payload-validation'
@@ -26,6 +28,44 @@ describe('exact barcode lookup IPC validation', () => {
   ])('rejects invalid lookup payload: %j', (payload) => {
     expect(() => validateBarcodeLookupPayload(payload)).toThrowError(PayloadValidationError)
   })
+})
+
+describe('hardware transaction IPC validation', () => {
+  it('accepts only a bounded event ID and a positive integer quantity', () => {
+    expect(
+      validateProcessHardwareTransactionInput({ eventId: 'evt-session:1', quantity: 10_000 })
+    ).toEqual({ eventId: 'evt-session:1', quantity: 10_000 })
+    expect(validateHardwareTransactionEventIdPayload('evt-session:1')).toBe('evt-session:1')
+  })
+
+  it.each([
+    undefined,
+    null,
+    {},
+    { eventId: '', quantity: 1 },
+    { eventId: ' event', quantity: 1 },
+    { eventId: 'event/id', quantity: 1 },
+    { eventId: 'x'.repeat(64), quantity: 1 },
+    { eventId: 'evt-1', quantity: undefined },
+    { eventId: 'evt-1', quantity: '1' },
+    { eventId: 'evt-1', quantity: 0 },
+    { eventId: 'evt-1', quantity: -1 },
+    { eventId: 'evt-1', quantity: 1.5 },
+    { eventId: 'evt-1', quantity: 10_001 }
+  ])('rejects an invalid processing payload: %j', (payload) => {
+    expect(() => validateProcessHardwareTransactionInput(payload)).toThrowError(
+      PayloadValidationError
+    )
+  })
+
+  it.each([undefined, null, 1, {}, '', ' event', 'event/id', 'x'.repeat(64)])(
+    'rejects an invalid receipt/ACK event ID: %j',
+    (eventId) => {
+      expect(() => validateHardwareTransactionEventIdPayload(eventId)).toThrowError(
+        PayloadValidationError
+      )
+    }
+  )
 })
 
 describe('Phase 2 IPC payload validation', () => {

@@ -6,6 +6,7 @@ import {
   type DesktopApi,
   type IpcResult,
   type LoginCredentials,
+  type ProcessHardwareTransactionInput,
   type ProductListQuery,
   type SelectedImageDto,
   type UpdateProductInput
@@ -82,7 +83,16 @@ const desktopApi: DesktopApi = Object.freeze({
     getNextTransactionEvent: () =>
       ipcRenderer.invoke(IPC_CHANNELS.hardwareGetNextTransactionEvent),
     acknowledgeTransactionEvent: (eventId: string) =>
-      ipcRenderer.invoke(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent, eventId)
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent, eventId),
+    getTransactionReceipt: (eventId: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareGetTransactionReceipt, eventId),
+    processTransaction: (input: ProcessHardwareTransactionInput) =>
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareProcessTransaction, {
+        eventId: input.eventId,
+        quantity: input.quantity
+      }),
+    retryTransactionAcknowledgement: (eventId: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareRetryTransactionAcknowledgement, eventId)
   })
 })
 

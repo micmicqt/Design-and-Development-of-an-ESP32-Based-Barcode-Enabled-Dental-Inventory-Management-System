@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
-import type { HardwareTransactionEvent, IpcResult, ProductDto } from '../../../shared/ipc-contract'
+import type {
+  HardwareTransactionEvent,
+  HardwareTransactionReceipt,
+  IpcResult,
+  ProductDto
+} from '../../../shared/ipc-contract'
 import { MAX_TRANSACTION_QUANTITY, validateTransactionQuantity } from '../../../shared/transaction-quantity'
 import clinicLogo from '../assets/branding/any-time-dental-logo.png'
 import { ProductImage } from './ProductImage'
@@ -11,8 +16,33 @@ type ProductLookup =
   | { state: 'unknown' }
   | { state: 'error' }
 
+const ACKNOWLEDGEMENT_ERROR =
+  'Inventory was updated, but the ESP32 has not acknowledged this transaction. Retry acknowledgement only; do not submit it again.'
+
+const RECEIPT_CHECK_ERROR =
+  'Could not verify whether this transaction was already saved. Retry before continuing.'
+
+function receiptMatchesEvent(
+  receipt: HardwareTransactionReceipt,
+  event: HardwareTransactionEvent
+): boolean {
+  return (
+    receipt.eventId === event.eventId &&
+    receipt.mode === event.mode &&
+    receipt.barcode === event.barcode &&
+    receipt.timestamp === event.timestamp
+  )
+}
+
 export function HardwareTransactionDialog({
-  event, open, acknowledging, acknowledgementError, onReject, onReviewLater
+  event,
+  open,
+  acknowledging,
+  acknowledgementError,
+  onReject,
+  onReviewLater,
+  onCommitted,
+  onCompleted
 }: {
   event: HardwareTransactionEvent
   open: boolean
@@ -20,20 +50,26 @@ export function HardwareTransactionDialog({
   acknowledgementError: string | null
   onReject: () => void
   onReviewLater: () => void
+  onCommitted: (receipt: HardwareTransactionReceipt) => void
+  onCompleted: (receipt: HardwareTransactionReceipt) => void
 }) {
   const [lookup, setLookup] = useState<ProductLookup>({ state: 'loading' })
   const [retryVersion, setRetryVersion] = useState(0)
+  const [checkingReceipt, setCheckingReceipt] = useState(true)
+  const [receiptCheckError, setReceiptCheckError] = useState<string | null>(null)
   const [quantity, setQuantity] = useState('')
   const [quantityError, setQuantityError] = useState<string | null>(null)
-  const [validatedQuantity, setValidatedQuantity] = useState<number | null>(null)
-  const [validating, setValidating] = useState(false)
+  const [transactionError, setTransactionError] = useState<string | null>(null)
+  const [receipt, setReceipt] = useState<HardwareTransactionReceipt | null>(null)
+  const [processing, setProcessing] = useState(false)
+  const [retryingAcknowledgement, setRetryingAcknowledgement] = useState(false)
   const dialog = useRef<HTMLElement | null>(null)
   const requestVersion = useRef(0)
-  const validationInFlight = useRef(false)
+  const processingInFlight = useRef(false)
+  const acknowledgementRetryInFlight = useRef(false)
+  const committedNotification = useRef<string | null>(null)
   const lookupTail = useRef<Promise<IpcResult<ProductDto | null> | undefined>>(Promise.resolve(undefined))
 
-  // Serializes reads even across Review later / Resume and StrictMode effect replay.
-  // Obsolete queued reads are skipped; resuming always requests fresh product information.
   const queueLookup = useCallback((isCurrent: () => boolean) => {
     const request = lookupTail.current.catch(() => undefined).then(() => {
       if (!isCurrent()) return undefined
@@ -43,77 +79,202 @@ export function HardwareTransactionDialog({
     return request
   }, [event.barcode])
 
+  const rememberCommittedReceipt = useCallback((committedReceipt: HardwareTransactionReceipt) => {
+    setReceipt(committedReceipt)
+    if (committedNotification.current !== committedReceipt.eventId) {
+      committedNotification.current = committedReceipt.eventId
+      onCommitted(committedReceipt)
+    }
+  }, [onCommitted])
+
   useEffect(() => {
     const version = ++requestVersion.current
     if (!open) return undefined
     let active = true
     const isCurrent = () => active && requestVersion.current === version
-    setLookup({ state: 'loading' })
-    setQuantityError(null)
-    setValidatedQuantity(null)
-    setValidating(false)
-    validationInFlight.current = false
 
-    void queueLookup(isCurrent).then((result) => {
-      if (!isCurrent() || result === undefined) return
-      if (!result.ok) setLookup({ state: 'error' })
-      else if (result.value === null) setLookup({ state: 'unknown' })
-      else setLookup({ state: 'known', product: result.value })
-    }).catch(() => {
-      if (isCurrent()) setLookup({ state: 'error' })
+    setCheckingReceipt(true)
+    setReceiptCheckError(null)
+    setQuantityError(null)
+    setTransactionError(null)
+    setProcessing(false)
+    setRetryingAcknowledgement(false)
+    processingInFlight.current = false
+    acknowledgementRetryInFlight.current = false
+
+    void (async () => {
+      let receiptResult: IpcResult<HardwareTransactionReceipt | null>
+      try {
+        receiptResult = await window.desktopApi.hardware.getTransactionReceipt(event.eventId)
+      } catch {
+        if (isCurrent()) setReceiptCheckError(RECEIPT_CHECK_ERROR)
+        return
+      }
+
+      if (!isCurrent()) return
+      if (!receiptResult.ok) {
+        setReceiptCheckError(RECEIPT_CHECK_ERROR)
+        return
+      }
+
+      if (receiptResult.value !== null) {
+        if (!receiptMatchesEvent(receiptResult.value, event)) {
+          setReceiptCheckError(
+            'The saved transaction does not match this scan. Processing is locked for safety.'
+          )
+          return
+        }
+        rememberCommittedReceipt(receiptResult.value)
+        setTransactionError(ACKNOWLEDGEMENT_ERROR)
+        return
+      }
+
+      setReceipt(null)
+      setLookup({ state: 'loading' })
+      setCheckingReceipt(false)
+      try {
+        const lookupResult = await queueLookup(isCurrent)
+        if (!isCurrent() || lookupResult === undefined) return
+        if (!lookupResult.ok) setLookup({ state: 'error' })
+        else if (lookupResult.value === null) setLookup({ state: 'unknown' })
+        else setLookup({ state: 'known', product: lookupResult.value })
+      } catch {
+        if (isCurrent()) setLookup({ state: 'error' })
+      }
+    })().finally(() => {
+      if (isCurrent()) setCheckingReceipt(false)
     })
 
     return () => {
       active = false
       requestVersion.current += 1
     }
-  }, [open, queueLookup, retryVersion])
+  }, [event.eventId, open, queueLookup, rememberCommittedReceipt, retryVersion])
+
+  async function recoverAfterUncertainProcess(failureMessage: string): Promise<void> {
+    try {
+      const receiptResult = await window.desktopApi.hardware.getTransactionReceipt(event.eventId)
+      if (!receiptResult.ok) {
+        setReceiptCheckError(RECEIPT_CHECK_ERROR)
+        return
+      }
+
+      if (receiptResult.value === null) {
+        setTransactionError(failureMessage)
+        return
+      }
+
+      if (!receiptMatchesEvent(receiptResult.value, event)) {
+        setReceiptCheckError(
+          'The saved transaction does not match this scan. Processing is locked for safety.'
+        )
+        return
+      }
+
+      rememberCommittedReceipt(receiptResult.value)
+      setTransactionError(ACKNOWLEDGEMENT_ERROR)
+    } catch {
+      // An interrupted IPC response can happen after SQLite committed. Lock the
+      // form until a durable-receipt check proves whether resubmission is safe.
+      setReceiptCheckError(RECEIPT_CHECK_ERROR)
+    }
+  }
 
   useEffect(() => {
     if (!open) return
-    const target = !acknowledging && !validating
+    const busy = acknowledging || checkingReceipt || processing || retryingAcknowledgement
+    const target = !busy
       ? dialog.current?.querySelector<HTMLElement>('[data-transaction-focus]')
       : null
     const focusTarget = target ?? dialog.current
     focusTarget?.focus()
-  }, [open, lookup.state, acknowledging, validating])
+  }, [open, lookup.state, acknowledging, checkingReceipt, processing, retryingAcknowledgement, receipt])
 
-  async function validate(eventToValidate: FormEvent<HTMLFormElement>): Promise<void> {
-    eventToValidate.preventDefault()
-    if (lookup.state !== 'known' || validationInFlight.current || acknowledging) return
-    validationInFlight.current = true
-    setValidating(true)
+  async function confirmTransaction(formEvent: FormEvent<HTMLFormElement>): Promise<void> {
+    formEvent.preventDefault()
+    if (
+      lookup.state !== 'known' ||
+      receipt !== null ||
+      processingInFlight.current ||
+      acknowledging ||
+      checkingReceipt
+    ) return
+
     setQuantityError(null)
-    setValidatedQuantity(null)
-    const version = requestVersion.current
-    const isCurrent = () => requestVersion.current === version
+    setTransactionError(null)
+    const validation = validateTransactionQuantity(
+      quantity,
+      event.mode,
+      lookup.product.currentStock
+    )
+    if (!validation.ok) {
+      setQuantityError(validation.message)
+      return
+    }
+
+    processingInFlight.current = true
+    setProcessing(true)
 
     try {
-      const result = await queueLookup(isCurrent)
-      if (!isCurrent() || result === undefined) return
+      const result = await window.desktopApi.hardware.processTransaction({
+        eventId: event.eventId,
+        quantity: validation.quantity
+      })
       if (!result.ok) {
-        setLookup({ state: 'error' })
+        await recoverAfterUncertainProcess(result.error.message)
         return
       }
-      if (result.value === null) {
-        setLookup({ state: 'unknown' })
+
+      if (!receiptMatchesEvent(result.value.receipt, event)) {
+        await recoverAfterUncertainProcess(
+          'The transaction response did not match this scan. Please retry safely.'
+        )
         return
       }
-      setLookup({ state: 'known', product: result.value })
-      const validation = validateTransactionQuantity(quantity, event.mode, result.value.currentStock)
-      if (!validation.ok) setQuantityError(validation.message)
-      else setValidatedQuantity(validation.quantity)
+
+      rememberCommittedReceipt(result.value.receipt)
+      if (result.value.acknowledged) {
+        onCompleted(result.value.receipt)
+      } else {
+        setTransactionError(ACKNOWLEDGEMENT_ERROR)
+      }
     } catch {
-      if (isCurrent()) setLookup({ state: 'error' })
+      await recoverAfterUncertainProcess(
+        'Could not process this transaction. The scan remains pending; please retry.'
+      )
     } finally {
-      if (isCurrent()) {
-        validationInFlight.current = false
-        setValidating(false)
+      processingInFlight.current = false
+      setProcessing(false)
+    }
+  }
+
+  async function retryAcknowledgement(): Promise<void> {
+    if (receipt === null || acknowledgementRetryInFlight.current) return
+    acknowledgementRetryInFlight.current = true
+    setRetryingAcknowledgement(true)
+    setTransactionError(null)
+
+    try {
+      const result = await window.desktopApi.hardware.retryTransactionAcknowledgement(event.eventId)
+      if (!result.ok || !receiptMatchesEvent(result.value.receipt, event)) {
+        setTransactionError(ACKNOWLEDGEMENT_ERROR)
+        return
       }
+
+      rememberCommittedReceipt(result.value.receipt)
+      if (result.value.acknowledged) onCompleted(result.value.receipt)
+      else setTransactionError(ACKNOWLEDGEMENT_ERROR)
+    } catch {
+      setTransactionError(ACKNOWLEDGEMENT_ERROR)
+    } finally {
+      acknowledgementRetryInFlight.current = false
+      setRetryingAcknowledgement(false)
     }
   }
 
   if (!open) return null
+
+  const busy = acknowledging || checkingReceipt || processing || retryingAcknowledgement
 
   return (
     <div className="dialog-backdrop hardware-event-backdrop">
@@ -151,28 +312,36 @@ export function HardwareTransactionDialog({
         <p className="dialog__eyebrow">Hardware transaction</p>
         <h2 id="hardware-event-title">{event.mode.toUpperCase()} TRANSACTION</h2>
         <p id="hardware-event-description" className="hardware-event-dialog__intro">
-          Review this scan and quantity. Inventory and movement history have not been changed.
+          {receipt === null
+            ? 'Review the scanned item and confirm a quantity to update inventory.'
+            : 'This inventory transaction is saved. Only ESP32 acknowledgement remains.'}
         </p>
         <dl className="hardware-event-details">
           <div><dt>Barcode</dt><dd>{event.barcode}</dd></div>
           <div><dt>Scanned</dt><dd>{event.timestamp}</dd></div>
         </dl>
 
-        {lookup.state === 'loading' && <p role="status">Looking up barcode in inventory…</p>}
-        {lookup.state === 'error' && (
+        {checkingReceipt && receipt === null && <p role="status">Checking transaction state…</p>}
+        {receiptCheckError !== null && receipt === null && (
+          <div className="form-alert form-alert--error" role="alert">{receiptCheckError}</div>
+        )}
+        {!checkingReceipt && receiptCheckError === null && receipt === null && lookup.state === 'loading' && (
+          <p role="status">Looking up barcode in inventory…</p>
+        )}
+        {!checkingReceipt && receiptCheckError === null && receipt === null && lookup.state === 'error' && (
           <div className="form-alert form-alert--error" role="alert">
             Could not look up this barcode. The scan remains pending. Please retry.
           </div>
         )}
-        {lookup.state === 'unknown' && (
+        {!checkingReceipt && receiptCheckError === null && receipt === null && lookup.state === 'unknown' && (
           <div className="form-alert form-alert--error" role="alert">
             <h3>ITEM NOT FOUND</h3>
             <p>This barcode is not registered in inventory.</p>
             <p>Reject scan acknowledges this event without changing inventory.</p>
           </div>
         )}
-        {lookup.state === 'known' && (
-          <form onSubmit={(formEvent) => void validate(formEvent)} noValidate>
+        {!checkingReceipt && receiptCheckError === null && receipt === null && lookup.state === 'known' && (
+          <form onSubmit={(formEvent) => void confirmTransaction(formEvent)} noValidate>
             <div className="hardware-transaction-product">
               <ProductImage imageUrl={lookup.product.imageUrl} itemName={lookup.product.itemName} />
               <div><h3>{lookup.product.itemName}</h3><p>{lookup.product.category}</p></div>
@@ -196,36 +365,75 @@ export function HardwareTransactionDialog({
                 inputMode="numeric"
                 data-transaction-focus
                 value={quantity}
-                disabled={validating}
+                disabled={processing}
                 aria-invalid={quantityError !== null}
                 aria-describedby={quantityError === null ? 'hardware-quantity-help' : 'hardware-quantity-error'}
                 onChange={(changeEvent) => {
                   setQuantity(changeEvent.target.value)
                   setQuantityError(null)
-                  setValidatedQuantity(null)
+                  setTransactionError(null)
                 }}
               />
               <small id="hardware-quantity-help">Whole numbers only, from 1 to {MAX_TRANSACTION_QUANTITY.toLocaleString('en-US')}.</small>
               {quantityError !== null && <p id="hardware-quantity-error" className="field-error" role="alert">{quantityError}</p>}
             </div>
-            {validatedQuantity !== null && (
-              <div className="form-alert form-alert--success" role="status">
-                Quantity {validatedQuantity} validated. Ready for Phase 5 Step 2 database transaction.
-                Stock is unchanged and this scan remains pending.
-              </div>
+            {transactionError !== null && (
+              <div className="form-alert form-alert--error" role="alert">{transactionError}</div>
             )}
             <div className="dialog__actions hardware-event-dialog__actions">
-              <button type="button" className="secondary-button" onClick={onReviewLater}>Review later</button>
-              <button className="primary-button primary-button--inline" type="submit" disabled={validating}>
-                {validating ? 'Validating…' : 'Validate'}
+              <button type="button" className="secondary-button" onClick={onReviewLater} disabled={processing}>Review later</button>
+              <button className="primary-button primary-button--inline" type="submit" disabled={processing}>
+                {processing
+                  ? 'Processing…'
+                  : event.mode === 'restock' ? 'Confirm Restock' : 'Confirm Checkout'}
               </button>
             </div>
           </form>
         )}
-        {acknowledgementError !== null && <div className="form-alert form-alert--error" role="alert">{acknowledgementError}</div>}
-        {lookup.state !== 'known' && (
+
+        {receipt !== null && (
+          <div className="hardware-transaction-receipt">
+            <div className="form-alert form-alert--success" role="status">
+              <h3>Inventory transaction saved</h3>
+              <p>Stock and movement history were committed exactly once.</p>
+            </div>
+            <dl className="hardware-event-details hardware-event-details--receipt">
+              <div><dt>Item</dt><dd>{receipt.itemName}</dd></div>
+              <div><dt>Quantity</dt><dd>{event.mode === 'restock' ? '+' : '-'}{receipt.quantity}</dd></div>
+              <div><dt>Previous</dt><dd>{receipt.previousStock}</dd></div>
+              <div><dt>New stock</dt><dd>{receipt.newTotal}</dd></div>
+              <div><dt>Status</dt><dd><StockStatusBadge status={receipt.status} /></dd></div>
+            </dl>
+            {transactionError !== null && (
+              <div className="form-alert form-alert--error" role="alert">{transactionError}</div>
+            )}
+            <div className="dialog__actions hardware-event-dialog__actions">
+              <button type="button" className="secondary-button" onClick={onReviewLater} disabled={busy}>Review later</button>
+              <button
+                type="button"
+                className="primary-button primary-button--inline"
+                data-transaction-focus
+                onClick={() => void retryAcknowledgement()}
+                disabled={busy}
+              >
+                {retryingAcknowledgement ? 'Retrying…' : 'Retry acknowledgement'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {acknowledgementError !== null && receipt === null && (
+          <div className="form-alert form-alert--error" role="alert">{acknowledgementError}</div>
+        )}
+        {receipt === null && !checkingReceipt && receiptCheckError !== null && (
           <div className="dialog__actions hardware-event-dialog__actions">
-            <button type="button" className="secondary-button" onClick={onReviewLater} disabled={acknowledging}>Review later</button>
+            <button type="button" className="secondary-button" onClick={onReviewLater}>Review later</button>
+            <button type="button" className="primary-button primary-button--inline" data-transaction-focus onClick={() => setRetryVersion((current) => current + 1)}>Retry transaction check</button>
+          </div>
+        )}
+        {receipt === null && !checkingReceipt && receiptCheckError === null && lookup.state !== 'known' && (
+          <div className="dialog__actions hardware-event-dialog__actions">
+            <button type="button" className="secondary-button" onClick={onReviewLater} disabled={busy}>Review later</button>
             {lookup.state === 'error' && <button type="button" className="primary-button primary-button--inline" data-transaction-focus onClick={() => setRetryVersion((current) => current + 1)}>Retry lookup</button>}
             {lookup.state === 'unknown' && <button type="button" className="primary-button primary-button--inline" data-transaction-focus onClick={onReject} disabled={acknowledging}>{acknowledging ? 'Acknowledging…' : 'Reject scan'}</button>}
           </div>

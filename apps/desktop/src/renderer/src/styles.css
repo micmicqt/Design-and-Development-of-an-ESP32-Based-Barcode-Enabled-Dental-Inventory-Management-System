@@ -2456,6 +2456,27 @@ button:focus-visible {
   margin-top: 20px;
 }
 
+.hardware-transaction-receipt {
+  margin-top: 18px;
+}
+
+.hardware-transaction-receipt .form-alert h3,
+.hardware-transaction-receipt .form-alert p {
+  margin: 0;
+}
+
+.hardware-transaction-receipt .form-alert p {
+  margin-top: 5px;
+}
+
+.hardware-event-details--receipt {
+  margin-top: 14px;
+}
+
+.hardware-transaction-notice {
+  margin: 0 0 18px;
+}
+
 .hardware-pending-scan {
   display: flex;
   align-items: center;

@@ -7,7 +7,7 @@ export type TransactionQuantityValidation =
   | { ok: true; quantity: number }
   | { ok: false; message: string }
 
-/** Read-only Step 1 validation. Step 2 must repeat this inside its database transaction. */
+/** Immediate UI feedback; the backend independently repeats all authoritative checks. */
 export function validateTransactionQuantity(
   value: string,
   mode: HardwareTransactionMode,

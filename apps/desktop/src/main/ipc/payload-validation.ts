@@ -3,9 +3,12 @@ import {
   type CreateProductInput,
   type DeleteProductInput,
   type InventoryCategory,
+  type ProcessHardwareTransactionInput,
   type ProductListQuery,
   type UpdateProductInput
 } from '../../shared/ipc-contract'
+import { isValidHardwareTransactionEventId } from '../hardware/hardware-gateway'
+import { MAX_TRANSACTION_QUANTITY } from '../../shared/transaction-quantity'
 import { isAbsolute } from 'node:path'
 
 const MAX_BARCODE_LENGTH = 128
@@ -151,6 +154,38 @@ export function validateBarcodeLookupPayload(value: unknown): string {
     throw new PayloadValidationError({ barcode: 'Barcode must be valid text, 1–256 characters long.' })
   }
   return value
+}
+
+export function validateHardwareTransactionEventIdPayload(value: unknown): string {
+  if (!isValidHardwareTransactionEventId(value)) {
+    throw new PayloadValidationError({ eventId: 'The transaction event ID is invalid.' })
+  }
+  return value
+}
+
+export function validateProcessHardwareTransactionInput(
+  value: unknown
+): ProcessHardwareTransactionInput {
+  const candidate = asRecord(value)
+  const fieldErrors: Record<string, string> = {}
+  const eventId = isValidHardwareTransactionEventId(candidate.eventId)
+    ? candidate.eventId
+    : ''
+  if (eventId.length === 0) {
+    fieldErrors.eventId = 'The transaction event ID is invalid.'
+  }
+
+  const quantity = candidate.quantity
+  if (
+    !Number.isSafeInteger(quantity) ||
+    (quantity as number) <= 0 ||
+    (quantity as number) > MAX_TRANSACTION_QUANTITY
+  ) {
+    fieldErrors.quantity = `Quantity must be a positive whole number no greater than ${MAX_TRANSACTION_QUANTITY.toLocaleString('en-US')}.`
+  }
+
+  throwIfInvalid(fieldErrors)
+  return { eventId, quantity: quantity as number }
 }
 
 export function validateCreateProductInput(value: unknown): CreateProductInput {

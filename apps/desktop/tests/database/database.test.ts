@@ -62,6 +62,7 @@ describe("database migrations and constraints", () => {
 
     expect(tableNames).toEqual([
       "configured_admin",
+      "processed_hardware_events",
       "products",
       "schema_migrations",
       "transactions",
@@ -71,6 +72,7 @@ describe("database migrations and constraints", () => {
     ).toEqual([
       { version: 1, name: "initial_phase_1_schema" },
       { version: 2, name: "phase_2_inventory_crud" },
+      { version: 3, name: "phase_5_step_2_hardware_transactions" },
     ]);
   });
 
@@ -81,7 +83,7 @@ describe("database migrations and constraints", () => {
     const result = database
       .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
       .get() as { count: number };
-    expect(result.count).toBe(2);
+    expect(result.count).toBe(3);
   });
 
   it("accepts all six fixed categories and rejects any other category", () => {

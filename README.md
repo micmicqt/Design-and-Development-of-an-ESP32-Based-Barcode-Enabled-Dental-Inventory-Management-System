@@ -1,6 +1,6 @@
 # Dental Inventory System
 
-Phase 2 standalone desktop application for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+Phase 5 Step 2 implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
 
 This repository currently provides:
 
@@ -10,10 +10,13 @@ This repository currently provides:
 - search, fixed-category filtering, derived stock status, safe editing, and soft deletion;
 - SQLite migrations and one preconfigured-administrator credential slot;
 - shared, versioned TypeScript protocol types and JSON Schema validation;
-- a development/test-only `HardwareGateway` mock boundary;
-- a compile-only ESP32 PlatformIO project whose physical hardware activation is disabled.
+- a local-network ESP32 `HardwareGateway` with status, FIFO scan delivery, and acknowledgement;
+- atomic online RESTOCK/CHECKOUT persistence with durable event idempotency; and
+- the verified ESP32 PlatformIO hardware integration from Phases 3 and 4.
 
-Physical scanner input, online kiosk transactions, offline transactions, synchronization, and all PCB peripheral activation remain intentionally outside Phase 2. Manual barcode entry is visibly identified as a development-only bridge until hardware integration is approved.
+ESP32 result feedback, database-driven stock LEDs/LCD messages, offline operation,
+and synchronization remain outside this step. Manual barcode entry remains
+available for item registration; physical scans use the hardware event path.
 
 ## Repository layout
 
@@ -118,10 +121,13 @@ React communicates only through narrow authentication, inventory, and hardware-s
 
 ### Local ESP32 status connection
 
-Phase 5 Step 1 adds exact barcode lookup and quantity review on the desktop,
-without changing stock or history. See [the lookup and quantity workflow guide](docs/phase5-step1-quantity-workflow.md)
-for known/unknown scans, deferred review, and acknowledgement behavior. The
-verified Phase 4 firmware and HTTP event contract remain unchanged.
+Phase 5 Step 2 completes the online desktop transaction: an exact barcode match
+and confirmed quantity are applied to stock and movement history in one SQLite
+transaction, then—and only then—the ESP32 event is acknowledged. A durable event
+receipt makes retries safe after an acknowledgement failure or desktop restart.
+See [the atomic transaction guide](docs/phase5-step2-atomic-transactions.md).
+The earlier [Step 1 guide](docs/phase5-step1-quantity-workflow.md) remains useful
+background for lookup, validation, deferred review, and unknown-scan behavior.
 
 Phase 4 Step 3 adds temporary hardware scan delivery over this same gateway. See
 [the event delivery contract and verification guide](docs/phase4-step3-event-delivery.md)
@@ -170,6 +176,10 @@ Development may override the file with `DENTAL_DATABASE_PATH`, as shown above. M
 Product status is derived by code and is not persisted.
 
 Migration 2 adds soft deletion to `products` and safely rebuilds `transactions` to permit `STOCK_CORRECTION`. Product barcodes remain immutable through normal editing and unique across active and retired rows. Transaction rows retain barcode, item-name, and category snapshots, so movement history remains readable after a product is retired.
+
+Migration 3 adds `processed_hardware_events`, a minimal durable link from an
+ESP32 `eventId` to its committed movement and resulting status. This is the
+database-level idempotency guard for online hardware transactions.
 
 ## Desktop checks and production bundle
 

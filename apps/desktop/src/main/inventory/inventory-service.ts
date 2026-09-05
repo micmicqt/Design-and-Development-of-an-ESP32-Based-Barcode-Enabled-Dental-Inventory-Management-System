@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import type {
+  HardwareTransactionEvent,
+  HardwareTransactionReceipt,
+} from "../../shared/ipc-contract";
+import { MAX_TRANSACTION_QUANTITY } from "../../shared/transaction-quantity";
 import type { SqliteDatabase } from "../database";
 import {
   deriveStockStatus,
@@ -80,6 +85,11 @@ export interface DeleteProductInput {
   id: number;
 }
 
+export interface ProcessHardwareTransactionServiceInput {
+  event: HardwareTransactionEvent;
+  quantity: number;
+}
+
 export interface ProductRecord {
   id: number;
   barcode: string;
@@ -138,6 +148,21 @@ interface MovementRow {
   source: MovementSource;
 }
 
+interface HardwareTransactionReceiptRow {
+  event_id: string;
+  transaction_id: string;
+  product_id: number;
+  barcode: string;
+  item_name: string;
+  category: InventoryCategory;
+  action: "RESTOCK" | "CHECKOUT";
+  quantity: number;
+  previous_stock: number;
+  new_total: number;
+  occurred_at: string;
+  resulting_status: StockStatus;
+}
+
 interface NormalizedProductQuery {
   searchPattern: string | null;
   category: InventoryCategory | null;
@@ -173,6 +198,111 @@ export interface InventoryService {
   updateProduct(input: UpdateProductInput): ProductRecord;
   deleteProduct(input: DeleteProductInput): ProductRecord;
   listMovementHistory(): MovementHistoryRecord[];
+  findHardwareTransactionReceipt(eventId: string): HardwareTransactionReceipt | null;
+  processHardwareTransaction(
+    input: ProcessHardwareTransactionServiceInput,
+  ): HardwareTransactionReceipt;
+}
+
+const HARDWARE_EVENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const HARDWARE_BARCODE_PATTERN = /^[\x20-\x7E]+$/;
+const RTC_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
+
+function validateHardwareEventId(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 63 ||
+    !HARDWARE_EVENT_ID_PATTERN.test(value)
+  ) {
+    throw new InventoryValidationError("The hardware transaction event ID is invalid.");
+  }
+
+  return value;
+}
+
+function validateHardwareTimestamp(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new InventoryValidationError("The hardware transaction timestamp is invalid.");
+  }
+
+  const match = RTC_TIMESTAMP_PATTERN.exec(value);
+  if (match === null) {
+    throw new InventoryValidationError("The hardware transaction timestamp is invalid.");
+  }
+
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number);
+  if (
+    year === undefined ||
+    month === undefined ||
+    day === undefined ||
+    hour === undefined ||
+    minute === undefined ||
+    second === undefined ||
+    year < 2000 ||
+    year > 2099 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    throw new InventoryValidationError("The hardware transaction timestamp is invalid.");
+  }
+
+  const parsed = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day ||
+    parsed.getUTCHours() !== hour ||
+    parsed.getUTCMinutes() !== minute ||
+    parsed.getUTCSeconds() !== second
+  ) {
+    throw new InventoryValidationError("The hardware transaction timestamp is invalid.");
+  }
+
+  return value;
+}
+
+function validateHardwareTransactionInput(
+  input: ProcessHardwareTransactionServiceInput,
+): ProcessHardwareTransactionServiceInput {
+  if (typeof input !== "object" || input === null) {
+    throw new InventoryValidationError("The hardware transaction is invalid.");
+  }
+
+  const event = input.event;
+  if (typeof event !== "object" || event === null) {
+    throw new InventoryValidationError("The hardware transaction event is invalid.");
+  }
+
+  const eventId = validateHardwareEventId(event.eventId);
+  if (event.mode !== "restock" && event.mode !== "checkout") {
+    throw new InventoryValidationError("The hardware transaction mode is invalid.");
+  }
+
+  const barcode = validateLookupBarcode(event.barcode);
+  if (!HARDWARE_BARCODE_PATTERN.test(barcode) || barcode.includes(",")) {
+    throw new InventoryValidationError("The hardware transaction barcode is invalid.");
+  }
+
+  const timestamp = validateHardwareTimestamp(event.timestamp);
+  if (
+    !Number.isSafeInteger(input.quantity) ||
+    input.quantity <= 0 ||
+    input.quantity > MAX_TRANSACTION_QUANTITY
+  ) {
+    throw new InventoryValidationError(
+      `Quantity must be a positive whole number not exceeding ${MAX_TRANSACTION_QUANTITY}.`,
+    );
+  }
+
+  return {
+    event: { eventId, mode: event.mode, barcode, timestamp },
+    quantity: input.quantity,
+  };
 }
 
 function validateLookupBarcode(value: unknown): string {
@@ -361,6 +491,38 @@ function movementFromRow(row: MovementRow): MovementHistoryRecord {
   };
 }
 
+function hardwareTransactionReceiptFromRow(
+  row: HardwareTransactionReceiptRow,
+): HardwareTransactionReceipt {
+  return {
+    eventId: row.event_id,
+    transactionId: row.transaction_id,
+    productId: row.product_id,
+    mode: row.action === "RESTOCK" ? "restock" : "checkout",
+    barcode: row.barcode,
+    itemName: row.item_name,
+    category: row.category,
+    timestamp: row.occurred_at,
+    quantity: row.quantity,
+    previousStock: row.previous_stock,
+    newTotal: row.new_total,
+    status: row.resulting_status,
+  };
+}
+
+function isSameHardwareTransaction(
+  receipt: HardwareTransactionReceipt,
+  input: ProcessHardwareTransactionServiceInput,
+): boolean {
+  return (
+    receipt.eventId === input.event.eventId &&
+    receipt.mode === input.event.mode &&
+    receipt.barcode === input.event.barcode &&
+    receipt.timestamp === input.event.timestamp &&
+    receipt.quantity === input.quantity
+  );
+}
+
 function isUniqueConstraintError(error: unknown): boolean {
   return (
     typeof error === "object" &&
@@ -471,10 +633,69 @@ export function createInventoryService(
     FROM transactions
     ORDER BY occurred_at DESC, recorded_at DESC, transaction_id DESC
   `);
+  const findHardwareTransactionReceiptStatement = database.prepare(`
+    SELECT
+      processed.event_id,
+      movements.transaction_id,
+      movements.product_id,
+      movements.barcode,
+      movements.item_name,
+      movements.category,
+      movements.action,
+      movements.quantity,
+      movements.previous_stock,
+      movements.new_total,
+      movements.occurred_at,
+      processed.resulting_status
+    FROM processed_hardware_events AS processed
+    INNER JOIN transactions AS movements
+      ON movements.transaction_id = processed.transaction_id
+    WHERE processed.event_id = ?
+  `);
+  const updateHardwareStockStatement = database.prepare(`
+    UPDATE products
+    SET
+      current_stock = ?,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE id = ?
+      AND deleted_at IS NULL
+      AND current_stock = ?
+  `);
+  const insertHardwareMovementStatement = database.prepare(`
+    INSERT INTO transactions (
+      transaction_id,
+      product_id,
+      barcode,
+      item_name,
+      category,
+      action,
+      quantity,
+      previous_stock,
+      new_total,
+      occurred_at,
+      source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ONLINE')
+  `);
+  const insertProcessedHardwareEventStatement = database.prepare(`
+    INSERT INTO processed_hardware_events (
+      event_id,
+      transaction_id,
+      resulting_status
+    ) VALUES (?, ?, ?)
+  `);
 
   const getActiveProduct = (id: number): ProductRecord | null => {
     const row = getActiveProductStatement.get(id) as ProductRow | undefined;
     return row ? productFromRow(row) : null;
+  };
+
+  const findHardwareTransactionReceipt = (
+    eventId: string,
+  ): HardwareTransactionReceipt | null => {
+    const row = findHardwareTransactionReceiptStatement.get(
+      validateHardwareEventId(eventId),
+    ) as HardwareTransactionReceiptRow | undefined;
+    return row ? hardwareTransactionReceiptFromRow(row) : null;
   };
 
   const updateInTransaction = database.transaction(
@@ -512,6 +733,85 @@ export function createInventoryService(
       const updatedProduct = getActiveProduct(input.id);
       if (updatedProduct === null) throw new ProductNotFoundError();
       return updatedProduct;
+    },
+  );
+
+  const processHardwareTransactionInTransaction = database.transaction(
+    (
+      input: ProcessHardwareTransactionServiceInput,
+    ): HardwareTransactionReceipt => {
+      const existingReceipt = findHardwareTransactionReceipt(input.event.eventId);
+      if (existingReceipt !== null) {
+        if (!isSameHardwareTransaction(existingReceipt, input)) {
+          throw new InventoryValidationError(
+            "This hardware event ID was already processed with different transaction details.",
+          );
+        }
+        return existingReceipt;
+      }
+
+      const productRow = findActiveProductByBarcodeStatement.get(
+        input.event.barcode,
+      ) as ProductRow | undefined;
+      if (productRow === undefined) throw new ProductNotFoundError();
+
+      const previousStock = productRow.current_stock;
+      if (!Number.isSafeInteger(previousStock) || previousStock < 0) {
+        throw new InventoryValidationError("The stored product stock is invalid.");
+      }
+      if (input.event.mode === "checkout" && input.quantity > previousStock) {
+        throw new InventoryValidationError(
+          `Insufficient stock. Only ${previousStock} available for checkout.`,
+        );
+      }
+
+      const newTotal =
+        input.event.mode === "restock"
+          ? previousStock + input.quantity
+          : previousStock - input.quantity;
+      if (!Number.isSafeInteger(newTotal) || newTotal < 0) {
+        throw new InventoryValidationError(
+          "The resulting stock would exceed the supported inventory range.",
+        );
+      }
+
+      const status = deriveStockStatus(newTotal, productRow.low_stock_threshold);
+      const stockUpdate = updateHardwareStockStatement.run(
+        newTotal,
+        productRow.id,
+        previousStock,
+      );
+      if (stockUpdate.changes !== 1) {
+        throw new InventoryServiceError(
+          "VALIDATION_ERROR",
+          "The product changed while the hardware transaction was being processed.",
+        );
+      }
+
+      const transactionId = createTransactionId();
+      insertHardwareMovementStatement.run(
+        transactionId,
+        productRow.id,
+        productRow.barcode,
+        productRow.item_name,
+        productRow.category,
+        input.event.mode === "restock" ? "RESTOCK" : "CHECKOUT",
+        input.quantity,
+        previousStock,
+        newTotal,
+        input.event.timestamp,
+      );
+      insertProcessedHardwareEventStatement.run(
+        input.event.eventId,
+        transactionId,
+        status,
+      );
+
+      const receipt = findHardwareTransactionReceipt(input.event.eventId);
+      if (receipt === null) {
+        throw new Error("The committed hardware transaction receipt is unavailable.");
+      }
+      return receipt;
     },
   );
 
@@ -566,6 +866,14 @@ export function createInventoryService(
 
     listMovementHistory() {
       return (listHistoryStatement.all() as MovementRow[]).map(movementFromRow);
+    },
+
+    findHardwareTransactionReceipt,
+
+    processHardwareTransaction(input) {
+      return processHardwareTransactionInTransaction(
+        validateHardwareTransactionInput(input),
+      );
     },
   };
 }

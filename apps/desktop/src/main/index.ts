@@ -13,6 +13,7 @@ import { createInventoryService } from './inventory'
 import { resolveEsp32BaseUrl } from './hardware/hardware-configuration'
 import { Esp32HttpGateway } from './hardware/esp32-http-gateway'
 import type { HardwareTransactionEventGateway } from './hardware/hardware-gateway'
+import { createHardwareTransactionCoordinator } from './hardware/hardware-transaction-coordinator'
 import { registerAuthIpcHandlers } from './ipc/register-auth-handlers'
 import { registerHardwareIpcHandlers } from './ipc/register-hardware-handlers'
 import { registerInventoryIpcHandlers } from './ipc/register-inventory-handlers'
@@ -118,6 +119,10 @@ async function startDesktopApplication(): Promise<void> {
   const esp32BaseUrl = resolveEsp32BaseUrl()
   hardwareGateway =
     esp32BaseUrl === null ? null : new Esp32HttpGateway({ baseUrl: esp32BaseUrl })
+  const transactionCoordinator = createHardwareTransactionCoordinator({
+    inventoryService,
+    gateway: hardwareGateway
+  })
 
   disposeImageProtocol = registerDentalImageProtocol(session.defaultSession, imageStore)
   mainWindow = createMainWindow()
@@ -135,6 +140,8 @@ async function startDesktopApplication(): Promise<void> {
   })
   const disposeHardwareHandlers = registerHardwareIpcHandlers({
     gateway: hardwareGateway,
+    inventoryService,
+    transactionCoordinator,
     authSession,
     getMainWindow
   })

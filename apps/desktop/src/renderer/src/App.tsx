@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import type {
   AuthSession,
   HardwareMode,
   HardwareStatusDto,
-  HardwareTransactionEvent
+  HardwareTransactionEvent,
+  HardwareTransactionReceipt
 } from '../../shared/ipc-contract'
 import clinicLogo from './assets/branding/any-time-dental-logo.png'
 import staffPhotoOne from './assets/branding/staff-01.jpg'
@@ -221,6 +222,9 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
   const [acknowledgingHardwareEvent, setAcknowledgingHardwareEvent] = useState(false)
   const [hardwareEventError, setHardwareEventError] = useState<string | null>(null)
   const [hardwareEventOpen, setHardwareEventOpen] = useState(false)
+  const [pendingHardwareReceipt, setPendingHardwareReceipt] =
+    useState<HardwareTransactionReceipt | null>(null)
+  const [hardwareTransactionNotice, setHardwareTransactionNotice] = useState<string | null>(null)
   const hardwareEventRequest = useRef<Promise<HardwareTransactionEvent | null> | null>(null)
   const hardwareAcknowledgementInFlight = useRef(false)
   const hardwareEventPreviousFocus = useRef<HTMLElement | null>(null)
@@ -246,6 +250,13 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     const timeout = window.setTimeout(() => setInventoryNotice(null), 5_000)
     return () => window.clearTimeout(timeout)
   }, [inventoryNotice])
+
+  useEffect(() => {
+    if (hardwareTransactionNotice === null) return undefined
+
+    const timeout = window.setTimeout(() => setHardwareTransactionNotice(null), 8_000)
+    return () => window.clearTimeout(timeout)
+  }, [hardwareTransactionNotice])
 
   useEffect(() => {
     let active = true
@@ -295,6 +306,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           hardwareEventPreviousFocus.current =
             document.activeElement instanceof HTMLElement ? document.activeElement : null
           setHardwareEventError(null)
+          setPendingHardwareReceipt(null)
           setPendingHardwareEvent(event)
           setHardwareEventOpen(true)
         }
@@ -393,6 +405,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       setPendingHardwareEvent((currentEvent) =>
         currentEvent?.eventId === eventId ? null : currentEvent
       )
+      setPendingHardwareReceipt(null)
     } catch {
       setHardwareEventError(
         'Could not acknowledge this scan. Check the ESP32 connection and try again.'
@@ -402,6 +415,31 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       setAcknowledgingHardwareEvent(false)
     }
   }
+
+  const handleHardwareTransactionCommitted = useCallback(
+    (receipt: HardwareTransactionReceipt): void => {
+      setPendingHardwareReceipt(receipt)
+      setInventoryRefreshVersion((current) => current + 1)
+      setHistoryRefreshVersion((current) => current + 1)
+    },
+    []
+  )
+
+  const handleHardwareTransactionCompleted = useCallback(
+    (receipt: HardwareTransactionReceipt): void => {
+      setHardwareTransactionNotice(
+        `${receipt.itemName}: ${receipt.mode.toUpperCase()} saved. ` +
+          `New stock ${receipt.newTotal} (${receipt.status}).`
+      )
+      setHardwareEventError(null)
+      setHardwareEventOpen(false)
+      setPendingHardwareReceipt(null)
+      setPendingHardwareEvent((currentEvent) =>
+        currentEvent?.eventId === receipt.eventId ? null : currentEvent
+      )
+    },
+    []
+  )
 
   return (
     <div className="app-shell">
@@ -503,13 +541,22 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
         <main className="content" id="application-section" role="tabpanel">
           {pendingHardwareEvent !== null && !hardwareEventOpen && (
             <div className="hardware-pending-scan" role="status">
-              <p>A {pendingHardwareEvent.mode.toUpperCase()} scan is pending. Stock is unchanged.</p>
+              <p>
+                {pendingHardwareReceipt === null
+                  ? `A ${pendingHardwareEvent.mode.toUpperCase()} scan is pending. Resume to continue safely.`
+                  : `The ${pendingHardwareEvent.mode.toUpperCase()} transaction was saved. ESP32 acknowledgement is pending.`}
+              </p>
               <button ref={resumeHardwareEventButton} type="button" className="secondary-button" onClick={() => {
                 hardwareEventPreviousFocus.current = document.activeElement instanceof HTMLElement
                   ? document.activeElement : null
                 setHardwareEventError(null)
                 setHardwareEventOpen(true)
               }}>Resume pending scan</button>
+            </div>
+          )}
+          {hardwareTransactionNotice !== null && (
+            <div className="form-alert form-alert--success hardware-transaction-notice" role="status">
+              {hardwareTransactionNotice}
             </div>
           )}
           <section className="page-heading">
@@ -540,6 +587,8 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           acknowledgementError={hardwareEventError}
           onReject={() => void rejectUnknownHardwareEvent()}
           onReviewLater={() => setHardwareEventOpen(false)}
+          onCommitted={handleHardwareTransactionCommitted}
+          onCompleted={handleHardwareTransactionCompleted}
         />
       )}
     </div>

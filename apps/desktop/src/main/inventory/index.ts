@@ -13,6 +13,7 @@ export {
   type MovementAction,
   type MovementHistoryRecord,
   type MovementSource,
+  type ProcessHardwareTransactionServiceInput,
   type ProductQuery,
   type ProductRecord,
   type UpdateProductInput,
