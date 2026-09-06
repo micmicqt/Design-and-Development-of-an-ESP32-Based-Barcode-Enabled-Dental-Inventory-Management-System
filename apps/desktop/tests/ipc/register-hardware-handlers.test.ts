@@ -3,9 +3,16 @@
 import type { BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createAuthSessionController } from '../../src/main/application/auth-session'
+import { initializeDatabase } from '../../src/main/database'
 import type { HardwareTransactionEventGateway } from '../../src/main/hardware/hardware-gateway'
-import type { HardwareTransactionCoordinator } from '../../src/main/hardware/hardware-transaction-coordinator'
-import type { InventoryService } from '../../src/main/inventory'
+import {
+  createHardwareTransactionCoordinator,
+  type HardwareTransactionCoordinator
+} from '../../src/main/hardware/hardware-transaction-coordinator'
+import {
+  createInventoryService as createSqliteInventoryService,
+  type InventoryService
+} from '../../src/main/inventory'
 import { registerHardwareIpcHandlers } from '../../src/main/ipc/register-hardware-handlers'
 import {
   IPC_CHANNELS,
@@ -48,7 +55,8 @@ const transactionReceipt: HardwareTransactionReceipt = {
   quantity: 2,
   previousStock: 20,
   newTotal: 22,
-  status: 'HIGH'
+  status: 'HIGH',
+  resultDeliveredToHardware: true
 }
 
 describe('authenticated hardware IPC boundary', () => {
@@ -88,11 +96,13 @@ describe('authenticated hardware IPC boundary', () => {
     const getReceipt = electronMock.handlers.get(IPC_CHANNELS.hardwareGetTransactionReceipt)
     const process = electronMock.handlers.get(IPC_CHANNELS.hardwareProcessTransaction)
     const retryAck = electronMock.handlers.get(IPC_CHANNELS.hardwareRetryTransactionAcknowledgement)
+    const retryResult = electronMock.handlers.get(IPC_CHANNELS.hardwareRetryTransactionResultDelivery)
     if (
       next === undefined ||
       acknowledge === undefined ||
       getReceipt === undefined ||
       process === undefined ||
+      retryResult === undefined ||
       retryAck === undefined
     ) {
       throw new Error('Hardware event handlers were not registered.')
@@ -105,6 +115,7 @@ describe('authenticated hardware IPC boundary', () => {
       acknowledge,
       getReceipt,
       process,
+      retryResult,
       retryAck,
       dispose,
       gateway,
@@ -128,6 +139,7 @@ describe('authenticated hardware IPC boundary', () => {
         sd: true
       }),
       getNextTransactionEvent: vi.fn().mockResolvedValue(hardwareEvent),
+      deliverTransactionResult: vi.fn().mockResolvedValue(undefined),
       acknowledgeTransactionEvent: vi.fn().mockResolvedValue(undefined)
     }
   }
@@ -141,6 +153,7 @@ describe('authenticated hardware IPC boundary', () => {
       deleteProduct: vi.fn(),
       listMovementHistory: vi.fn().mockReturnValue([]),
       findHardwareTransactionReceipt: vi.fn().mockReturnValue(null),
+      markHardwareTransactionResultDelivered: vi.fn(),
       processHardwareTransaction: vi.fn()
     }
   }
@@ -149,6 +162,10 @@ describe('authenticated hardware IPC boundary', () => {
     return {
       getTransactionReceipt: vi.fn().mockReturnValue(null),
       processTransaction: vi.fn().mockResolvedValue({
+        receipt: transactionReceipt,
+        acknowledged: true
+      }),
+      retryTransactionResultDelivery: vi.fn().mockResolvedValue({
         receipt: transactionReceipt,
         acknowledged: true
       }),
@@ -244,7 +261,7 @@ describe('authenticated hardware IPC boundary', () => {
     expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(hardwareEvent.eventId)
   })
 
-  it('blocks the generic rejection route for a registered product', async () => {
+  it('acknowledges an explicitly cancelled registered event before any commit', async () => {
     const gateway = createGateway()
     const inventoryService = createInventoryService()
     vi.mocked(inventoryService.findProductByBarcode).mockReturnValue({
@@ -259,35 +276,327 @@ describe('authenticated hardware IPC boundary', () => {
       createdAt: '2026-09-01T00:00:00.000Z',
       updatedAt: '2026-09-01T00:00:00.000Z'
     })
-    const { authSession, trustedEvent, acknowledge } = setup(gateway, inventoryService)
+    const coordinator = createTransactionCoordinator()
+    const { authSession, trustedEvent, acknowledge } = setup(
+      gateway,
+      inventoryService,
+      coordinator
+    )
+    authSession.signIn('admin')
+
+    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
+      ok: true,
+      value: { eventId: hardwareEvent.eventId }
+    })
+    expect(coordinator.getTransactionReceipt).toHaveBeenCalledExactlyOnceWith(hardwareEvent.eventId)
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(hardwareEvent.eventId)
+    expect(coordinator.processTransaction).not.toHaveBeenCalled()
+  })
+
+  it('refuses cancellation after a durable transaction receipt exists', async () => {
+    const gateway = createGateway()
+    const inventoryService = createInventoryService()
+    vi.mocked(inventoryService.findProductByBarcode).mockReturnValue({
+      id: 7,
+      barcode: hardwareEvent.barcode,
+      itemName: 'Cleanser',
+      category: 'General',
+      imagePath: '',
+      currentStock: 20,
+      lowStockThreshold: 5,
+      status: 'HIGH',
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z'
+    })
+    const coordinator = createTransactionCoordinator()
+    vi.mocked(coordinator.getTransactionReceipt).mockReturnValue(transactionReceipt)
+    const { authSession, trustedEvent, acknowledge } = setup(
+      gateway,
+      inventoryService,
+      coordinator
+    )
     authSession.signIn('admin')
 
     await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
       ok: false,
-      error: { code: 'VALIDATION_ERROR' }
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'This inventory transaction is already saved and must finish recovery.'
+      }
     })
     expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+    expect(coordinator.processTransaction).not.toHaveBeenCalled()
   })
 
-  it('does not reject a different or missing FIFO head', async () => {
+  it('serializes cancellation behind FIFO validation, commit, result delivery, and acknowledgement', async () => {
+    const database = initializeDatabase({ databasePath: ':memory:' })
+    const inventoryService = createSqliteInventoryService(database, {
+      createTransactionId: () => 'movement-serialized-1'
+    })
+    inventoryService.createProduct({
+      barcode: hardwareEvent.barcode,
+      itemName: 'Cleanser',
+      category: 'General',
+      initialStock: 20,
+      lowStockThreshold: 5
+    })
+
+    const nextEvent = {
+      ...hardwareEvent,
+      eventId: 'evt-session-2',
+      mode: 'checkout'
+    } as const
+    const hardwareQueue = [hardwareEvent, nextEvent]
     const gateway = createGateway()
-    const { authSession, trustedEvent, acknowledge } = setup(gateway)
+    let releaseInitialHead!: () => void
+    const initialHead = new Promise<typeof hardwareEvent>((resolve) => {
+      releaseInitialHead = () => resolve(hardwareEvent)
+    })
+    let headRequestCount = 0
+    vi.mocked(gateway.getNextTransactionEvent).mockImplementation(async () => {
+      headRequestCount += 1
+      if (headRequestCount === 1) return initialHead
+      return hardwareQueue[0] ?? null
+    })
+    vi.mocked(gateway.acknowledgeTransactionEvent).mockImplementation(async (eventId) => {
+      if (hardwareQueue[0]?.eventId !== eventId) {
+        throw new Error('The ACK must never consume a different FIFO head.')
+      }
+      hardwareQueue.shift()
+    })
+
+    let releaseResultDelivery!: () => void
+    const resultDelivery = new Promise<void>((resolve) => {
+      releaseResultDelivery = resolve
+    })
+    vi.mocked(gateway.deliverTransactionResult).mockReturnValue(resultDelivery)
+
+    const coordinator = createHardwareTransactionCoordinator({
+      inventoryService,
+      gateway
+    })
+    const {
+      authSession,
+      trustedEvent,
+      acknowledge,
+      process,
+      dispose
+    } = setup(gateway, inventoryService, coordinator)
+    authSession.signIn('admin')
+
+    try {
+      const processing = process(trustedEvent, {
+        eventId: hardwareEvent.eventId,
+        quantity: 2
+      })
+      await vi.waitFor(() => {
+        expect(gateway.getNextTransactionEvent).toHaveBeenCalledTimes(1)
+      })
+
+      let cancellationSettled = false
+      const cancellation = Promise.resolve(
+        acknowledge(trustedEvent, hardwareEvent.eventId)
+      ).finally(() => {
+        cancellationSettled = true
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+
+      // Confirmation owns the FIFO mutation lane from its first authoritative
+      // head read. Cancellation cannot overtake it and ACK the same event while
+      // confirmation is still validating which event it will commit.
+      expect(gateway.getNextTransactionEvent).toHaveBeenCalledTimes(1)
+      expect(gateway.deliverTransactionResult).not.toHaveBeenCalled()
+      expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+      expect(cancellationSettled).toBe(false)
+      expect(hardwareQueue).toEqual([hardwareEvent, nextEvent])
+      expect(inventoryService.findProductByBarcode(hardwareEvent.barcode)).toMatchObject({
+        currentStock: 20
+      })
+      expect(inventoryService.listMovementHistory()).toHaveLength(0)
+      expect(inventoryService.findHardwareTransactionReceipt(hardwareEvent.eventId)).toBeNull()
+
+      releaseInitialHead()
+      await vi.waitFor(() => {
+        expect(gateway.deliverTransactionResult).toHaveBeenCalledTimes(1)
+      })
+
+      // SQLite is already committed, but result delivery is deliberately held
+      // open. A simultaneous Cancel request must remain behind that operation.
+      expect(inventoryService.findProductByBarcode(hardwareEvent.barcode)).toMatchObject({
+        currentStock: 22
+      })
+      expect(inventoryService.listMovementHistory()).toHaveLength(1)
+      expect(inventoryService.findHardwareTransactionReceipt(hardwareEvent.eventId)).toMatchObject({
+        resultDeliveredToHardware: false
+      })
+      expect(gateway.getNextTransactionEvent).toHaveBeenCalledTimes(2)
+      expect(gateway.deliverTransactionResult).toHaveBeenCalledExactlyOnceWith({
+        eventId: hardwareEvent.eventId,
+        result: 'success',
+        mode: hardwareEvent.mode,
+        quantity: 2,
+        resultingStock: 22,
+        stockStatus: 'HIGH'
+      })
+      expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+      expect(cancellationSettled).toBe(false)
+      expect(hardwareQueue).toEqual([hardwareEvent, nextEvent])
+
+      releaseResultDelivery()
+
+      await expect(processing).resolves.toMatchObject({
+        ok: true,
+        value: {
+          acknowledged: true,
+          receipt: {
+            eventId: hardwareEvent.eventId,
+            newTotal: 22,
+            resultDeliveredToHardware: true
+          }
+        }
+      })
+      await expect(cancellation).resolves.toEqual({
+        ok: false,
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'This inventory transaction is already saved and must finish recovery.'
+        }
+      })
+
+      expect(gateway.getNextTransactionEvent).toHaveBeenCalledTimes(3)
+      expect(gateway.deliverTransactionResult).toHaveBeenCalledTimes(1)
+      expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(
+        hardwareEvent.eventId
+      )
+      expect(hardwareQueue).toEqual([nextEvent])
+      expect(inventoryService.findProductByBarcode(hardwareEvent.barcode)).toMatchObject({
+        currentStock: 22
+      })
+      expect(inventoryService.listMovementHistory()).toHaveLength(1)
+      expect(inventoryService.findHardwareTransactionReceipt(hardwareEvent.eventId)).toMatchObject({
+        newTotal: 22,
+        resultDeliveredToHardware: true
+      })
+    } finally {
+      releaseInitialHead()
+      releaseResultDelivery()
+      dispose()
+      database.close()
+    }
+  })
+
+  it('retries an old cancellation ID when the FIFO advanced after a lost response', async () => {
+    const gateway = createGateway()
+    const inventoryService = createInventoryService()
+    const coordinator = createTransactionCoordinator()
+    const { authSession, trustedEvent, acknowledge } = setup(
+      gateway,
+      inventoryService,
+      coordinator
+    )
     authSession.signIn('admin')
 
     vi.mocked(gateway.getNextTransactionEvent).mockResolvedValueOnce({
       ...hardwareEvent,
       eventId: 'evt-other'
     })
-    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
-      ok: false,
-      error: { code: 'VALIDATION_ERROR' }
+    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
+      ok: true,
+      value: { eventId: hardwareEvent.eventId }
     })
-    vi.mocked(gateway.getNextTransactionEvent).mockResolvedValueOnce(null)
-    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
+
+    expect(coordinator.getTransactionReceipt).toHaveBeenCalledExactlyOnceWith(
+      hardwareEvent.eventId
+    )
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(
+      hardwareEvent.eventId
+    )
+    expect(inventoryService.findProductByBarcode).not.toHaveBeenCalled()
+  })
+
+  it('rejects a true cancellation mismatch without consuming the current FIFO head', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextTransactionEvent).mockResolvedValueOnce({
+      ...hardwareEvent,
+      eventId: 'evt-other'
+    })
+    vi.mocked(gateway.acknowledgeTransactionEvent).mockRejectedValueOnce(
+      new Error('The old event ID is not in the recent-ACK receipt.')
+    )
+    const { authSession, trustedEvent, acknowledge } = setup(gateway)
+    authSession.signIn('admin')
+
+    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
       ok: false,
-      error: { code: 'NOT_FOUND' }
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'A different hardware scan is currently pending.'
+      }
+    })
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(
+      hardwareEvent.eventId
+    )
+    expect(gateway.getNextTransactionEvent).toHaveBeenCalledExactlyOnceWith()
+  })
+
+  it('treats an already-empty uncommitted queue as idempotent cancellation success', async () => {
+    const gateway = createGateway()
+    const { authSession, trustedEvent, acknowledge } = setup(gateway)
+    authSession.signIn('admin')
+
+    vi.mocked(gateway.getNextTransactionEvent).mockResolvedValueOnce(null)
+    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
+      ok: true,
+      value: { eventId: hardwareEvent.eventId }
     })
     expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  })
+
+  it('never retries cancellation after a durable receipt when the FIFO already advanced', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextTransactionEvent).mockResolvedValueOnce({
+      ...hardwareEvent,
+      eventId: 'evt-other'
+    })
+    const coordinator = createTransactionCoordinator()
+    vi.mocked(coordinator.getTransactionReceipt).mockReturnValue(transactionReceipt)
+    const { authSession, trustedEvent, acknowledge } = setup(
+      gateway,
+      createInventoryService(),
+      coordinator
+    )
+    authSession.signIn('admin')
+
+    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
+      ok: false,
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'This inventory transaction is already saved and must finish recovery.'
+      }
+    })
+    expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  })
+
+  it('reconciles a lost ACK response when the event has already left the FIFO', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextTransactionEvent)
+      .mockResolvedValueOnce(hardwareEvent)
+      .mockResolvedValueOnce(null)
+    vi.mocked(gateway.acknowledgeTransactionEvent).mockRejectedValueOnce(
+      new Error('Response lost after ESP32 applied ACK')
+    )
+    const { authSession, trustedEvent, acknowledge } = setup(gateway)
+    authSession.signIn('admin')
+
+    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
+      ok: true,
+      value: { eventId: hardwareEvent.eventId }
+    })
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(
+      hardwareEvent.eventId
+    )
+    expect(gateway.getNextTransactionEvent).toHaveBeenCalledTimes(2)
   })
 
   it('reports a failed ACK without leaking transport details and allows a retry', async () => {
@@ -388,10 +697,30 @@ describe('authenticated hardware IPC boundary', () => {
     expect(coordinator.processTransaction).not.toHaveBeenCalled()
   })
 
+  it('offers result-delivery recovery through a separate fixed channel', async () => {
+    const coordinator = createTransactionCoordinator()
+    const { authSession, trustedEvent, retryResult } = setup(
+      createGateway(),
+      createInventoryService(),
+      coordinator
+    )
+    authSession.signIn('admin')
+
+    await expect(retryResult(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
+      ok: true,
+      value: { receipt: transactionReceipt, acknowledged: true }
+    })
+    expect(coordinator.retryTransactionResultDelivery).toHaveBeenCalledExactlyOnceWith(
+      hardwareEvent.eventId
+    )
+    expect(coordinator.processTransaction).not.toHaveBeenCalled()
+  })
+
   it.each([
     [IPC_CHANNELS.hardwareGetTransactionReceipt, 'invalid/id'],
     [IPC_CHANNELS.hardwareProcessTransaction, { eventId: hardwareEvent.eventId, quantity: 0 }],
     [IPC_CHANNELS.hardwareProcessTransaction, { eventId: hardwareEvent.eventId, quantity: 10_001 }],
+    [IPC_CHANNELS.hardwareRetryTransactionResultDelivery, 'invalid/id'],
     [IPC_CHANNELS.hardwareRetryTransactionAcknowledgement, 'invalid/id']
   ])('validates %s before calling the transaction coordinator', async (channel, payload) => {
     const coordinator = createTransactionCoordinator()
@@ -410,12 +739,22 @@ describe('authenticated hardware IPC boundary', () => {
     })
     expect(coordinator.getTransactionReceipt).not.toHaveBeenCalled()
     expect(coordinator.processTransaction).not.toHaveBeenCalled()
+    expect(coordinator.retryTransactionResultDelivery).not.toHaveBeenCalled()
     expect(coordinator.retryTransactionAcknowledgement).not.toHaveBeenCalled()
   })
 
   it('blocks both event routes when signed out, from another window, or from a subframe', async () => {
     const gateway = createGateway()
-    const { authSession, trustedEvent, next, acknowledge, getReceipt, process, retryAck } = setup(gateway)
+    const {
+      authSession,
+      trustedEvent,
+      next,
+      acknowledge,
+      getReceipt,
+      process,
+      retryResult,
+      retryAck
+    } = setup(gateway)
     await expect(next(trustedEvent)).resolves.toBeNull()
     await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
       ok: false, error: { code: 'UNAUTHORIZED' }
@@ -427,6 +766,9 @@ describe('authenticated hardware IPC boundary', () => {
       process(trustedEvent, { eventId: hardwareEvent.eventId, quantity: 2 })
     ).resolves.toMatchObject({ ok: false, error: { code: 'UNAUTHORIZED' } })
     await expect(retryAck(trustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
+      ok: false, error: { code: 'UNAUTHORIZED' }
+    })
+    await expect(retryResult(trustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
       ok: false, error: { code: 'UNAUTHORIZED' }
     })
 
@@ -446,6 +788,9 @@ describe('authenticated hardware IPC boundary', () => {
         process(untrustedEvent, { eventId: hardwareEvent.eventId, quantity: 2 })
       ).resolves.toMatchObject({ ok: false, error: { code: 'UNAUTHORIZED' } })
       await expect(retryAck(untrustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
+        ok: false, error: { code: 'UNAUTHORIZED' }
+      })
+      await expect(retryResult(untrustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
         ok: false, error: { code: 'UNAUTHORIZED' }
       })
     }
@@ -471,6 +816,9 @@ describe('authenticated hardware IPC boundary', () => {
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetTransactionReceipt)
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareProcessTransaction)
+    expect(electronMock.removeHandler).toHaveBeenCalledWith(
+      IPC_CHANNELS.hardwareRetryTransactionResultDelivery
+    )
     expect(electronMock.removeHandler).toHaveBeenCalledWith(
       IPC_CHANNELS.hardwareRetryTransactionAcknowledgement
     )

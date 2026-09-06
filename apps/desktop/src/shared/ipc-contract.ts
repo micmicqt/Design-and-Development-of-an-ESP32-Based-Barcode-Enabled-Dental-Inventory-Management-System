@@ -34,6 +34,7 @@ export const IPC_CHANNELS = {
   hardwareAcknowledgeTransactionEvent: 'hardware:acknowledge-transaction-event',
   hardwareGetTransactionReceipt: 'hardware:get-transaction-receipt',
   hardwareProcessTransaction: 'hardware:process-transaction',
+  hardwareRetryTransactionResultDelivery: 'hardware:retry-transaction-result-delivery',
   hardwareRetryTransactionAcknowledgement: 'hardware:retry-transaction-acknowledgement'
 } as const
 
@@ -68,6 +69,17 @@ export interface HardwareTransactionReceipt extends HardwareTransactionEvent {
   previousStock: number
   newTotal: number
   status: StockStatus
+  /** Persisted after the ESP32 accepts this committed result. */
+  resultDeliveredToHardware: boolean
+}
+
+export interface HardwareTransactionResult {
+  eventId: string
+  result: 'success'
+  mode: HardwareTransactionMode
+  quantity: number
+  resultingStock: number
+  stockStatus: StockStatus
 }
 
 export interface ProcessHardwareTransactionInput {
@@ -75,7 +87,7 @@ export interface ProcessHardwareTransactionInput {
   quantity: number
 }
 
-/** ok=true always means SQLite committed, even when the later ACK failed. */
+/** ok=true always means SQLite committed, even when later result delivery or ACK failed. */
 export interface HardwareTransactionOutcome {
   receipt: HardwareTransactionReceipt
   acknowledged: boolean
@@ -213,6 +225,7 @@ export interface DesktopApi {
     ) => Promise<IpcResult<{ eventId: string }>>
     getTransactionReceipt: (eventId: string) => Promise<IpcResult<HardwareTransactionReceipt | null>>
     processTransaction: (input: ProcessHardwareTransactionInput) => Promise<IpcResult<HardwareTransactionOutcome>>
+    retryTransactionResultDelivery: (eventId: string) => Promise<IpcResult<HardwareTransactionOutcome>>
     retryTransactionAcknowledgement: (eventId: string) => Promise<IpcResult<HardwareTransactionOutcome>>
   }
 }

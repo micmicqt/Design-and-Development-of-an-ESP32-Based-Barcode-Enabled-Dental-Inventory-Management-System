@@ -29,13 +29,23 @@ constexpr uint32_t kBarcodeTimeoutMs = 10000UL;
 constexpr uint32_t kBarcodeIdleTimeoutMs = 100UL;
 constexpr uint32_t kIndicatorFeedbackMs = 1000UL;
 constexpr uint32_t kLcdFeedbackMs = 2000UL;
+constexpr uint32_t kCommittedResultLcdFeedbackMs = 4000UL;
 constexpr size_t kMaximumBarcodeLength = 256U;
 constexpr uint16_t kHttpServerPort = 80U;
 constexpr uint32_t kWiFiConnectionTimeoutMs = 15000UL;
 constexpr uint32_t kWiFiRetryBackoffMs = 30000UL;
 constexpr uint32_t kWiFiProgressIntervalMs = 2000UL;
+constexpr uint8_t kDs3231StatusRegister = 0x0FU;
+constexpr uint8_t kDs3231OscillatorStopFlag = 0x80U;
+constexpr uint8_t kRtcStatusReadAttempts = 3U;
+constexpr uint32_t kRtcStatusRetryDelayMs = 25UL;
 using dental::events::AcknowledgementResult;
 using dental::events::PendingTransactionEvent;
+using dental::events::ResultApplicationResult;
+using dental::events::StockIndicatorOutputs;
+using dental::events::StockStatus;
+using dental::events::TransactionResult;
+using dental::events::TransactionResultQueue;
 using dental::events::appendJsonString;
 constexpr char kWiFiSsidPlaceholder[] = "replace-with-local-wifi-ssid";
 constexpr char kWiFiPasswordPlaceholder[] =
@@ -93,6 +103,7 @@ enum class WorkflowState : uint8_t {
   kWaitingForAcknowledgement,
   kWaitingForBarcode,
   kShowingFeedback,
+  kShowingCommittedResult,
 };
 
 enum class CsvAppendResult : uint8_t {
@@ -149,10 +160,18 @@ dental::events::PendingEventQueue pendingEvents;
 uint64_t nextEventSequence = 1ULL;
 char bootSessionIdentifier[40U] = {};
 
+TransactionResultQueue committedResultFeedbacks;
+TransactionResult activeCommittedResultFeedback =
+    {{}, {}, 0U, 0ULL, StockStatus::kHigh};
+bool committedResultIndicatorIsOn = false;
+
 size_t acknowledgementMatchIndex = 0U;
 String barcodeBuffer;
 bool barcodeIsInvalid = false;
 uint32_t lastBarcodeByteMs = 0UL;
+
+void setStockStatusIndicator(StockStatus status);
+void startNextCommittedResultFeedback(uint32_t nowMs);
 
 void writePaddedLcdLine(uint8_t row, const String& text) {
   if (!lcdAvailable) {
@@ -191,6 +210,9 @@ const char* currentHttpMode() {
   }
   if (activeTransaction == &kCheckoutTransaction) {
     return "checkout";
+  }
+  if (workflowState == WorkflowState::kShowingCommittedResult) {
+    return activeCommittedResultFeedback.mode;
   }
   return "busy";
 }
@@ -302,6 +324,74 @@ void sendAcknowledgementError(int statusCode, const char* errorCode) {
   httpServer.send(statusCode, "application/json", response);
 }
 
+void sendResultError(int statusCode, const char* errorCode) {
+  String response = "{\"accepted\":false,\"error\":";
+  appendJsonString(response, errorCode);
+  response += '}';
+  httpServer.send(statusCode, "application/json", response);
+}
+
+void handleEventResultRequest() {
+  TransactionResult requestedResult =
+      {{}, {}, 0U, 0ULL, StockStatus::kHigh};
+  const String body = httpServer.arg("plain");
+  if (!dental::events::parseTransactionResultBody(
+          body.c_str(), body.length(), requestedResult)) {
+    sendResultError(400, "invalid_request");
+    return;
+  }
+
+  // Classify before the capacity check so empty/mismatched/conflicting results
+  // retain their precise response and never consume a feedback slot.
+  const ResultApplicationResult classification =
+      pendingEvents.classifyResult(requestedResult);
+  if (classification == ResultApplicationResult::kApplied &&
+      committedResultFeedbacks.full()) {
+    sendResultError(503, "feedback_queue_full");
+    return;
+  }
+
+  const ResultApplicationResult result =
+      pendingEvents.applyResult(requestedResult);
+  if (result == ResultApplicationResult::kEmpty) {
+    sendResultError(404, "no_pending_event");
+    return;
+  }
+  if (result == ResultApplicationResult::kEventIdMismatch) {
+    sendResultError(409, "event_id_mismatch");
+    return;
+  }
+  if (result == ResultApplicationResult::kModeMismatch) {
+    sendResultError(409, "event_mode_mismatch");
+    return;
+  }
+  if (result == ResultApplicationResult::kConflict) {
+    sendResultError(409, "conflicting_result");
+    return;
+  }
+
+  if (result == ResultApplicationResult::kApplied) {
+    setStockStatusIndicator(requestedResult.stockStatus);
+    if (!committedResultFeedbacks.enqueue(requestedResult)) {
+      // The preflight check above and single-threaded WebServer dispatch make
+      // this unreachable, but never write past the bounded queue.
+      sendResultError(503, "feedback_queue_full");
+      return;
+    }
+    Serial.print("Committed transaction result accepted: ");
+    Serial.println(requestedResult.eventId);
+    startNextCommittedResultFeedback(millis());
+  } else {
+    Serial.print("Identical committed transaction result already applied: ");
+    Serial.println(requestedResult.eventId);
+  }
+
+  String response = "{\"accepted\":true,\"eventId\":";
+  appendJsonString(response, requestedResult.eventId);
+  response += '}';
+  httpServer.send(200, "application/json", response);
+}
+
 void handleEventAcknowledgementRequest() {
   char requestedEventId[dental::events::kEventIdCapacity] = {};
   const String body = httpServer.arg("plain");
@@ -335,6 +425,7 @@ void configureHttpRoutes() {
   httpServer.on("/events/next", HTTP_GET, handleNextEventRequest);
   httpServer.on("/events/ack", HTTP_POST,
                 handleEventAcknowledgementRequest);
+  httpServer.on("/events/result", HTTP_POST, handleEventResultRequest);
 }
 
 bool wiFiCredentialsAreConfigured() {
@@ -432,6 +523,34 @@ bool i2cAddressResponds(uint8_t address) {
   return Wire.endTransmission() == 0U;
 }
 
+bool readDs3231StatusRegister(uint8_t& status) {
+  for (uint8_t attempt = 1U; attempt <= kRtcStatusReadAttempts; ++attempt) {
+    Wire.beginTransmission(dental::hardware::kDs3231I2cAddress);
+    Wire.write(kDs3231StatusRegister);
+    const uint8_t transmissionResult = Wire.endTransmission(false);
+    const uint8_t receivedBytes =
+        transmissionResult == 0U
+            ? Wire.requestFrom(dental::hardware::kDs3231I2cAddress,
+                               static_cast<uint8_t>(1U))
+            : 0U;
+
+    if (transmissionResult == 0U && receivedBytes == 1U &&
+        Wire.available() == 1) {
+      status = static_cast<uint8_t>(Wire.read());
+      return true;
+    }
+
+    while (Wire.available() > 0) {
+      Wire.read();
+    }
+    if (attempt < kRtcStatusReadAttempts) {
+      delay(kRtcStatusRetryDelayMs);
+    }
+  }
+
+  return false;
+}
+
 void setTransactionIndicatorOff() {
   digitalWrite(dental::hardware::kTwoIndicatorControlAGpio, LOW);
   digitalWrite(dental::hardware::kTwoIndicatorControlBGpio, LOW);
@@ -450,6 +569,52 @@ void setErrorIndicator() {
   digitalWrite(dental::hardware::kTwoIndicatorControlAGpio, HIGH);
 }
 
+void setStockStatusIndicator(StockStatus status) {
+  const StockIndicatorOutputs outputs =
+      dental::events::stockIndicatorOutputs(status);
+
+  // Pass through 00 before selecting a status so a previous status does not
+  // remain visible during the two GPIO writes.
+  digitalWrite(dental::hardware::kThreeIndicatorControlAGpio, LOW);
+  digitalWrite(dental::hardware::kThreeIndicatorControlBGpio, LOW);
+  digitalWrite(dental::hardware::kThreeIndicatorControlAGpio,
+               outputs.controlA ? HIGH : LOW);
+  digitalWrite(dental::hardware::kThreeIndicatorControlBGpio,
+               outputs.controlB ? HIGH : LOW);
+}
+
+void startNextCommittedResultFeedback(uint32_t nowMs) {
+  if (workflowState != WorkflowState::kIdle ||
+      committedResultFeedbacks.size() == 0U) {
+    return;
+  }
+
+  if (!committedResultFeedbacks.dequeue(activeCommittedResultFeedback)) return;
+
+  char stockLine[32U] = {};
+  snprintf(stockLine, sizeof(stockLine), "Stock: %llu",
+           static_cast<unsigned long long>(
+               activeCommittedResultFeedback.resultingStock));
+  String quantityLine = "Qty: ";
+  quantityLine += strcmp(activeCommittedResultFeedback.mode, "restock") == 0
+                      ? "+"
+                      : "-";
+  quantityLine += String(activeCommittedResultFeedback.quantity);
+  String statusLine = "Status: ";
+  statusLine += dental::events::stockStatusName(
+      activeCommittedResultFeedback.stockStatus);
+
+  showLcdScreen(
+      strcmp(activeCommittedResultFeedback.mode, "restock") == 0
+          ? "RESTOCK SUCCESS"
+          : "CHECKOUT SUCCESS",
+      quantityLine, stockLine, statusLine);
+  setSuccessIndicator();
+  committedResultIndicatorIsOn = true;
+  workflowState = WorkflowState::kShowingCommittedResult;
+  workflowStateStartedMs = nowMs;
+}
+
 void configureLedOutputs() {
   const uint8_t outputPins[] = {
       dental::hardware::kTwoIndicatorControlAGpio,
@@ -464,7 +629,8 @@ void configureLedOutputs() {
     digitalWrite(pin, LOW);
   }
 
-  // GPIO26/GPIO27 remain LOW for this test; D3/D4/D5 are not exercised.
+  // GPIO26/GPIO27 stay at 00 until an authoritative desktop result selects a
+  // persistent HIGH, LOW, or EMPTY stock indication.
 }
 
 void resetScannerWorkflowBuffers() {
@@ -837,6 +1003,27 @@ void initializeButton(DebouncedButtonState& button) {
 }
 
 void serviceWorkflowTimeouts(uint32_t nowMs) {
+  if (workflowState == WorkflowState::kShowingCommittedResult) {
+    const uint32_t elapsedMs = nowMs - workflowStateStartedMs;
+    if (committedResultIndicatorIsOn &&
+        elapsedMs >= kIndicatorFeedbackMs) {
+      setTransactionIndicatorOff();
+      committedResultIndicatorIsOn = false;
+    }
+
+    if (elapsedMs >= kCommittedResultLcdFeedbackMs) {
+      setTransactionIndicatorOff();
+      committedResultIndicatorIsOn = false;
+      workflowState = WorkflowState::kIdle;
+      if (committedResultFeedbacks.size() > 0U) {
+        startNextCommittedResultFeedback(nowMs);
+      } else {
+        showIdleScreen();
+      }
+    }
+    return;
+  }
+
   if (workflowState == WorkflowState::kWaitingForAcknowledgement &&
       nowMs - workflowStateStartedMs >= kAcknowledgementTimeoutMs) {
     beginErrorFeedback("GM65 trigger acknowledgement timeout",
@@ -872,7 +1059,11 @@ void serviceWorkflowTimeouts(uint32_t nowMs) {
       resetScannerWorkflowBuffers();
       activeTransaction = nullptr;
       workflowState = WorkflowState::kIdle;
-      showIdleScreen();
+      if (committedResultFeedbacks.size() > 0U) {
+        startNextCommittedResultFeedback(nowMs);
+      } else {
+        showIdleScreen();
+      }
     }
   }
 }
@@ -915,7 +1106,11 @@ void setup() {
   }
 
   if (wireInitialized && rtc.begin(&Wire)) {
-    if (rtc.lostPower()) {
+    uint8_t rtcStatus = 0U;
+    if (!readDs3231StatusRegister(rtcStatus)) {
+      Serial.println(
+          "RTC initialization: FAILED - status register read failed");
+    } else if ((rtcStatus & kDs3231OscillatorStopFlag) != 0U) {
       Serial.println(
           "RTC initialization: FAILED - lost-power flag set; time not modified");
     } else if (!rtc.now().isValid()) {

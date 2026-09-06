@@ -66,6 +66,7 @@ function sanitizedTransactionFailure<T>(error: unknown, fallbackMessage: string)
       case 'RECEIPT_NOT_FOUND':
         return failure({ code: 'NOT_FOUND', message: error.message })
       case 'EVENT_MISMATCH':
+      case 'RESULT_NOT_DELIVERED':
         return failure({ code: 'VALIDATION_ERROR', message: error.message })
       case 'HARDWARE_UNAVAILABLE':
         return failure({ code: 'INTERNAL_ERROR', message: fallbackMessage })
@@ -101,6 +102,16 @@ export function registerHardwareIpcHandlers(
   options: RegisterHardwareIpcHandlersOptions
 ): () => void {
   const { gateway, inventoryService, transactionCoordinator, authSession, getMainWindow } = options
+  let hardwareMutationTail: Promise<void> = Promise.resolve()
+
+  function serializeHardwareMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = hardwareMutationTail.then(operation, operation)
+    hardwareMutationTail = result.then(
+      () => undefined,
+      () => undefined
+    )
+    return result
+  }
 
   ipcMain.handle(
     IPC_CHANNELS.hardwareGetStatus,
@@ -154,39 +165,88 @@ export function registerHardwareIpcHandlers(
     async (event, eventId: unknown): Promise<IpcResult<{ eventId: string }>> => {
       if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
 
-      try {
-        const validatedEventId = validateHardwareTransactionEventIdPayload(eventId)
-        if (gateway === null) throw new Error('Hardware is not configured.')
+      return serializeHardwareMutation(async () => {
+        try {
+          const validatedEventId = validateHardwareTransactionEventIdPayload(eventId)
+          if (gateway === null) throw new Error('Hardware is not configured.')
 
-        const pendingEvent = await gateway.getNextTransactionEvent()
-        if (pendingEvent === null) {
-          return failure({ code: 'NOT_FOUND', message: 'This hardware scan is no longer pending.' })
-        }
-        if (pendingEvent.eventId !== validatedEventId) {
-          return failure({
-            code: 'VALIDATION_ERROR',
-            message: 'A different hardware scan is currently pending.'
-          })
-        }
+          const pendingEvent = await gateway.getNextTransactionEvent()
+          if (pendingEvent === null) {
+            // Do not let an uncommitted-cancellation retry dismiss a transaction
+            // that crossed the durable commit boundary before the FIFO advanced.
+            if (transactionCoordinator.getTransactionReceipt(validatedEventId) !== null) {
+              return failure({
+                code: 'VALIDATION_ERROR',
+                message: 'This inventory transaction is already saved and must finish recovery.'
+              })
+            }
 
-        // This narrow route exists only for explicit rejection of an unknown
-        // barcode. Registered products must pass through the atomic transaction
-        // coordinator, preventing renderer code from bypassing commit-before-ACK.
-        if (inventoryService.findProductByBarcode(pendingEvent.barcode) !== null) {
-          return failure({
-            code: 'VALIDATION_ERROR',
-            message: 'Registered item scans must be confirmed before acknowledgement.'
-          })
-        }
+            // Cancellation/rejection is idempotent. A retry can arrive after the
+            // ESP32 removed the event but its successful HTTP response was lost.
+            return ok({ eventId: validatedEventId })
+          }
+          if (pendingEvent.eventId !== validatedEventId) {
+            if (transactionCoordinator.getTransactionReceipt(validatedEventId) !== null) {
+              return failure({
+                code: 'VALIDATION_ERROR',
+                message: 'This inventory transaction is already saved and must finish recovery.'
+              })
+            }
 
-        await gateway.acknowledgeTransactionEvent(validatedEventId)
-        return ok({ eventId: validatedEventId })
-      } catch (error: unknown) {
-        return sanitizedTransactionFailure(
-          error,
-          'Unable to acknowledge this scan. Check the ESP32 connection and retry.'
-        )
-      }
+            // A successful cancellation ACK can advance the FIFO before its HTTP
+            // response reaches the desktop. Retry the old ID so the firmware's
+            // bounded recent-ACK receipt can prove that cancellation without ever
+            // consuming the newly visible head. A rejected retry is a true
+            // mismatch and leaves both events untouched.
+            try {
+              await gateway.acknowledgeTransactionEvent(validatedEventId)
+              return ok({ eventId: validatedEventId })
+            } catch {
+              return failure({
+                code: 'VALIDATION_ERROR',
+                message: 'A different hardware scan is currently pending.'
+              })
+            }
+          }
+
+          const registeredProduct = inventoryService.findProductByBarcode(pendingEvent.barcode)
+
+          // Explicit rejection/cancellation may discard only an event that has not
+          // committed inventory work. Once a durable receipt exists, the event must
+          // complete result delivery and acknowledgement through the coordinator.
+          if (transactionCoordinator.getTransactionReceipt(validatedEventId) !== null) {
+            return failure({
+              code: 'VALIDATION_ERROR',
+              message: registeredProduct === null
+                ? 'This scan is already associated with a saved transaction.'
+                : 'This inventory transaction is already saved and must finish recovery.'
+            })
+          }
+
+          try {
+            await gateway.acknowledgeTransactionEvent(validatedEventId)
+          } catch (acknowledgementError: unknown) {
+            // Resolve an ambiguous transport failure by reading the authoritative
+            // FIFO head. If this event is gone, the ACK was applied and retrying is
+            // safely treated as success. A transport failure or unchanged head
+            // still preserves the dialog for another retry.
+            const eventAfterAcknowledgement = await gateway.getNextTransactionEvent()
+            if (
+              eventAfterAcknowledgement === null ||
+              eventAfterAcknowledgement.eventId !== validatedEventId
+            ) {
+              return ok({ eventId: validatedEventId })
+            }
+            throw acknowledgementError
+          }
+          return ok({ eventId: validatedEventId })
+        } catch (error: unknown) {
+          return sanitizedTransactionFailure(
+            error,
+            'Unable to acknowledge this scan. Check the ESP32 connection and retry.'
+          )
+        }
+      })
     }
   )
 
@@ -212,15 +272,39 @@ export function registerHardwareIpcHandlers(
     async (event, input: unknown): Promise<IpcResult<HardwareTransactionOutcome>> => {
       if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
 
-      try {
-        return ok(
-          await transactionCoordinator.processTransaction(
-            validateProcessHardwareTransactionInput(input)
+      return serializeHardwareMutation(async () => {
+        try {
+          return ok(
+            await transactionCoordinator.processTransaction(
+              validateProcessHardwareTransactionInput(input)
+            )
           )
-        )
-      } catch (error: unknown) {
-        return sanitizedTransactionFailure(error, 'Unable to process this hardware transaction.')
-      }
+        } catch (error: unknown) {
+          return sanitizedTransactionFailure(error, 'Unable to process this hardware transaction.')
+        }
+      })
+    }
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.hardwareRetryTransactionResultDelivery,
+    async (event, eventId: unknown): Promise<IpcResult<HardwareTransactionOutcome>> => {
+      if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
+
+      return serializeHardwareMutation(async () => {
+        try {
+          return ok(
+            await transactionCoordinator.retryTransactionResultDelivery(
+              validateHardwareTransactionEventIdPayload(eventId)
+            )
+          )
+        } catch (error: unknown) {
+          return sanitizedTransactionFailure(
+            error,
+            'Inventory was updated, but the result could not be delivered to the kiosk.'
+          )
+        }
+      })
     }
   )
 
@@ -229,18 +313,20 @@ export function registerHardwareIpcHandlers(
     async (event, eventId: unknown): Promise<IpcResult<HardwareTransactionOutcome>> => {
       if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
 
-      try {
-        return ok(
-          await transactionCoordinator.retryTransactionAcknowledgement(
-            validateHardwareTransactionEventIdPayload(eventId)
+      return serializeHardwareMutation(async () => {
+        try {
+          return ok(
+            await transactionCoordinator.retryTransactionAcknowledgement(
+              validateHardwareTransactionEventIdPayload(eventId)
+            )
           )
-        )
-      } catch (error: unknown) {
-        return sanitizedTransactionFailure(
-          error,
-          'Inventory was updated, but the kiosk acknowledgement could not be completed.'
-        )
-      }
+        } catch (error: unknown) {
+          return sanitizedTransactionFailure(
+            error,
+            'Inventory was updated, but the kiosk acknowledgement could not be completed.'
+          )
+        }
+      })
     }
   )
 
@@ -250,6 +336,7 @@ export function registerHardwareIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetTransactionReceipt)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareProcessTransaction)
+    ipcMain.removeHandler(IPC_CHANNELS.hardwareRetryTransactionResultDelivery)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareRetryTransactionAcknowledgement)
   }
 }

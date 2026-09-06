@@ -1,4 +1,7 @@
-import type { HardwareTransactionEvent } from '../../shared/ipc-contract'
+import type {
+  HardwareTransactionEvent,
+  HardwareTransactionResult
+} from '../../shared/ipc-contract'
 
 /**
  * Boundary for the future real ESP32 transport. No renderer component may use
@@ -33,6 +36,7 @@ export interface HardwareStatusGateway {
 /** Polling/acknowledgement boundary for Phase 4 hardware scan delivery. */
 export interface HardwareTransactionEventGateway extends HardwareStatusGateway {
   getNextTransactionEvent(): Promise<HardwareTransactionEvent | null>
+  deliverTransactionResult(result: HardwareTransactionResult): Promise<void>
   acknowledgeTransactionEvent(eventId: string): Promise<void>
 }
 

@@ -8,7 +8,9 @@ import {
 } from './hardware-gateway'
 import type {
   HardwareTransactionEvent,
-  HardwareTransactionMode
+  HardwareTransactionMode,
+  HardwareTransactionResult,
+  StockStatus
 } from '../../shared/ipc-contract'
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_500
@@ -21,6 +23,8 @@ const HARDWARE_MODES: readonly Esp32HardwareMode[] = [
 const TRANSACTION_MODES: readonly HardwareTransactionMode[] = ['restock', 'checkout']
 const TRANSACTION_EVENT_KEYS = ['barcode', 'eventId', 'mode', 'timestamp'] as const
 const ACKNOWLEDGEMENT_KEYS = ['acknowledged', 'eventId'] as const
+const RESULT_ACCEPTANCE_KEYS = ['accepted', 'eventId'] as const
+const STOCK_STATUSES: readonly StockStatus[] = ['HIGH', 'LOW', 'EMPTY']
 const NO_CONTENT = Symbol('HTTP 204')
 
 export interface HardwareHttpResponse {
@@ -220,6 +224,36 @@ function validateAcknowledgement(value: unknown, expectedEventId: string): void 
   }
 }
 
+function validateResult(result: HardwareTransactionResult): void {
+  if (
+    !isValidHardwareTransactionEventId(result.eventId) ||
+    result.result !== 'success' ||
+    !TRANSACTION_MODES.includes(result.mode) ||
+    !Number.isSafeInteger(result.quantity) ||
+    result.quantity <= 0 ||
+    result.quantity > 10_000 ||
+    !Number.isSafeInteger(result.resultingStock) ||
+    result.resultingStock < 0 ||
+    !STOCK_STATUSES.includes(result.stockStatus)
+  ) {
+    throw new HardwareGatewayError('INVALID_RESPONSE', 'The transaction result is invalid.')
+  }
+}
+
+function validateResultAcceptance(value: unknown, expectedEventId: string): void {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, RESULT_ACCEPTANCE_KEYS) ||
+    value.accepted !== true ||
+    value.eventId !== expectedEventId
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The ESP32 transaction result response is invalid.'
+    )
+  }
+}
+
 const defaultFetch: HardwareFetch = (url, options) => fetch(url, options)
 
 export class Esp32HttpGateway implements HardwareTransactionEventGateway {
@@ -249,6 +283,15 @@ export class Esp32HttpGateway implements HardwareTransactionEventGateway {
     return response === NO_CONTENT ? null : validateTransactionEvent(response)
   }
 
+  async deliverTransactionResult(result: HardwareTransactionResult): Promise<void> {
+    validateResult(result)
+    const response = await this.request('/events/result', {
+      method: 'POST',
+      body: JSON.stringify(result)
+    })
+    validateResultAcceptance(response, result.eventId)
+  }
+
   async acknowledgeTransactionEvent(eventId: string): Promise<void> {
     if (!isValidHardwareTransactionEventId(eventId)) {
       throw new HardwareGatewayError(
@@ -265,7 +308,7 @@ export class Esp32HttpGateway implements HardwareTransactionEventGateway {
   }
 
   private async request(
-    path: '/health' | '/status' | '/events/next' | '/events/ack',
+    path: '/health' | '/status' | '/events/next' | '/events/result' | '/events/ack',
     options: {
       method?: 'GET' | 'POST'
       body?: string
@@ -291,7 +334,9 @@ export class Esp32HttpGateway implements HardwareTransactionEventGateway {
         if (method === 'POST' && response.status >= 400 && response.status < 500) {
           throw new HardwareGatewayError(
             'REJECTED',
-            'The ESP32 rejected the transaction acknowledgement.'
+            path === '/events/result'
+              ? 'The ESP32 rejected the transaction result.'
+              : 'The ESP32 rejected the transaction acknowledgement.'
           )
         }
         throw new HardwareGatewayError(

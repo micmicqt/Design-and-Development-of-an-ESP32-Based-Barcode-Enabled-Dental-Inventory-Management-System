@@ -73,6 +73,7 @@ describe("database migrations and constraints", () => {
       { version: 1, name: "initial_phase_1_schema" },
       { version: 2, name: "phase_2_inventory_crud" },
       { version: 3, name: "phase_5_step_2_hardware_transactions" },
+      { version: 4, name: "phase_5_step_3_result_delivery" },
     ]);
   });
 
@@ -83,7 +84,7 @@ describe("database migrations and constraints", () => {
     const result = database
       .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
       .get() as { count: number };
-    expect(result.count).toBe(3);
+    expect(result.count).toBe(4);
   });
 
   it("accepts all six fixed categories and rejects any other category", () => {

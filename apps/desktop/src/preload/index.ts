@@ -91,6 +91,8 @@ const desktopApi: DesktopApi = Object.freeze({
         eventId: input.eventId,
         quantity: input.quantity
       }),
+    retryTransactionResultDelivery: (eventId: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareRetryTransactionResultDelivery, eventId),
     retryTransactionAcknowledgement: (eventId: string) =>
       ipcRenderer.invoke(IPC_CHANNELS.hardwareRetryTransactionAcknowledgement, eventId)
   })

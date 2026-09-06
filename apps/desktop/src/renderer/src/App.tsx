@@ -227,6 +227,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
   const [hardwareTransactionNotice, setHardwareTransactionNotice] = useState<string | null>(null)
   const hardwareEventRequest = useRef<Promise<HardwareTransactionEvent | null> | null>(null)
   const hardwareAcknowledgementInFlight = useRef(false)
+  const lastCommittedHardwareEvent = useRef<string | null>(null)
   const hardwareEventPreviousFocus = useRef<HTMLElement | null>(null)
   const resumeHardwareEventButton = useRef<HTMLButtonElement | null>(null)
   const hardwareEventVisible = pendingHardwareEvent !== null && hardwareEventOpen
@@ -385,7 +386,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     }
   }
 
-  async function rejectUnknownHardwareEvent(): Promise<void> {
+  async function acknowledgeUncommittedHardwareEvent(failureMessage?: string): Promise<void> {
     if (pendingHardwareEvent === null || hardwareAcknowledgementInFlight.current) return
 
     const eventId = pendingHardwareEvent.eventId
@@ -395,10 +396,13 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
 
     try {
       const result = await window.desktopApi.hardware.acknowledgeTransactionEvent(eventId)
-      if (!result.ok || result.value.eventId !== eventId) {
-        setHardwareEventError(
-          'Could not acknowledge this scan. Check the ESP32 connection and try again.'
-        )
+      if (!result.ok) {
+        setHardwareEventError(result.error.message)
+        return
+      }
+      if (result.value.eventId !== eventId) {
+        setHardwareEventError(failureMessage ??
+          'Could not acknowledge this scan. Check the ESP32 connection and try again.')
         return
       }
 
@@ -407,9 +411,8 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       )
       setPendingHardwareReceipt(null)
     } catch {
-      setHardwareEventError(
-        'Could not acknowledge this scan. Check the ESP32 connection and try again.'
-      )
+      setHardwareEventError(failureMessage ??
+        'Could not acknowledge this scan. Check the ESP32 connection and try again.')
     } finally {
       hardwareAcknowledgementInFlight.current = false
       setAcknowledgingHardwareEvent(false)
@@ -419,8 +422,11 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
   const handleHardwareTransactionCommitted = useCallback(
     (receipt: HardwareTransactionReceipt): void => {
       setPendingHardwareReceipt(receipt)
-      setInventoryRefreshVersion((current) => current + 1)
-      setHistoryRefreshVersion((current) => current + 1)
+      if (lastCommittedHardwareEvent.current !== receipt.eventId) {
+        lastCommittedHardwareEvent.current = receipt.eventId
+        setInventoryRefreshVersion((current) => current + 1)
+        setHistoryRefreshVersion((current) => current + 1)
+      }
     },
     []
   )
@@ -544,7 +550,9 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
               <p>
                 {pendingHardwareReceipt === null
                   ? `A ${pendingHardwareEvent.mode.toUpperCase()} scan is pending. Resume to continue safely.`
-                  : `The ${pendingHardwareEvent.mode.toUpperCase()} transaction was saved. ESP32 acknowledgement is pending.`}
+                  : pendingHardwareReceipt.resultDeliveredToHardware
+                    ? `The ${pendingHardwareEvent.mode.toUpperCase()} transaction was saved. ESP32 acknowledgement is pending.`
+                    : `The ${pendingHardwareEvent.mode.toUpperCase()} transaction was saved. ESP32 stock feedback is pending.`}
               </p>
               <button ref={resumeHardwareEventButton} type="button" className="secondary-button" onClick={() => {
                 hardwareEventPreviousFocus.current = document.activeElement instanceof HTMLElement
@@ -585,7 +593,10 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           open={hardwareEventOpen}
           acknowledging={acknowledgingHardwareEvent}
           acknowledgementError={hardwareEventError}
-          onReject={() => void rejectUnknownHardwareEvent()}
+          onReject={() => void acknowledgeUncommittedHardwareEvent()}
+          onCancel={() => void acknowledgeUncommittedHardwareEvent(
+            'Could not cancel this scan. Check the ESP32 connection and try again.'
+          )}
           onReviewLater={() => setHardwareEventOpen(false)}
           onCommitted={handleHardwareTransactionCommitted}
           onCompleted={handleHardwareTransactionCompleted}

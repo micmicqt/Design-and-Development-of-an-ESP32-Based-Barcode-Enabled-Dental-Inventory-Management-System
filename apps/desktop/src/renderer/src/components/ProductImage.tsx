@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import clinicLogo from '../assets/branding/any-time-dental-logo.png'
 
 export function ProductImage({
@@ -10,9 +10,8 @@ export function ProductImage({
   itemName: string
   className?: string
 }) {
-  const [unavailable, setUnavailable] = useState(false)
-
-  useEffect(() => setUnavailable(false), [imageUrl])
+  const [failedImageUrl, setFailedImageUrl] = useState<string | null>(null)
+  const unavailable = imageUrl !== null && failedImageUrl === imageUrl
 
   if (imageUrl === null || unavailable) {
     return (
@@ -31,7 +30,8 @@ export function ProductImage({
       className={`product-image ${className}`.trim()}
       src={imageUrl}
       alt={`${itemName} reference`}
-      onError={() => setUnavailable(true)}
+      onError={() => setFailedImageUrl(imageUrl)}
+      onLoad={() => setFailedImageUrl(null)}
     />
   )
 }

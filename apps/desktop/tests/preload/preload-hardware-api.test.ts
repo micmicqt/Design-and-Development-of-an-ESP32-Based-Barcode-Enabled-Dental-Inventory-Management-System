@@ -86,7 +86,7 @@ describe('preload hardware API', () => {
     await expect(api.hardware.acknowledgeTransactionEvent('device-session-1')).resolves.toEqual(result)
   })
 
-  it('exposes fixed receipt, processing, and ACK-retry channels with copied payloads', async () => {
+  it('exposes fixed receipt, processing, result-retry, and ACK-retry channels', async () => {
     const receiptResult = { ok: true, value: null }
     electronMock.invoke.mockResolvedValueOnce(receiptResult)
     await expect(api.hardware.getTransactionReceipt('evt-1')).resolves.toEqual(receiptResult)
@@ -105,6 +105,15 @@ describe('preload hardware API', () => {
     )
 
     const retryResult = { ok: true, value: { receipt: {}, acknowledged: true } }
+    electronMock.invoke.mockResolvedValueOnce(retryResult)
+    await expect(api.hardware.retryTransactionResultDelivery('evt-1')).resolves.toEqual(
+      retryResult
+    )
+    expect(electronMock.invoke).toHaveBeenLastCalledWith(
+      IPC_CHANNELS.hardwareRetryTransactionResultDelivery,
+      'evt-1'
+    )
+
     electronMock.invoke.mockResolvedValueOnce(retryResult)
     await expect(api.hardware.retryTransactionAcknowledgement('evt-1')).resolves.toEqual(
       retryResult
@@ -136,7 +145,8 @@ describe('preload hardware API', () => {
       'getStatus',
       'getTransactionReceipt',
       'processTransaction',
-      'retryTransactionAcknowledgement'
+      'retryTransactionAcknowledgement',
+      'retryTransactionResultDelivery'
     ])
     expect(api.hardware).not.toHaveProperty('baseUrl')
     expect(api.hardware).not.toHaveProperty('fetch')

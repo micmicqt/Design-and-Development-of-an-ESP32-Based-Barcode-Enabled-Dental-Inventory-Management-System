@@ -2,6 +2,7 @@ import type {
   HardwareTransactionEvent,
   HardwareTransactionOutcome,
   HardwareTransactionReceipt,
+  HardwareTransactionResult,
   ProcessHardwareTransactionInput
 } from '../../shared/ipc-contract'
 import type { HardwareTransactionEventGateway } from './hardware-gateway'
@@ -10,7 +11,8 @@ export const HARDWARE_TRANSACTION_COORDINATOR_ERROR_CODES = [
   'HARDWARE_UNAVAILABLE',
   'EVENT_NOT_PENDING',
   'EVENT_MISMATCH',
-  'RECEIPT_NOT_FOUND'
+  'RECEIPT_NOT_FOUND',
+  'RESULT_NOT_DELIVERED'
 ] as const
 
 export type HardwareTransactionCoordinatorErrorCode =
@@ -33,11 +35,13 @@ export interface HardwareTransactionInventoryService {
     event: HardwareTransactionEvent
     quantity: number
   }): HardwareTransactionReceipt
+  markHardwareTransactionResultDelivered(eventId: string): HardwareTransactionReceipt
 }
 
 export interface HardwareTransactionCoordinator {
   getTransactionReceipt(eventId: string): HardwareTransactionReceipt | null
   processTransaction(input: ProcessHardwareTransactionInput): Promise<HardwareTransactionOutcome>
+  retryTransactionResultDelivery(eventId: string): Promise<HardwareTransactionOutcome>
   retryTransactionAcknowledgement(eventId: string): Promise<HardwareTransactionOutcome>
 }
 
@@ -56,6 +60,17 @@ function isSameEvent(
     receipt.barcode === event.barcode &&
     receipt.timestamp === event.timestamp
   )
+}
+
+function resultFromReceipt(receipt: HardwareTransactionReceipt): HardwareTransactionResult {
+  return {
+    eventId: receipt.eventId,
+    result: 'success',
+    mode: receipt.mode,
+    quantity: receipt.quantity,
+    resultingStock: receipt.newTotal,
+    stockStatus: receipt.status
+  }
 }
 
 export function createHardwareTransactionCoordinator(
@@ -96,7 +111,7 @@ export function createHardwareTransactionCoordinator(
     return pendingEvent
   }
 
-  const acknowledgeCommittedReceipt = async (
+  const completeCommittedReceipt = async (
     receipt: HardwareTransactionReceipt
   ): Promise<HardwareTransactionOutcome> => {
     if (gateway === null) return { receipt, acknowledged: false }
@@ -108,21 +123,66 @@ export function createHardwareTransactionCoordinator(
       return { receipt, acknowledged: false }
     }
 
-    // The ACK may have reached the ESP32 even when its HTTP response was lost.
-    // An empty queue therefore means there is nothing left to acknowledge.
-    if (pendingEvent === null) return { receipt, acknowledged: true }
-    if (pendingEvent.eventId !== receipt.eventId || !isSameEvent(receipt, pendingEvent)) {
+    // An empty queue can prove a lost ACK response only after result delivery
+    // was durably recorded. Before that boundary, never claim completion.
+    if (pendingEvent === null) {
+      return {
+        receipt,
+        acknowledged: receipt.resultDeliveredToHardware
+      }
+    }
+    if (pendingEvent.eventId !== receipt.eventId) {
+      // A successful ACK can advance the ESP32 FIFO before its HTTP response
+      // is lost. Once result delivery is durable, retry the old event ID and
+      // let the firmware's recent-ACK receipt prove completion. Its FIFO guard
+      // guarantees this request cannot remove the newly visible head.
+      if (receipt.resultDeliveredToHardware) {
+        try {
+          await gateway.acknowledgeTransactionEvent(receipt.eventId)
+          return { receipt, acknowledged: true }
+        } catch {
+          return { receipt, acknowledged: false }
+        }
+      }
+
+      throw new HardwareTransactionCoordinatorError(
+        'EVENT_MISMATCH',
+        'A different hardware scan is currently pending.'
+      )
+    }
+    if (!isSameEvent(receipt, pendingEvent)) {
       throw new HardwareTransactionCoordinatorError(
         'EVENT_MISMATCH',
         'A different hardware scan is currently pending.'
       )
     }
 
+    let currentReceipt = receipt
+    if (!currentReceipt.resultDeliveredToHardware) {
+      try {
+        await gateway.deliverTransactionResult(resultFromReceipt(currentReceipt))
+      } catch {
+        return { receipt: currentReceipt, acknowledged: false }
+      }
+
+      // The ESP32 accepts identical result retries. Persisting this boundary
+      // makes later recovery ACK-only, including after an Electron restart.
+      try {
+        currentReceipt = inventoryService.markHardwareTransactionResultDelivered(
+          currentReceipt.eventId
+        )
+      } catch {
+        // The result may already be applied to hardware. Keep ACK pending and
+        // safely retry the identical result before attempting ACK.
+        return { receipt: currentReceipt, acknowledged: false }
+      }
+    }
+
     try {
-      await gateway.acknowledgeTransactionEvent(receipt.eventId)
-      return { receipt, acknowledged: true }
+      await gateway.acknowledgeTransactionEvent(currentReceipt.eventId)
+      return { receipt: currentReceipt, acknowledged: true }
     } catch {
-      return { receipt, acknowledged: false }
+      return { receipt: currentReceipt, acknowledged: false }
     }
   }
 
@@ -134,7 +194,7 @@ export function createHardwareTransactionCoordinator(
     async processTransaction(input) {
       const existingReceipt = inventoryService.findHardwareTransactionReceipt(input.eventId)
       if (existingReceipt !== null) {
-        return acknowledgeCommittedReceipt(existingReceipt)
+        return completeCommittedReceipt(existingReceipt)
       }
 
       const event = await requirePendingHead(input.eventId)
@@ -143,9 +203,20 @@ export function createHardwareTransactionCoordinator(
         quantity: input.quantity
       })
 
-      // The synchronous SQLite transaction above has committed before this
-      // first acknowledgement attempt. ACK failure never rolls it back.
-      return acknowledgeCommittedReceipt(receipt)
+      // SQLite has committed before result delivery. A result or ACK failure
+      // never rolls it back and the durable receipt prevents a second mutation.
+      return completeCommittedReceipt(receipt)
+    },
+
+    async retryTransactionResultDelivery(eventId) {
+      const receipt = inventoryService.findHardwareTransactionReceipt(eventId)
+      if (receipt === null) {
+        throw new HardwareTransactionCoordinatorError(
+          'RECEIPT_NOT_FOUND',
+          'No committed transaction was found for this hardware scan.'
+        )
+      }
+      return completeCommittedReceipt(receipt)
     },
 
     async retryTransactionAcknowledgement(eventId) {
@@ -156,7 +227,13 @@ export function createHardwareTransactionCoordinator(
           'No committed transaction was found for this hardware scan.'
         )
       }
-      return acknowledgeCommittedReceipt(receipt)
+      if (!receipt.resultDeliveredToHardware) {
+        throw new HardwareTransactionCoordinatorError(
+          'RESULT_NOT_DELIVERED',
+          'The committed result must be delivered before acknowledgement.'
+        )
+      }
+      return completeCommittedReceipt(receipt)
     }
   }
 }

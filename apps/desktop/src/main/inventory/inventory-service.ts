@@ -161,6 +161,7 @@ interface HardwareTransactionReceiptRow {
   new_total: number;
   occurred_at: string;
   resulting_status: StockStatus;
+  result_delivered_at: string | null;
 }
 
 interface NormalizedProductQuery {
@@ -202,6 +203,7 @@ export interface InventoryService {
   processHardwareTransaction(
     input: ProcessHardwareTransactionServiceInput,
   ): HardwareTransactionReceipt;
+  markHardwareTransactionResultDelivered(eventId: string): HardwareTransactionReceipt;
 }
 
 const HARDWARE_EVENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -507,6 +509,7 @@ function hardwareTransactionReceiptFromRow(
     previousStock: row.previous_stock,
     newTotal: row.new_total,
     status: row.resulting_status,
+    resultDeliveredToHardware: row.result_delivered_at !== null,
   };
 }
 
@@ -646,7 +649,8 @@ export function createInventoryService(
       movements.previous_stock,
       movements.new_total,
       movements.occurred_at,
-      processed.resulting_status
+      processed.resulting_status,
+      processed.result_delivered_at
     FROM processed_hardware_events AS processed
     INNER JOIN transactions AS movements
       ON movements.transaction_id = processed.transaction_id
@@ -683,6 +687,14 @@ export function createInventoryService(
       resulting_status
     ) VALUES (?, ?, ?)
   `);
+  const markHardwareTransactionResultDeliveredStatement = database.prepare(`
+    UPDATE processed_hardware_events
+    SET result_delivered_at = COALESCE(
+      result_delivered_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    WHERE event_id = ?
+  `);
 
   const getActiveProduct = (id: number): ProductRecord | null => {
     const row = getActiveProductStatement.get(id) as ProductRow | undefined;
@@ -696,6 +708,24 @@ export function createInventoryService(
       validateHardwareEventId(eventId),
     ) as HardwareTransactionReceiptRow | undefined;
     return row ? hardwareTransactionReceiptFromRow(row) : null;
+  };
+
+  const markHardwareTransactionResultDelivered = (
+    eventId: string,
+  ): HardwareTransactionReceipt => {
+    const validatedEventId = validateHardwareEventId(eventId);
+    const result = markHardwareTransactionResultDeliveredStatement.run(validatedEventId);
+    if (result.changes !== 1) {
+      throw new InventoryValidationError(
+        "No committed transaction was found for this hardware event.",
+      );
+    }
+
+    const receipt = findHardwareTransactionReceipt(validatedEventId);
+    if (receipt === null) {
+      throw new Error("The committed hardware transaction receipt is unavailable.");
+    }
+    return receipt;
   };
 
   const updateInTransaction = database.transaction(
@@ -869,6 +899,8 @@ export function createInventoryService(
     },
 
     findHardwareTransactionReceipt,
+
+    markHardwareTransactionResultDelivered,
 
     processHardwareTransaction(input) {
       return processHardwareTransactionInTransaction(

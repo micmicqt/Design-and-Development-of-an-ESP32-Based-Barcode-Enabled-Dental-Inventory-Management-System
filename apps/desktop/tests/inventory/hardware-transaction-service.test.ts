@@ -87,6 +87,7 @@ describe("InventoryService hardware transactions", () => {
       previousStock: 3,
       newTotal: 5,
       status: "HIGH",
+      resultDeliveredToHardware: false,
     });
     expect(inventory.findProductByBarcode(product.barcode)).toMatchObject({
       currentStock: 5,
@@ -334,6 +335,32 @@ describe("InventoryService hardware transactions", () => {
     expect(transactionSequence).toBe(1);
   });
 
+  it("durably marks result delivery without changing stock or history", () => {
+    createProduct();
+    const committed = inventory.processHardwareTransaction({
+      event: restockEvent,
+      quantity: 2,
+    });
+
+    expect(committed.resultDeliveredToHardware).toBe(false);
+    const delivered = inventory.markHardwareTransactionResultDelivered(
+      restockEvent.eventId,
+    );
+    expect(delivered).toEqual({ ...committed, resultDeliveredToHardware: true });
+    expect(
+      inventory.markHardwareTransactionResultDelivered(restockEvent.eventId),
+    ).toEqual(delivered);
+    expect(inventory.findProductByBarcode(restockEvent.barcode)?.currentStock).toBe(12);
+    expect(inventory.listMovementHistory()).toHaveLength(1);
+    expect(receiptCount()).toBe(1);
+  });
+
+  it("cannot mark result delivery without a committed receipt", () => {
+    expect(() =>
+      inventory.markHardwareTransactionResultDelivered(restockEvent.eventId),
+    ).toThrow(/No committed transaction/i);
+  });
+
   it("rejects a reused event ID with different transaction details", () => {
     createProduct();
     inventory.processHardwareTransaction({ event: restockEvent, quantity: 2 });
@@ -389,6 +416,10 @@ describe("InventoryService durable hardware idempotency", () => {
         event: restockEvent,
         quantity: 2,
       });
+      const delivered = inventory.markHardwareTransactionResultDelivered(
+        restockEvent.eventId,
+      );
+      expect(delivered).toEqual({ ...first, resultDeliveredToHardware: true });
       database.close();
       database = null;
 
@@ -399,10 +430,10 @@ describe("InventoryService durable hardware idempotency", () => {
         },
       });
 
-      expect(inventory.findHardwareTransactionReceipt(restockEvent.eventId)).toEqual(first);
+      expect(inventory.findHardwareTransactionReceipt(restockEvent.eventId)).toEqual(delivered);
       expect(
         inventory.processHardwareTransaction({ event: restockEvent, quantity: 2 }),
-      ).toEqual(first);
+      ).toEqual(delivered);
       expect(inventory.findProductByBarcode(restockEvent.barcode)?.currentStock).toBe(10);
       expect(inventory.listMovementHistory()).toHaveLength(1);
       expect(

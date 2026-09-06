@@ -19,8 +19,15 @@ type ProductLookup =
 const ACKNOWLEDGEMENT_ERROR =
   'Inventory was updated, but the ESP32 has not acknowledged this transaction. Retry acknowledgement only; do not submit it again.'
 
+const RESULT_DELIVERY_ERROR =
+  'Inventory was updated, but the transaction result has not reached the ESP32. Retry result delivery only; do not submit it again.'
+
 const RECEIPT_CHECK_ERROR =
   'Could not verify whether this transaction was already saved. Retry before continuing.'
+
+function pendingDeliveryMessage(receipt: HardwareTransactionReceipt): string {
+  return receipt.resultDeliveredToHardware ? ACKNOWLEDGEMENT_ERROR : RESULT_DELIVERY_ERROR
+}
 
 function receiptMatchesEvent(
   receipt: HardwareTransactionReceipt,
@@ -40,6 +47,7 @@ export function HardwareTransactionDialog({
   acknowledging,
   acknowledgementError,
   onReject,
+  onCancel,
   onReviewLater,
   onCommitted,
   onCompleted
@@ -49,6 +57,7 @@ export function HardwareTransactionDialog({
   acknowledging: boolean
   acknowledgementError: string | null
   onReject: () => void
+  onCancel: () => void
   onReviewLater: () => void
   onCommitted: (receipt: HardwareTransactionReceipt) => void
   onCompleted: (receipt: HardwareTransactionReceipt) => void
@@ -62,12 +71,13 @@ export function HardwareTransactionDialog({
   const [transactionError, setTransactionError] = useState<string | null>(null)
   const [receipt, setReceipt] = useState<HardwareTransactionReceipt | null>(null)
   const [processing, setProcessing] = useState(false)
+  const [retryingResultDelivery, setRetryingResultDelivery] = useState(false)
   const [retryingAcknowledgement, setRetryingAcknowledgement] = useState(false)
   const dialog = useRef<HTMLElement | null>(null)
   const requestVersion = useRef(0)
   const processingInFlight = useRef(false)
+  const resultDeliveryRetryInFlight = useRef(false)
   const acknowledgementRetryInFlight = useRef(false)
-  const committedNotification = useRef<string | null>(null)
   const lookupTail = useRef<Promise<IpcResult<ProductDto | null> | undefined>>(Promise.resolve(undefined))
 
   const queueLookup = useCallback((isCurrent: () => boolean) => {
@@ -81,10 +91,7 @@ export function HardwareTransactionDialog({
 
   const rememberCommittedReceipt = useCallback((committedReceipt: HardwareTransactionReceipt) => {
     setReceipt(committedReceipt)
-    if (committedNotification.current !== committedReceipt.eventId) {
-      committedNotification.current = committedReceipt.eventId
-      onCommitted(committedReceipt)
-    }
+    onCommitted(committedReceipt)
   }, [onCommitted])
 
   useEffect(() => {
@@ -98,8 +105,10 @@ export function HardwareTransactionDialog({
     setQuantityError(null)
     setTransactionError(null)
     setProcessing(false)
+    setRetryingResultDelivery(false)
     setRetryingAcknowledgement(false)
     processingInFlight.current = false
+    resultDeliveryRetryInFlight.current = false
     acknowledgementRetryInFlight.current = false
 
     void (async () => {
@@ -125,7 +134,7 @@ export function HardwareTransactionDialog({
           return
         }
         rememberCommittedReceipt(receiptResult.value)
-        setTransactionError(ACKNOWLEDGEMENT_ERROR)
+        setTransactionError(pendingDeliveryMessage(receiptResult.value))
         return
       }
 
@@ -172,7 +181,7 @@ export function HardwareTransactionDialog({
       }
 
       rememberCommittedReceipt(receiptResult.value)
-      setTransactionError(ACKNOWLEDGEMENT_ERROR)
+      setTransactionError(pendingDeliveryMessage(receiptResult.value))
     } catch {
       // An interrupted IPC response can happen after SQLite committed. Lock the
       // form until a durable-receipt check proves whether resubmission is safe.
@@ -182,13 +191,27 @@ export function HardwareTransactionDialog({
 
   useEffect(() => {
     if (!open) return
-    const busy = acknowledging || checkingReceipt || processing || retryingAcknowledgement
+    const busy =
+      acknowledging ||
+      checkingReceipt ||
+      processing ||
+      retryingResultDelivery ||
+      retryingAcknowledgement
     const target = !busy
-      ? dialog.current?.querySelector<HTMLElement>('[data-transaction-focus]')
+      ? dialog.current?.querySelector<HTMLElement>('[data-transaction-focus]:not(:disabled)')
       : null
     const focusTarget = target ?? dialog.current
     focusTarget?.focus()
-  }, [open, lookup.state, acknowledging, checkingReceipt, processing, retryingAcknowledgement, receipt])
+  }, [
+    open,
+    lookup.state,
+    acknowledging,
+    checkingReceipt,
+    processing,
+    retryingResultDelivery,
+    retryingAcknowledgement,
+    receipt
+  ])
 
   async function confirmTransaction(formEvent: FormEvent<HTMLFormElement>): Promise<void> {
     formEvent.preventDefault()
@@ -233,10 +256,10 @@ export function HardwareTransactionDialog({
       }
 
       rememberCommittedReceipt(result.value.receipt)
-      if (result.value.acknowledged) {
+      if (result.value.acknowledged && result.value.receipt.resultDeliveredToHardware) {
         onCompleted(result.value.receipt)
       } else {
-        setTransactionError(ACKNOWLEDGEMENT_ERROR)
+        setTransactionError(pendingDeliveryMessage(result.value.receipt))
       }
     } catch {
       await recoverAfterUncertainProcess(
@@ -248,8 +271,44 @@ export function HardwareTransactionDialog({
     }
   }
 
+  async function retryResultDelivery(): Promise<void> {
+    if (
+      receipt === null ||
+      receipt.resultDeliveredToHardware ||
+      resultDeliveryRetryInFlight.current
+    ) return
+
+    resultDeliveryRetryInFlight.current = true
+    setRetryingResultDelivery(true)
+    setTransactionError(null)
+
+    try {
+      const result = await window.desktopApi.hardware.retryTransactionResultDelivery(event.eventId)
+      if (!result.ok || !receiptMatchesEvent(result.value.receipt, event)) {
+        setTransactionError(RESULT_DELIVERY_ERROR)
+        return
+      }
+
+      rememberCommittedReceipt(result.value.receipt)
+      if (result.value.acknowledged && result.value.receipt.resultDeliveredToHardware) {
+        onCompleted(result.value.receipt)
+      } else {
+        setTransactionError(pendingDeliveryMessage(result.value.receipt))
+      }
+    } catch {
+      setTransactionError(RESULT_DELIVERY_ERROR)
+    } finally {
+      resultDeliveryRetryInFlight.current = false
+      setRetryingResultDelivery(false)
+    }
+  }
+
   async function retryAcknowledgement(): Promise<void> {
-    if (receipt === null || acknowledgementRetryInFlight.current) return
+    if (
+      receipt === null ||
+      !receipt.resultDeliveredToHardware ||
+      acknowledgementRetryInFlight.current
+    ) return
     acknowledgementRetryInFlight.current = true
     setRetryingAcknowledgement(true)
     setTransactionError(null)
@@ -262,8 +321,11 @@ export function HardwareTransactionDialog({
       }
 
       rememberCommittedReceipt(result.value.receipt)
-      if (result.value.acknowledged) onCompleted(result.value.receipt)
-      else setTransactionError(ACKNOWLEDGEMENT_ERROR)
+      if (result.value.acknowledged && result.value.receipt.resultDeliveredToHardware) {
+        onCompleted(result.value.receipt)
+      } else {
+        setTransactionError(pendingDeliveryMessage(result.value.receipt))
+      }
     } catch {
       setTransactionError(ACKNOWLEDGEMENT_ERROR)
     } finally {
@@ -274,7 +336,12 @@ export function HardwareTransactionDialog({
 
   if (!open) return null
 
-  const busy = acknowledging || checkingReceipt || processing || retryingAcknowledgement
+  const busy =
+    acknowledging ||
+    checkingReceipt ||
+    processing ||
+    retryingResultDelivery ||
+    retryingAcknowledgement
 
   return (
     <div className="dialog-backdrop hardware-event-backdrop">
@@ -314,7 +381,9 @@ export function HardwareTransactionDialog({
         <p id="hardware-event-description" className="hardware-event-dialog__intro">
           {receipt === null
             ? 'Review the scanned item and confirm a quantity to update inventory.'
-            : 'This inventory transaction is saved. Only ESP32 acknowledgement remains.'}
+            : receipt.resultDeliveredToHardware
+              ? 'This inventory transaction is saved. Only ESP32 acknowledgement remains.'
+              : 'This inventory transaction is saved. ESP32 stock feedback is still pending.'}
         </p>
         <dl className="hardware-event-details">
           <div><dt>Barcode</dt><dd>{event.barcode}</dd></div>
@@ -365,7 +434,7 @@ export function HardwareTransactionDialog({
                 inputMode="numeric"
                 data-transaction-focus
                 value={quantity}
-                disabled={processing}
+                disabled={busy || (event.mode === 'checkout' && lookup.product.currentStock === 0)}
                 aria-invalid={quantityError !== null}
                 aria-describedby={quantityError === null ? 'hardware-quantity-help' : 'hardware-quantity-error'}
                 onChange={(changeEvent) => {
@@ -380,13 +449,28 @@ export function HardwareTransactionDialog({
             {transactionError !== null && (
               <div className="form-alert form-alert--error" role="alert">{transactionError}</div>
             )}
-            <div className="dialog__actions hardware-event-dialog__actions">
-              <button type="button" className="secondary-button" onClick={onReviewLater} disabled={processing}>Review later</button>
-              <button className="primary-button primary-button--inline" type="submit" disabled={processing}>
-                {processing
-                  ? 'Processing…'
-                  : event.mode === 'restock' ? 'Confirm Restock' : 'Confirm Checkout'}
+            <div className="dialog__actions dialog__actions--spread hardware-event-dialog__actions">
+              <button
+                type="button"
+                className="secondary-button secondary-button--danger"
+                data-transaction-focus
+                onClick={onCancel}
+                disabled={busy}
+              >
+                {acknowledging ? 'Cancelling…' : 'Cancel scan'}
               </button>
+              <div>
+                <button type="button" className="secondary-button" onClick={onReviewLater} disabled={busy}>Review later</button>
+                <button
+                  className="primary-button primary-button--inline"
+                  type="submit"
+                  disabled={busy || (event.mode === 'checkout' && lookup.product.currentStock === 0)}
+                >
+                  {processing
+                    ? 'Processing…'
+                    : event.mode === 'restock' ? 'Confirm Restock' : 'Confirm Checkout'}
+                </button>
+              </div>
             </div>
           </form>
         )}
@@ -413,10 +497,17 @@ export function HardwareTransactionDialog({
                 type="button"
                 className="primary-button primary-button--inline"
                 data-transaction-focus
-                onClick={() => void retryAcknowledgement()}
+                onClick={() => {
+                  if (receipt.resultDeliveredToHardware) void retryAcknowledgement()
+                  else void retryResultDelivery()
+                }}
                 disabled={busy}
               >
-                {retryingAcknowledgement ? 'Retrying…' : 'Retry acknowledgement'}
+                {retryingResultDelivery || retryingAcknowledgement
+                  ? 'Retrying…'
+                  : receipt.resultDeliveredToHardware
+                    ? 'Retry acknowledgement'
+                    : 'Retry result delivery'}
               </button>
             </div>
           </div>

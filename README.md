@@ -1,6 +1,6 @@
 # Dental Inventory System
 
-Phase 5 Step 2 implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+Phase 5 Step 3 implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
 
 This repository currently provides:
 
@@ -10,20 +10,21 @@ This repository currently provides:
 - search, fixed-category filtering, derived stock status, safe editing, and soft deletion;
 - SQLite migrations and one preconfigured-administrator credential slot;
 - shared, versioned TypeScript protocol types and JSON Schema validation;
-- a local-network ESP32 `HardwareGateway` with status, FIFO scan delivery, and acknowledgement;
-- atomic online RESTOCK/CHECKOUT persistence with durable event idempotency; and
+- a local-network ESP32 `HardwareGateway` with status, FIFO scan delivery, result feedback, and acknowledgement;
+- atomic online RESTOCK/CHECKOUT persistence with durable event and delivery-state idempotency; and
 - the verified ESP32 PlatformIO hardware integration from Phases 3 and 4.
 
-ESP32 result feedback, database-driven stock LEDs/LCD messages, offline operation,
-and synchronization remain outside this step. Manual barcode entry remains
-available for item registration; physical scans use the hardware event path.
+Committed online results now drive the kiosk LCD plus SUCCESS and stock-status
+indicators before the ESP32 event is acknowledged. Offline operation and
+synchronization remain outside this step. Manual barcode entry remains available
+for item registration; physical scans use the hardware event path.
 
 ## Repository layout
 
 ```text
 apps/desktop/       Electron main/preload processes and React renderer
 packages/protocol/  Shared protocol types, JSON Schema, and validator
-firmware/           ESP32 PlatformIO project (hardware disabled)
+firmware/           ESP32 PlatformIO firmware and host-native protocol tests
 docs/               Hardware validation gate and unresolved questions
 ```
 
@@ -121,11 +122,14 @@ React communicates only through narrow authentication, inventory, and hardware-s
 
 ### Local ESP32 status connection
 
-Phase 5 Step 2 completes the online desktop transaction: an exact barcode match
-and confirmed quantity are applied to stock and movement history in one SQLite
-transaction, then—and only then—the ESP32 event is acknowledged. A durable event
-receipt makes retries safe after an acknowledgement failure or desktop restart.
-See [the atomic transaction guide](docs/phase5-step2-atomic-transactions.md).
+Phase 5 Step 3 completes online result feedback: after the existing atomic SQLite
+commit, Electron sends the committed quantity, stock, and status to the matching
+ESP32 event. The kiosk accepts identical retries safely, updates its LCD and LED
+logic, and only then is the event acknowledged. Migration 4 durably distinguishes
+result-delivery retry from acknowledgement-only recovery after a desktop restart.
+See [the online result-feedback guide](docs/phase5-step3-online-feedback.md).
+The [Step 2 atomic transaction guide](docs/phase5-step2-atomic-transactions.md)
+documents the underlying stock, history, and event-receipt transaction.
 The earlier [Step 1 guide](docs/phase5-step1-quantity-workflow.md) remains useful
 background for lookup, validation, deferred review, and unknown-scan behavior.
 
@@ -180,6 +184,10 @@ Migration 2 adds soft deletion to `products` and safely rebuilds `transactions` 
 Migration 3 adds `processed_hardware_events`, a minimal durable link from an
 ESP32 `eventId` to its committed movement and resulting status. This is the
 database-level idempotency guard for online hardware transactions.
+
+Migration 4 adds the nullable `result_delivered_at` boundary to that receipt.
+It is set only after the ESP32 accepts the committed result, allowing a restart
+to retry result delivery when null and perform acknowledgement only when set.
 
 ## Desktop checks and production bundle
 

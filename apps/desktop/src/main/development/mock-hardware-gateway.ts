@@ -1,4 +1,5 @@
 import type { HardwareTransactionEvent } from '../../shared/ipc-contract'
+import type { HardwareTransactionResult } from '../../shared/ipc-contract'
 import type {
   CacheProduct,
   HardwareBarcodeEvent,
@@ -80,6 +81,10 @@ export class MockHardwareGateway implements HardwareGateway {
       throw new Error('No matching development mock event.')
     }
     this.transactionEvents.shift()
+  }
+
+  async deliverTransactionResult(_result: HardwareTransactionResult): Promise<void> {
+    this.assertConnected()
   }
 
   setTransactionEventsForTest(events: readonly HardwareTransactionEvent[]): void {

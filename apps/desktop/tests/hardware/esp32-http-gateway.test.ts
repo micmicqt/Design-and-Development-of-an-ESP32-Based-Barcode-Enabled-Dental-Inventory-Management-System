@@ -23,6 +23,15 @@ const transactionEvent = {
   timestamp: '2026-09-04 12:34:56'
 } as const
 
+const transactionResult = {
+  eventId: transactionEvent.eventId,
+  result: 'success',
+  mode: 'restock',
+  quantity: 2,
+  resultingStock: 22,
+  stockStatus: 'HIGH'
+} as const
+
 describe('ESP32 HTTP hardware gateway', () => {
   afterEach(() => vi.useRealTimers())
 
@@ -205,6 +214,69 @@ describe('ESP32 HTTP hardware gateway', () => {
     const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
 
     await expect(gateway.getNextTransactionEvent()).resolves.toEqual(expected)
+  })
+
+  it('posts the complete committed result and accepts an explicit matching response', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+      jsonResponse({ accepted: true, eventId: transactionEvent.eventId })
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.deliverTransactionResult(transactionResult)).resolves.toBeUndefined()
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith(
+      'http://192.0.2.10/events/result',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(transactionResult)
+      })
+    )
+  })
+
+  it.each([
+    { ...transactionResult, eventId: 'invalid/id' },
+    { ...transactionResult, result: 'failed' },
+    { ...transactionResult, mode: 'RESTOCK' },
+    { ...transactionResult, quantity: 0 },
+    { ...transactionResult, quantity: 1.5 },
+    { ...transactionResult, quantity: 10_001 },
+    { ...transactionResult, resultingStock: -1 },
+    { ...transactionResult, resultingStock: 1.5 },
+    { ...transactionResult, stockStatus: 'UNKNOWN' }
+  ])('rejects an invalid outgoing transaction result before HTTP %#', async (result) => {
+    const fetcher = vi.fn<HardwareFetch>()
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(
+      gateway.deliverTransactionResult(result as typeof transactionResult)
+    ).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    null,
+    {},
+    { accepted: false, eventId: transactionEvent.eventId },
+    { accepted: 'true', eventId: transactionEvent.eventId },
+    { accepted: true, eventId: 'different-event' },
+    { accepted: true },
+    { accepted: true, eventId: transactionEvent.eventId, duplicate: false }
+  ])('rejects an invalid result-acceptance body %#', async (payload) => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(payload))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.deliverTransactionResult(transactionResult)).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE'
+    })
+  })
+
+  it.each([400, 404, 409])('reports HTTP %s result refusal as REJECTED', async (status) => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse({}, status))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.deliverTransactionResult(transactionResult)).rejects.toMatchObject({
+      code: 'REJECTED'
+    })
   })
 
   it('posts exactly the event ID and accepts the explicit matching ACK', async () => {
