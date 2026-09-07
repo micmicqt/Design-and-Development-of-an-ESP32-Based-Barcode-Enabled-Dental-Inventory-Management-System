@@ -30,6 +30,7 @@ export const IPC_CHANNELS = {
   productsSelectDroppedImage: 'products:select-dropped-image',
   movementHistoryList: 'movement-history:list',
   hardwareGetStatus: 'hardware:get-status',
+  hardwareSendDesktopHeartbeat: 'hardware:send-desktop-heartbeat',
   hardwareGetNextTransactionEvent: 'hardware:get-next-transaction-event',
   hardwareAcknowledgeTransactionEvent: 'hardware:acknowledge-transaction-event',
   hardwareGetTransactionReceipt: 'hardware:get-transaction-receipt',
@@ -219,6 +220,8 @@ export interface DesktopApi {
   }
   hardware: {
     getStatus: () => Promise<HardwareStatusDto>
+    /** Refreshes the ESP32 desktop-presence lease through a fixed backend route. */
+    sendDesktopHeartbeat: () => Promise<boolean>
     getNextTransactionEvent: () => Promise<HardwareTransactionEvent | null>
     acknowledgeTransactionEvent: (
       eventId: string

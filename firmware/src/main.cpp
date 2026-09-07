@@ -11,6 +11,7 @@
 #include <bootloader_random.h>
 #include <esp_system.h>
 
+#include "desktop_presence_lease.h"
 #include "hardware_config.h"
 #include "protocol_config.h"
 #include "secrets.h"
@@ -35,6 +36,7 @@ constexpr uint16_t kHttpServerPort = 80U;
 constexpr uint32_t kWiFiConnectionTimeoutMs = 15000UL;
 constexpr uint32_t kWiFiRetryBackoffMs = 30000UL;
 constexpr uint32_t kWiFiProgressIntervalMs = 2000UL;
+constexpr uint32_t kDesktopPresenceLeaseMs = 12000UL;
 constexpr uint8_t kDs3231StatusRegister = 0x0FU;
 constexpr uint8_t kDs3231OscillatorStopFlag = 0x80U;
 constexpr uint8_t kRtcStatusReadAttempts = 3U;
@@ -155,6 +157,8 @@ WiFiConnectionState wiFiConnectionState = WiFiConnectionState::kDisabled;
 uint32_t wiFiStateStartedMs = 0UL;
 uint32_t lastWiFiProgressMs = 0UL;
 bool httpServerRunning = false;
+dental::presence::DesktopPresenceLease desktopPresence(
+    kDesktopPresenceLeaseMs);
 
 dental::events::PendingEventQueue pendingEvents;
 uint64_t nextEventSequence = 1ULL;
@@ -294,7 +298,7 @@ void handleHealthRequest() {
 
 void handleStatusRequest() {
   String response;
-  response.reserve(128U);
+  response.reserve(160U);
   response =
       "{\"device\":\"dental-inventory-esp32\",\"online\":true,\"mode\":\"";
   response += currentHttpMode();
@@ -302,9 +306,16 @@ void handleStatusRequest() {
   response += rtcAvailable ? "true" : "false";
   response += ",\"sd\":";
   response += microSdAvailable ? "true" : "false";
+  response += ",\"desktopOnline\":";
+  response += desktopPresence.desktopAvailable() ? "true" : "false";
   response += '}';
 
   httpServer.send(200, "application/json", response);
+}
+
+void handleDesktopHeartbeatRequest() {
+  desktopPresence.recordHeartbeat(millis());
+  httpServer.send(200, "application/json", "{\"desktopOnline\":true}");
 }
 
 void handleNextEventRequest() {
@@ -422,6 +433,8 @@ void handleEventAcknowledgementRequest() {
 void configureHttpRoutes() {
   httpServer.on("/health", HTTP_GET, handleHealthRequest);
   httpServer.on("/status", HTTP_GET, handleStatusRequest);
+  httpServer.on("/desktop/heartbeat", HTTP_POST,
+                handleDesktopHeartbeatRequest);
   httpServer.on("/events/next", HTTP_GET, handleNextEventRequest);
   httpServer.on("/events/ack", HTTP_POST,
                 handleEventAcknowledgementRequest);
@@ -471,10 +484,15 @@ void initializeWiFi() {
 
 void serviceWiFi(uint32_t nowMs) {
   if (wiFiConnectionState == WiFiConnectionState::kDisabled) {
+    desktopPresence.setNetworkConnected(false);
     return;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
+  const bool wiFiConnected = WiFi.status() == WL_CONNECTED;
+  desktopPresence.setNetworkConnected(wiFiConnected);
+  desktopPresence.service(nowMs);
+
+  if (wiFiConnected) {
     if (wiFiConnectionState != WiFiConnectionState::kConnected) {
       handleWiFiConnected();
     }

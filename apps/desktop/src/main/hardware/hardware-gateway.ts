@@ -25,12 +25,15 @@ export interface Esp32StatusResponse {
   mode: Esp32HardwareMode
   rtc: boolean
   sd: boolean
+  /** Optional for compatibility with Phase 5 firmware. */
+  desktopOnline?: boolean
 }
 
 /** Narrow status boundary implemented during Phase 4 Step 2. */
 export interface HardwareStatusGateway {
   healthCheck(): Promise<Esp32HealthResponse>
   getStatus(): Promise<Esp32StatusResponse>
+  sendDesktopHeartbeat(): Promise<void>
 }
 
 /** Polling/acknowledgement boundary for Phase 4 hardware scan delivery. */

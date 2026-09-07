@@ -24,6 +24,7 @@ const TRANSACTION_MODES: readonly HardwareTransactionMode[] = ['restock', 'check
 const TRANSACTION_EVENT_KEYS = ['barcode', 'eventId', 'mode', 'timestamp'] as const
 const ACKNOWLEDGEMENT_KEYS = ['acknowledged', 'eventId'] as const
 const RESULT_ACCEPTANCE_KEYS = ['accepted', 'eventId'] as const
+const DESKTOP_HEARTBEAT_KEYS = ['desktopOnline'] as const
 const STOCK_STATUSES: readonly StockStatus[] = ['HIGH', 'LOW', 'EMPTY']
 const NO_CONTENT = Symbol('HTTP 204')
 
@@ -172,17 +173,36 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
     typeof value.mode !== 'string' ||
     !HARDWARE_MODES.includes(value.mode as Esp32HardwareMode) ||
     typeof value.rtc !== 'boolean' ||
-    typeof value.sd !== 'boolean'
+    typeof value.sd !== 'boolean' ||
+    (value.desktopOnline !== undefined && typeof value.desktopOnline !== 'boolean')
   ) {
     throw new HardwareGatewayError('INVALID_RESPONSE', 'The ESP32 status response is invalid.')
   }
 
-  return {
+  const status: Esp32StatusResponse = {
     device: ESP32_DEVICE_ID,
     online: value.online,
     mode: value.mode as Esp32HardwareMode,
     rtc: value.rtc,
     sd: value.sd
+  }
+
+  if (typeof value.desktopOnline === 'boolean') {
+    status.desktopOnline = value.desktopOnline
+  }
+  return status
+}
+
+function validateDesktopHeartbeatResponse(value: unknown): void {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, DESKTOP_HEARTBEAT_KEYS) ||
+    value.desktopOnline !== true
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The ESP32 desktop heartbeat response is invalid.'
+    )
   }
 }
 
@@ -278,6 +298,12 @@ export class Esp32HttpGateway implements HardwareTransactionEventGateway {
     return validateStatusResponse(await this.request('/status'))
   }
 
+  async sendDesktopHeartbeat(): Promise<void> {
+    validateDesktopHeartbeatResponse(
+      await this.request('/desktop/heartbeat', { method: 'POST' })
+    )
+  }
+
   async getNextTransactionEvent(): Promise<HardwareTransactionEvent | null> {
     const response = await this.request('/events/next', { allowNoContent: true })
     return response === NO_CONTENT ? null : validateTransactionEvent(response)
@@ -308,7 +334,13 @@ export class Esp32HttpGateway implements HardwareTransactionEventGateway {
   }
 
   private async request(
-    path: '/health' | '/status' | '/events/next' | '/events/result' | '/events/ack',
+    path:
+      | '/health'
+      | '/status'
+      | '/desktop/heartbeat'
+      | '/events/next'
+      | '/events/result'
+      | '/events/ack',
     options: {
       method?: 'GET' | 'POST'
       body?: string

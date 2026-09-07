@@ -26,6 +26,7 @@ type NavigationItem = (typeof NAVIGATION_ITEMS)[number]
 
 const EMPTY_SESSION: AuthSession = { authenticated: false, username: null }
 const HARDWARE_POLL_INTERVAL_MS = 4_000
+const DESKTOP_HEARTBEAT_INTERVAL_MS = 4_000
 const HARDWARE_EVENT_POLL_INTERVAL_MS = 1_000
 const OFFLINE_HARDWARE_STATUS: HardwareStatusDto = {
   connection: 'OFFLINE',
@@ -226,6 +227,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     useState<HardwareTransactionReceipt | null>(null)
   const [hardwareTransactionNotice, setHardwareTransactionNotice] = useState<string | null>(null)
   const hardwareEventRequest = useRef<Promise<HardwareTransactionEvent | null> | null>(null)
+  const desktopHeartbeatRequest = useRef<Promise<boolean> | null>(null)
   const hardwareAcknowledgementInFlight = useRef(false)
   const lastCommittedHardwareEvent = useRef<string | null>(null)
   const hardwareEventPreviousFocus = useRef<HTMLElement | null>(null)
@@ -258,6 +260,45 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     const timeout = window.setTimeout(() => setHardwareTransactionNotice(null), 8_000)
     return () => window.clearTimeout(timeout)
   }, [hardwareTransactionNotice])
+
+  useEffect(() => {
+    if (loggingOut) return undefined
+
+    let active = true
+    let heartbeatTimer: number | undefined
+
+    async function sendDesktopHeartbeat(): Promise<void> {
+      const heartbeatStartedAt = Date.now()
+      try {
+        // Reuse an outstanding request during StrictMode effect replay and
+        // never schedule the next lease refresh until this one has settled.
+        desktopHeartbeatRequest.current ??=
+          window.desktopApi.hardware.sendDesktopHeartbeat()
+        await desktopHeartbeatRequest.current
+      } catch {
+        // Presence recovery is automatic on the next interval. Inventory and
+        // the authenticated shell stay usable while hardware is unavailable.
+      } finally {
+        desktopHeartbeatRequest.current = null
+        if (active) {
+          const elapsedMs = Date.now() - heartbeatStartedAt
+          const nextHeartbeatDelayMs = Math.max(
+            0,
+            DESKTOP_HEARTBEAT_INTERVAL_MS - elapsedMs
+          )
+          heartbeatTimer = window.setTimeout(() => {
+            void sendDesktopHeartbeat()
+          }, nextHeartbeatDelayMs)
+        }
+      }
+    }
+
+    void sendDesktopHeartbeat()
+    return () => {
+      active = false
+      if (heartbeatTimer !== undefined) window.clearTimeout(heartbeatTimer)
+    }
+  }, [loggingOut])
 
   useEffect(() => {
     let active = true

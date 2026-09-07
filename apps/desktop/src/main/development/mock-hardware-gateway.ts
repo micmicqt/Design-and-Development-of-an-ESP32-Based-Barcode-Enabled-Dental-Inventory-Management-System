@@ -69,6 +69,10 @@ export class MockHardwareGateway implements HardwareGateway {
     }
   }
 
+  async sendDesktopHeartbeat(): Promise<void> {
+    this.assertConnected()
+  }
+
   async getNextTransactionEvent(): Promise<HardwareTransactionEvent | null> {
     this.assertConnected()
     const event = this.transactionEvents[0]

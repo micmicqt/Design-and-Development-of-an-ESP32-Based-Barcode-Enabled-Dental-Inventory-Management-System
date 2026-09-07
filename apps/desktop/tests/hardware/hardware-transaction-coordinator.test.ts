@@ -51,6 +51,7 @@ function createGateway(): HardwareTransactionEventGateway {
   return {
     healthCheck: vi.fn(),
     getStatus: vi.fn(),
+    sendDesktopHeartbeat: vi.fn().mockResolvedValue(undefined),
     getNextTransactionEvent: vi.fn().mockResolvedValue(event),
     deliverTransactionResult: vi.fn().mockResolvedValue(undefined),
     acknowledgeTransactionEvent: vi.fn().mockResolvedValue(undefined)

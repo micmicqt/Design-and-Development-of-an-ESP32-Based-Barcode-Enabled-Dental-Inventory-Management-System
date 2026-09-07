@@ -1,3 +1,4 @@
+#include "desktop_presence_lease.h"
 #include "transaction_event_queue.h"
 
 #include <assert.h>
@@ -5,6 +6,7 @@
 #include <string>
 
 using namespace dental::events;
+using dental::presence::DesktopPresenceLease;
 
 namespace {
 
@@ -385,6 +387,82 @@ void jsonSerializationEscapesText() {
   assert(json == "\"00\\\"\\\\\\b\\f\\n\\r\\t\\u0001\"");
 }
 
+void heartbeatSetsDesktopAvailable() {
+  DesktopPresenceLease lease(12000U);
+  assert(!lease.desktopAvailable());
+  lease.setNetworkConnected(true);
+  lease.recordHeartbeat(1000U);
+  assert(lease.desktopAvailable());
+}
+
+void repeatedHeartbeatRefreshesLease() {
+  DesktopPresenceLease lease(12000U);
+  lease.setNetworkConnected(true);
+  lease.recordHeartbeat(1000U);
+  lease.service(10000U);
+  assert(lease.desktopAvailable());
+  lease.recordHeartbeat(10000U);
+  lease.service(21999U);
+  assert(lease.desktopAvailable());
+}
+
+void leaseExpiryMakesDesktopUnavailable() {
+  DesktopPresenceLease lease(12000U);
+  lease.setNetworkConnected(true);
+  lease.recordHeartbeat(1000U);
+  lease.service(12999U);
+  assert(lease.desktopAvailable());
+  lease.service(13000U);
+  assert(!lease.desktopAvailable());
+}
+
+void networkLossClearsDesktopAvailabilityImmediately() {
+  DesktopPresenceLease lease(12000U);
+  lease.setNetworkConnected(true);
+  lease.recordHeartbeat(1000U);
+  assert(lease.desktopAvailable());
+  lease.setNetworkConnected(false);
+  assert(!lease.desktopAvailable());
+}
+
+void heartbeatAfterReconnectRestoresAvailability() {
+  DesktopPresenceLease lease(12000U);
+  lease.setNetworkConnected(true);
+  lease.recordHeartbeat(1000U);
+  lease.setNetworkConnected(false);
+  lease.setNetworkConnected(true);
+  assert(!lease.desktopAvailable());
+  lease.recordHeartbeat(2000U);
+  assert(lease.desktopAvailable());
+}
+
+void leaseExpiryIsMillisWrapSafe() {
+  DesktopPresenceLease lease(12000U);
+  lease.setNetworkConnected(true);
+  const uint32_t heartbeatMs = UINT32_MAX - 5000U;
+  lease.recordHeartbeat(heartbeatMs);
+  lease.service(heartbeatMs + 11999U);
+  assert(lease.desktopAvailable());
+  lease.service(heartbeatMs + 12000U);
+  assert(!lease.desktopAvailable());
+}
+
+void heartbeatDoesNotChangePendingEventFifo() {
+  PendingEventQueue queue;
+  const PendingTransactionEvent first = makeEvent(1U);
+  assert(queue.enqueue(first));
+  assert(queue.enqueue(makeEvent(2U)));
+
+  DesktopPresenceLease lease(12000U);
+  lease.setNetworkConnected(true);
+  lease.recordHeartbeat(1000U);
+  lease.service(5000U);
+
+  assert(queue.size() == 2U);
+  assert(strcmp(queue.oldest()->eventId, first.eventId) == 0);
+  assert(queue.oldestAppliedResult() == nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -411,6 +489,13 @@ int main() {
   resultRetryAfterAckUsesReceiptWithoutTouchingNextHead();
   resultReceiptsAreBoundedAndUnknownAckCreatesNone();
   jsonSerializationEscapesText();
-  puts("Firmware event queue/protocol: 23 host test scenarios PASSED");
+  heartbeatSetsDesktopAvailable();
+  repeatedHeartbeatRefreshesLease();
+  leaseExpiryMakesDesktopUnavailable();
+  networkLossClearsDesktopAvailabilityImmediately();
+  heartbeatAfterReconnectRestoresAvailability();
+  leaseExpiryIsMillisWrapSafe();
+  heartbeatDoesNotChangePendingEventFifo();
+  puts("Firmware event queue/protocol/presence: 30 host test scenarios PASSED");
   return 0;
 }

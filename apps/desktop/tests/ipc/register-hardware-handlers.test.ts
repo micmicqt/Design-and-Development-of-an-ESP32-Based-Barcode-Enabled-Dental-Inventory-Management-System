@@ -91,6 +91,7 @@ describe('authenticated hardware IPC boundary', () => {
     })
     const handler = electronMock.handlers.get(IPC_CHANNELS.hardwareGetStatus)
     if (handler === undefined) throw new Error('Hardware status handler was not registered.')
+    const heartbeat = electronMock.handlers.get(IPC_CHANNELS.hardwareSendDesktopHeartbeat)
     const next = electronMock.handlers.get(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     const acknowledge = electronMock.handlers.get(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     const getReceipt = electronMock.handlers.get(IPC_CHANNELS.hardwareGetTransactionReceipt)
@@ -98,6 +99,7 @@ describe('authenticated hardware IPC boundary', () => {
     const retryAck = electronMock.handlers.get(IPC_CHANNELS.hardwareRetryTransactionAcknowledgement)
     const retryResult = electronMock.handlers.get(IPC_CHANNELS.hardwareRetryTransactionResultDelivery)
     if (
+      heartbeat === undefined ||
       next === undefined ||
       acknowledge === undefined ||
       getReceipt === undefined ||
@@ -111,6 +113,7 @@ describe('authenticated hardware IPC boundary', () => {
       authSession,
       trustedEvent,
       handler,
+      heartbeat,
       next,
       acknowledge,
       getReceipt,
@@ -138,6 +141,7 @@ describe('authenticated hardware IPC boundary', () => {
         rtc: true,
         sd: true
       }),
+      sendDesktopHeartbeat: vi.fn().mockResolvedValue(undefined),
       getNextTransactionEvent: vi.fn().mockResolvedValue(hardwareEvent),
       deliverTransactionResult: vi.fn().mockResolvedValue(undefined),
       acknowledgeTransactionEvent: vi.fn().mockResolvedValue(undefined)
@@ -221,6 +225,50 @@ describe('authenticated hardware IPC boundary', () => {
     await expect(handler(untrustedEvent)).resolves.toMatchObject({ connection: 'OFFLINE' })
     expect(gateway.getStatus).not.toHaveBeenCalled()
     dispose()
+  })
+
+  it('renews desktop presence only for the authenticated trusted renderer', async () => {
+    const gateway = createGateway()
+    const { authSession, trustedEvent, heartbeat, dispose } = setup(gateway)
+    authSession.signIn('admin')
+
+    await expect(heartbeat(trustedEvent)).resolves.toBe(true)
+    expect(gateway.sendDesktopHeartbeat).toHaveBeenCalledExactlyOnceWith()
+    dispose()
+  })
+
+  it('does not renew desktop presence while signed out or from an untrusted frame', async () => {
+    const gateway = createGateway()
+    const { authSession, trustedEvent, heartbeat, dispose } = setup(gateway)
+
+    await expect(heartbeat(trustedEvent)).resolves.toBe(false)
+    authSession.signIn('admin')
+    const untrustedEvent = {
+      sender: { isDestroyed: () => false, mainFrame: {} },
+      senderFrame: {}
+    } as unknown as IpcMainInvokeEvent
+    await expect(heartbeat(untrustedEvent)).resolves.toBe(false)
+    expect(gateway.sendDesktopHeartbeat).not.toHaveBeenCalled()
+    dispose()
+  })
+
+  it('keeps a failed or unconfigured heartbeat harmless and recoverable', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.sendDesktopHeartbeat)
+      .mockRejectedValueOnce(new Error('private transport detail'))
+      .mockResolvedValueOnce(undefined)
+    const { authSession, trustedEvent, heartbeat, dispose } = setup(gateway)
+    authSession.signIn('admin')
+
+    await expect(heartbeat(trustedEvent)).resolves.toBe(false)
+    await expect(heartbeat(trustedEvent)).resolves.toBe(true)
+    expect(gateway.sendDesktopHeartbeat).toHaveBeenCalledTimes(2)
+    dispose()
+
+    const unconfigured = setup(null)
+    unconfigured.authSession.signIn('admin')
+    await expect(unconfigured.heartbeat(unconfigured.trustedEvent)).resolves.toBe(false)
+    unconfigured.dispose()
   })
 
   it('delivers a scan without implicitly acknowledging it', async () => {
@@ -812,6 +860,9 @@ describe('authenticated hardware IPC boundary', () => {
     const { dispose } = setup()
     dispose()
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetStatus)
+    expect(electronMock.removeHandler).toHaveBeenCalledWith(
+      IPC_CHANNELS.hardwareSendDesktopHeartbeat
+    )
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetTransactionReceipt)

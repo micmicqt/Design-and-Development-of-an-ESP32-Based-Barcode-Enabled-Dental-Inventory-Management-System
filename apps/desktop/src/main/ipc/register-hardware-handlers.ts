@@ -140,6 +140,24 @@ export function registerHardwareIpcHandlers(
   )
 
   ipcMain.handle(
+    IPC_CHANNELS.hardwareSendDesktopHeartbeat,
+    async (event): Promise<boolean> => {
+      if (!isAuthorized(event, authSession, getMainWindow) || gateway === null) {
+        return false
+      }
+
+      try {
+        await gateway.sendDesktopHeartbeat()
+        return true
+      } catch {
+        // Presence is a renewable lease. A later heartbeat will recover
+        // automatically, while this failure remains harmless to inventory work.
+        return false
+      }
+    }
+  )
+
+  ipcMain.handle(
     IPC_CHANNELS.hardwareGetNextTransactionEvent,
     async (event): Promise<HardwareTransactionEvent | null> => {
       if (
@@ -332,6 +350,7 @@ export function registerHardwareIpcHandlers(
 
   return () => {
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetStatus)
+    ipcMain.removeHandler(IPC_CHANNELS.hardwareSendDesktopHeartbeat)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetTransactionReceipt)

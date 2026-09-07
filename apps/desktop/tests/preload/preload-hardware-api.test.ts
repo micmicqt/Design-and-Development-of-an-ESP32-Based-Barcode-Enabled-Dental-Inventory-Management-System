@@ -44,6 +44,24 @@ describe('preload hardware API', () => {
     expect(electronMock.invoke).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetStatus)
   })
 
+  it('exposes a parameter-free desktop heartbeat on one fixed IPC channel', async () => {
+    electronMock.invoke.mockResolvedValueOnce(true)
+
+    await expect(api.hardware.sendDesktopHeartbeat()).resolves.toBe(true)
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareSendDesktopHeartbeat
+    )
+
+    electronMock.invoke.mockClear()
+    const callWithUnexpectedArgument = api.hardware.sendDesktopHeartbeat as (
+      unexpected: unknown
+    ) => Promise<boolean>
+    await callWithUnexpectedArgument('http://untrusted.example/desktop/heartbeat')
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareSendDesktopHeartbeat
+    )
+  })
+
   it('exposes a parameter-free next-event invocation and preserves barcode text', async () => {
     const event = {
       eventId: 'device-session-1',
@@ -146,7 +164,8 @@ describe('preload hardware API', () => {
       'getTransactionReceipt',
       'processTransaction',
       'retryTransactionAcknowledgement',
-      'retryTransactionResultDelivery'
+      'retryTransactionResultDelivery',
+      'sendDesktopHeartbeat'
     ])
     expect(api.hardware).not.toHaveProperty('baseUrl')
     expect(api.hardware).not.toHaveProperty('fetch')

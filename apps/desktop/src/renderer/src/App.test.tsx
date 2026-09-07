@@ -88,6 +88,7 @@ function createDesktopApi({
       ...inventory
     },
     hardware: {
+      sendDesktopHeartbeat: vi.fn().mockResolvedValue(true),
       getStatus: vi.fn().mockResolvedValue({
         connection: 'OFFLINE',
         device: null,
@@ -117,6 +118,118 @@ function createDesktopApi({
     }
   }
 }
+
+describe('Phase 6 Step 1 desktop presence heartbeat', () => {
+  async function settle(): Promise<void> {
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+  }
+
+  async function advance(milliseconds: number): Promise<void> {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(milliseconds)
+    })
+  }
+
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('sends immediately and approximately every four seconds while the authenticated shell is active', async () => {
+    const sendDesktopHeartbeat = vi.fn().mockResolvedValue(true)
+    installDesktopApi(createDesktopApi({ hardware: { sendDesktopHeartbeat } }))
+    const view = render(<App />)
+
+    await settle()
+    expect(sendDesktopHeartbeat).toHaveBeenCalledOnce()
+
+    await advance(3_999)
+    expect(sendDesktopHeartbeat).toHaveBeenCalledOnce()
+    await advance(1)
+    expect(sendDesktopHeartbeat).toHaveBeenCalledTimes(2)
+
+    await advance(4_000)
+    expect(sendDesktopHeartbeat).toHaveBeenCalledTimes(3)
+    view.unmount()
+  })
+
+  it('shares one in-flight heartbeat during StrictMode replay and never overlaps a slow request', async () => {
+    let completeFirstHeartbeat!: (value: boolean) => void
+    const firstHeartbeat = new Promise<boolean>((resolve) => {
+      completeFirstHeartbeat = resolve
+    })
+    const sendDesktopHeartbeat = vi.fn().mockReturnValue(firstHeartbeat)
+    installDesktopApi(createDesktopApi({ hardware: { sendDesktopHeartbeat } }))
+    const view = render(<StrictMode><App /></StrictMode>)
+
+    await settle()
+    await advance(12_000)
+    expect(sendDesktopHeartbeat).toHaveBeenCalledOnce()
+
+    await act(async () => completeFirstHeartbeat(true))
+    await advance(0)
+    expect(sendDesktopHeartbeat).toHaveBeenCalledTimes(2)
+    view.unmount()
+  })
+
+  it('treats transport failure as harmless and automatically retries', async () => {
+    const sendDesktopHeartbeat = vi.fn()
+      .mockRejectedValueOnce(new Error('ESP32 unavailable'))
+      .mockResolvedValue(true)
+    installDesktopApi(createDesktopApi({ hardware: { sendDesktopHeartbeat } }))
+    const view = render(<App />)
+
+    await settle()
+    expect(sendDesktopHeartbeat).toHaveBeenCalledOnce()
+    expect(screen.getByRole('heading', { name: 'Item Inventory' })).toBeVisible()
+
+    await advance(4_000)
+    expect(sendDesktopHeartbeat).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('heading', { name: 'Item Inventory' })).toBeVisible()
+    view.unmount()
+  })
+
+  it.each(['logout', 'unmount'] as const)(
+    'stops scheduling heartbeats after shell %s',
+    async (cleanupMethod) => {
+      const sendDesktopHeartbeat = vi.fn().mockResolvedValue(true)
+      const api = createDesktopApi({ hardware: { sendDesktopHeartbeat } })
+      installDesktopApi(api)
+      const view = render(<App />)
+      await settle()
+      expect(sendDesktopHeartbeat).toHaveBeenCalledOnce()
+
+      if (cleanupMethod === 'logout') {
+        fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+        await settle()
+        expect(api.auth.logout).toHaveBeenCalledOnce()
+        expect(screen.getByRole('button', { name: 'Sign In' })).toBeVisible()
+      } else {
+        view.unmount()
+      }
+
+      await advance(12_000)
+      expect(sendDesktopHeartbeat).toHaveBeenCalledOnce()
+    }
+  )
+
+  it('does not announce desktop presence before administrator login', async () => {
+    const sendDesktopHeartbeat = vi.fn().mockResolvedValue(true)
+    installDesktopApi(createDesktopApi({
+      authenticated: false,
+      hardware: { sendDesktopHeartbeat }
+    }))
+    const view = render(<App />)
+
+    await settle()
+    await advance(12_000)
+    expect(screen.getByRole('button', { name: 'Sign In' })).toBeVisible()
+    expect(sendDesktopHeartbeat).not.toHaveBeenCalled()
+    view.unmount()
+  })
+})
 
 function filteredProductList(products: () => ProductDto[]) {
   return vi.fn(async (query: ProductListQuery) => {

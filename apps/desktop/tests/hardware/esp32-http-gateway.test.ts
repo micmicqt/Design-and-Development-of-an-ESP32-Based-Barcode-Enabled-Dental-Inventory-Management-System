@@ -80,6 +80,83 @@ describe('ESP32 HTTP hardware gateway', () => {
     )
   })
 
+  it('accepts the optional desktop-presence field without requiring it from older firmware', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        device: 'dental-inventory-esp32',
+        online: true,
+        mode: 'idle',
+        rtc: true,
+        sd: true
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        device: 'dental-inventory-esp32',
+        online: true,
+        mode: 'idle',
+        rtc: true,
+        sd: true,
+        desktopOnline: false
+      }))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.getStatus()).resolves.not.toHaveProperty('desktopOnline')
+    await expect(gateway.getStatus()).resolves.toMatchObject({ desktopOnline: false })
+  })
+
+  it('rejects a malformed optional desktop-presence field', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse({
+      device: 'dental-inventory-esp32',
+      online: true,
+      mode: 'idle',
+      rtc: true,
+      sd: true,
+      desktopOnline: 'yes'
+    }))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.getStatus()).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+  })
+
+  it('posts a desktop heartbeat through only the fixed endpoint', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+      jsonResponse({ desktopOnline: true })
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.sendDesktopHeartbeat()).resolves.toBeUndefined()
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith(
+      'http://192.0.2.10/desktop/heartbeat',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' }
+      })
+    )
+    expect(fetcher.mock.calls[0]?.[1]).not.toHaveProperty('body')
+  })
+
+  it.each([
+    null,
+    {},
+    { desktopOnline: false },
+    { desktopOnline: 'true' },
+    { desktopOnline: true, credentials: 'leak' }
+  ])('rejects an invalid desktop-heartbeat response %#', async (payload) => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(payload))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.sendDesktopHeartbeat()).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE'
+    })
+  })
+
+  it('reports desktop-heartbeat network failure without implicit retries', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockRejectedValue(new Error('network unavailable'))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.sendDesktopHeartbeat()).rejects.toMatchObject({ code: 'UNAVAILABLE' })
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
   it.each([
     { status: 'ok', device: 'unexpected-device', phase: 4 },
     { status: 'ok', device: 'dental-inventory-esp32', phase: '4' },

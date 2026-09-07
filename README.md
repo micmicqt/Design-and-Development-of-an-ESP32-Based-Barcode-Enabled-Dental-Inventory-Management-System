@@ -1,6 +1,6 @@
 # Dental Inventory System
 
-Phase 5 Step 3 implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+Phase 6 Step 1 implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
 
 This repository currently provides:
 
@@ -12,7 +12,8 @@ This repository currently provides:
 - shared, versioned TypeScript protocol types and JSON Schema validation;
 - a local-network ESP32 `HardwareGateway` with status, FIFO scan delivery, result feedback, and acknowledgement;
 - atomic online RESTOCK/CHECKOUT persistence with durable event and delivery-state idempotency; and
-- the verified ESP32 PlatformIO hardware integration from Phases 3 and 4.
+- the verified ESP32 PlatformIO hardware integration from Phases 3 and 4; and
+- a renewable desktop-presence heartbeat that is separate from Wi-Fi connectivity.
 
 Committed online results now drive the kiosk LCD plus SUCCESS and stock-status
 indicators before the ESP32 event is acknowledged. Offline operation and
@@ -121,6 +122,14 @@ Then:
 React communicates only through narrow authentication, inventory, and hardware-status methods exposed by the preload. It cannot access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
 
 ### Local ESP32 status connection
+
+Phase 6 Step 1 adds an authenticated, backend-only desktop heartbeat. While the
+authenticated application shell is active, Electron immediately posts to the
+fixed `/desktop/heartbeat` route and renews it about every four seconds. The
+ESP32 treats the desktop as available for a 12-second lease, clears that state
+on lease expiry or Wi-Fi loss, and waits for a new heartbeat after reconnect.
+This detection does not yet enable offline stock processing or synchronization.
+See [the desktop-presence guide](docs/phase6-step1-desktop-presence.md).
 
 Phase 5 Step 3 completes online result feedback: after the existing atomic SQLite
 commit, Electron sends the committed quantity, stock, and status to the matching
