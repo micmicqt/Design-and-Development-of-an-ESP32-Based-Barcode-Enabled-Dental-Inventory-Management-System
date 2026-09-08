@@ -12,7 +12,8 @@ import {
 import { createInventoryService } from './inventory'
 import { resolveEsp32BaseUrl } from './hardware/hardware-configuration'
 import { Esp32HttpGateway } from './hardware/esp32-http-gateway'
-import type { HardwareTransactionEventGateway } from './hardware/hardware-gateway'
+import type { DesktopHardwareGateway } from './hardware/hardware-gateway'
+import { createOfflineInventoryCacheCoordinator } from './hardware/offline-inventory-cache'
 import { createHardwareTransactionCoordinator } from './hardware/hardware-transaction-coordinator'
 import { registerAuthIpcHandlers } from './ipc/register-auth-handlers'
 import { registerHardwareIpcHandlers } from './ipc/register-hardware-handlers'
@@ -23,7 +24,7 @@ let disposeIpcHandlers: (() => void) | null = null
 let disposeImageProtocol: (() => void) | null = null
 let database: SqliteDatabase | null = null
 let imageStore: ProductImageStore | null = null
-let hardwareGateway: HardwareTransactionEventGateway | null = null
+let hardwareGateway: DesktopHardwareGateway | null = null
 
 const WINDOW_TITLE = 'Any Time Dental — Dental Inventory Management System'
 
@@ -123,6 +124,13 @@ async function startDesktopApplication(): Promise<void> {
     inventoryService,
     gateway: hardwareGateway
   })
+  const offlineInventoryCacheCoordinator =
+    hardwareGateway === null
+      ? null
+      : createOfflineInventoryCacheCoordinator({
+          inventoryService,
+          gateway: hardwareGateway
+        })
 
   disposeImageProtocol = registerDentalImageProtocol(session.defaultSession, imageStore)
   mainWindow = createMainWindow()
@@ -136,12 +144,14 @@ async function startDesktopApplication(): Promise<void> {
     inventoryService,
     imageStore,
     authSession,
-    getMainWindow
+    getMainWindow,
+    offlineInventoryCacheCoordinator
   })
   const disposeHardwareHandlers = registerHardwareIpcHandlers({
     gateway: hardwareGateway,
     inventoryService,
     transactionCoordinator,
+    offlineInventoryCacheCoordinator,
     authSession,
     getMainWindow
   })

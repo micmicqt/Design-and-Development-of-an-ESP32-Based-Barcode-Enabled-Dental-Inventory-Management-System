@@ -1,16 +1,22 @@
 import {
+  type DesktopHardwareGateway,
   ESP32_DEVICE_ID,
   type Esp32HardwareMode,
   type Esp32HealthResponse,
   type Esp32StatusResponse,
-  type HardwareTransactionEventGateway,
+  OFFLINE_CACHE_GENERATION_PATTERN,
+  type OfflineInventoryCacheInstallResult,
+  type OfflineInventoryCacheProduct,
+  type OfflineInventoryCacheSnapshot,
   isValidHardwareTransactionEventId
 } from './hardware-gateway'
-import type {
-  HardwareTransactionEvent,
-  HardwareTransactionMode,
-  HardwareTransactionResult,
-  StockStatus
+import {
+  INVENTORY_CATEGORIES,
+  STOCK_STATUSES,
+  type HardwareTransactionEvent,
+  type HardwareTransactionMode,
+  type HardwareTransactionResult,
+  type StockStatus
 } from '../../shared/ipc-contract'
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_500
@@ -25,8 +31,27 @@ const TRANSACTION_EVENT_KEYS = ['barcode', 'eventId', 'mode', 'timestamp'] as co
 const ACKNOWLEDGEMENT_KEYS = ['acknowledged', 'eventId'] as const
 const RESULT_ACCEPTANCE_KEYS = ['accepted', 'eventId'] as const
 const DESKTOP_HEARTBEAT_KEYS = ['desktopOnline'] as const
-const STOCK_STATUSES: readonly StockStatus[] = ['HIGH', 'LOW', 'EMPTY']
+const CACHE_RESPONSE_KEYS = [
+  'accepted',
+  'operation',
+  'generation',
+  'receivedItems',
+  'alreadyCurrent'
+] as const
+const CACHE_SNAPSHOT_KEYS = ['generation', 'products'] as const
+const CACHE_PRODUCT_KEYS = [
+  'id',
+  'barcode',
+  'name',
+  'category',
+  'currentStock',
+  'lowStockThreshold',
+  'status'
+] as const
+const MAX_OFFLINE_CACHE_ITEMS = 10_000
 const NO_CONTENT = Symbol('HTTP 204')
+
+type CacheOperation = 'begin' | 'item' | 'commit'
 
 export interface HardwareHttpResponse {
   ok: boolean
@@ -166,6 +191,25 @@ function validateHealthResponse(value: unknown): Esp32HealthResponse {
 }
 
 function validateStatusResponse(value: unknown): Esp32StatusResponse {
+  const hasAnyCacheMetadata =
+    isRecord(value) &&
+    ('offlineCacheAvailable' in value ||
+      'offlineCacheGeneration' in value ||
+      'offlineCacheItems' in value)
+  const hasValidCacheMetadata =
+    !hasAnyCacheMetadata ||
+    (isRecord(value) &&
+      typeof value.offlineCacheAvailable === 'boolean' &&
+      (value.offlineCacheGeneration === null ||
+        (typeof value.offlineCacheGeneration === 'string' &&
+          OFFLINE_CACHE_GENERATION_PATTERN.test(value.offlineCacheGeneration))) &&
+      Number.isSafeInteger(value.offlineCacheItems) &&
+      (value.offlineCacheItems as number) >= 0 &&
+      (value.offlineCacheItems as number) <= MAX_OFFLINE_CACHE_ITEMS &&
+      (value.offlineCacheAvailable
+        ? typeof value.offlineCacheGeneration === 'string'
+        : value.offlineCacheGeneration === null && value.offlineCacheItems === 0))
+
   if (
     !isRecord(value) ||
     value.device !== ESP32_DEVICE_ID ||
@@ -174,7 +218,8 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
     !HARDWARE_MODES.includes(value.mode as Esp32HardwareMode) ||
     typeof value.rtc !== 'boolean' ||
     typeof value.sd !== 'boolean' ||
-    (value.desktopOnline !== undefined && typeof value.desktopOnline !== 'boolean')
+    (value.desktopOnline !== undefined && typeof value.desktopOnline !== 'boolean') ||
+    !hasValidCacheMetadata
   ) {
     throw new HardwareGatewayError('INVALID_RESPONSE', 'The ESP32 status response is invalid.')
   }
@@ -190,6 +235,11 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
   if (typeof value.desktopOnline === 'boolean') {
     status.desktopOnline = value.desktopOnline
   }
+  if (typeof value.offlineCacheAvailable === 'boolean') {
+    status.offlineCacheAvailable = value.offlineCacheAvailable
+    status.offlineCacheGeneration = value.offlineCacheGeneration as string | null
+    status.offlineCacheItems = value.offlineCacheItems as number
+  }
   return status
 }
 
@@ -203,6 +253,112 @@ function validateDesktopHeartbeatResponse(value: unknown): void {
       'INVALID_RESPONSE',
       'The ESP32 desktop heartbeat response is invalid.'
     )
+  }
+}
+
+function containsControlCharacter(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const code = character.charCodeAt(0)
+    return code < 32 || code === 127
+  })
+}
+
+function validateCacheProduct(product: unknown): asserts product is OfflineInventoryCacheProduct {
+  if (
+    !isRecord(product) ||
+    !hasExactlyKeys(product, CACHE_PRODUCT_KEYS) ||
+    typeof product.id !== 'string' ||
+    !/^[1-9]\d*$/.test(product.id) ||
+    product.id.length > 31 ||
+    typeof product.barcode !== 'string' ||
+    product.barcode.length === 0 ||
+    product.barcode.length > 256 ||
+    Buffer.byteLength(product.barcode, 'utf8') > 1_024 ||
+    product.barcode.trim().length === 0 ||
+    containsControlCharacter(product.barcode) ||
+    typeof product.name !== 'string' ||
+    product.name.trim().length === 0 ||
+    product.name.length > 200 ||
+    Buffer.byteLength(product.name, 'utf8') > 800 ||
+    containsControlCharacter(product.name) ||
+    !INVENTORY_CATEGORIES.includes(product.category as never) ||
+    typeof product.currentStock !== 'number' ||
+    !Number.isSafeInteger(product.currentStock) ||
+    product.currentStock < 0 ||
+    typeof product.lowStockThreshold !== 'number' ||
+    !Number.isSafeInteger(product.lowStockThreshold) ||
+    product.lowStockThreshold < 0 ||
+    !STOCK_STATUSES.includes(product.status as StockStatus) ||
+    product.status !==
+      (product.currentStock === 0
+        ? 'EMPTY'
+        : product.currentStock <= product.lowStockThreshold
+          ? 'LOW'
+          : 'HIGH')
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The offline inventory cache contains an invalid product.'
+    )
+  }
+}
+
+function validateCacheSnapshot(snapshot: OfflineInventoryCacheSnapshot): void {
+  if (
+    !isRecord(snapshot) ||
+    !hasExactlyKeys(snapshot, CACHE_SNAPSHOT_KEYS) ||
+    typeof snapshot.generation !== 'string' ||
+    !OFFLINE_CACHE_GENERATION_PATTERN.test(snapshot.generation) ||
+    !Array.isArray(snapshot.products) ||
+    snapshot.products.length > MAX_OFFLINE_CACHE_ITEMS
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The offline inventory cache snapshot is invalid.'
+    )
+  }
+
+  const productIds = new Set<string>()
+  const barcodes = new Set<string>()
+  for (const product of snapshot.products) {
+    validateCacheProduct(product)
+    if (productIds.has(product.id) || barcodes.has(product.barcode)) {
+      throw new HardwareGatewayError(
+        'INVALID_RESPONSE',
+        'The offline inventory cache contains duplicate products.'
+      )
+    }
+    productIds.add(product.id)
+    barcodes.add(product.barcode)
+  }
+}
+
+function validateCacheOperationResponse(
+  value: unknown,
+  expectedOperation: CacheOperation,
+  expectedGeneration: string,
+  itemCount: number
+): { receivedItems: number; alreadyCurrent: boolean } {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, CACHE_RESPONSE_KEYS) ||
+    value.accepted !== true ||
+    value.operation !== expectedOperation ||
+    value.generation !== expectedGeneration ||
+    !Number.isSafeInteger(value.receivedItems) ||
+    (value.receivedItems as number) < 0 ||
+    (value.receivedItems as number) > itemCount ||
+    typeof value.alreadyCurrent !== 'boolean'
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The ESP32 offline cache response is invalid.'
+    )
+  }
+
+  return {
+    receivedItems: value.receivedItems as number,
+    alreadyCurrent: value.alreadyCurrent
   }
 }
 
@@ -276,7 +432,7 @@ function validateResultAcceptance(value: unknown, expectedEventId: string): void
 
 const defaultFetch: HardwareFetch = (url, options) => fetch(url, options)
 
-export class Esp32HttpGateway implements HardwareTransactionEventGateway {
+export class Esp32HttpGateway implements DesktopHardwareGateway {
   private readonly baseUrl: string
   private readonly requestTimeoutMs: number
   private readonly fetcher: HardwareFetch
@@ -302,6 +458,93 @@ export class Esp32HttpGateway implements HardwareTransactionEventGateway {
     validateDesktopHeartbeatResponse(
       await this.request('/desktop/heartbeat', { method: 'POST' })
     )
+  }
+
+  async installOfflineInventoryCache(
+    snapshot: OfflineInventoryCacheSnapshot
+  ): Promise<OfflineInventoryCacheInstallResult> {
+    validateCacheSnapshot(snapshot)
+    const itemCount = snapshot.products.length
+    const beginResponse = validateCacheOperationResponse(
+      await this.request('/offline/cache', {
+        method: 'POST',
+        body: JSON.stringify({
+          operation: 'begin',
+          generation: snapshot.generation,
+          itemCount
+        })
+      }),
+      'begin',
+      snapshot.generation,
+      itemCount
+    )
+
+    if (beginResponse.alreadyCurrent) {
+      if (beginResponse.receivedItems !== itemCount) {
+        throw new HardwareGatewayError(
+          'INVALID_RESPONSE',
+          'The ESP32 reported inconsistent current-cache metadata.'
+        )
+      }
+      return { generation: snapshot.generation, itemCount, alreadyCurrent: true }
+    }
+    if (beginResponse.receivedItems !== 0) {
+      throw new HardwareGatewayError(
+        'INVALID_RESPONSE',
+        'The ESP32 reported an inconsistent offline cache starting position.'
+      )
+    }
+
+    let nextIndex = 0
+    while (nextIndex < itemCount) {
+      const itemResponse = validateCacheOperationResponse(
+        await this.request('/offline/cache', {
+          method: 'POST',
+          body: JSON.stringify({
+            operation: 'item',
+            generation: snapshot.generation,
+            index: nextIndex,
+            product: snapshot.products[nextIndex]
+          })
+        }),
+        'item',
+        snapshot.generation,
+        itemCount
+      )
+      if (itemResponse.alreadyCurrent || itemResponse.receivedItems !== nextIndex + 1) {
+        throw new HardwareGatewayError(
+          'INVALID_RESPONSE',
+          'The ESP32 reported an inconsistent offline cache position.'
+        )
+      }
+      nextIndex = itemResponse.receivedItems
+    }
+
+    const commitResponse = validateCacheOperationResponse(
+      await this.request('/offline/cache', {
+        method: 'POST',
+        body: JSON.stringify({
+          operation: 'commit',
+          generation: snapshot.generation,
+          itemCount
+        })
+      }),
+      'commit',
+      snapshot.generation,
+      itemCount
+    )
+    if (commitResponse.receivedItems !== itemCount) {
+      throw new HardwareGatewayError(
+        'INVALID_RESPONSE',
+        'The ESP32 did not commit the complete offline cache.'
+      )
+    }
+
+    return {
+      generation: snapshot.generation,
+      itemCount,
+      alreadyCurrent: commitResponse.alreadyCurrent
+    }
   }
 
   async getNextTransactionEvent(): Promise<HardwareTransactionEvent | null> {
@@ -338,6 +581,7 @@ export class Esp32HttpGateway implements HardwareTransactionEventGateway {
       | '/health'
       | '/status'
       | '/desktop/heartbeat'
+      | '/offline/cache'
       | '/events/next'
       | '/events/result'
       | '/events/ack',
@@ -368,7 +612,9 @@ export class Esp32HttpGateway implements HardwareTransactionEventGateway {
             'REJECTED',
             path === '/events/result'
               ? 'The ESP32 rejected the transaction result.'
-              : 'The ESP32 rejected the transaction acknowledgement.'
+              : path === '/offline/cache'
+                ? 'The ESP32 rejected the offline inventory cache.'
+                : 'The ESP32 rejected the transaction acknowledgement.'
           )
         }
         throw new HardwareGatewayError(
@@ -381,6 +627,12 @@ export class Esp32HttpGateway implements HardwareTransactionEventGateway {
         throw new HardwareGatewayError(
           'INVALID_RESPONSE',
           'The ESP32 returned an unexpected event response status.'
+        )
+      }
+      if (path === '/offline/cache' && response.status !== 200) {
+        throw new HardwareGatewayError(
+          'INVALID_RESPONSE',
+          'The ESP32 returned an unexpected offline cache response status.'
         )
       }
 

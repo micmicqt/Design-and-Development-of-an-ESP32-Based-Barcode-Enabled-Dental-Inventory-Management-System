@@ -32,6 +32,42 @@ const transactionResult = {
   stockStatus: 'HIGH'
 } as const
 
+const cacheGeneration = `v1-${'a'.repeat(64)}`
+const cacheProducts = [
+  {
+    id: '7',
+    barcode: '0004806016001569',
+    name: 'Cleanser',
+    category: 'General',
+    currentStock: 20,
+    lowStockThreshold: 5,
+    status: 'HIGH'
+  },
+  {
+    id: '8',
+    barcode: '00000002',
+    name: 'Composite Resin',
+    category: 'Restorative & Esthetic',
+    currentStock: 0,
+    lowStockThreshold: 3,
+    status: 'EMPTY'
+  }
+] as const
+
+function cacheResponse(
+  operation: 'begin' | 'item' | 'commit',
+  receivedItems: number,
+  alreadyCurrent = false
+) {
+  return {
+    accepted: true,
+    operation,
+    generation: cacheGeneration,
+    receivedItems,
+    alreadyCurrent
+  }
+}
+
 describe('ESP32 HTTP hardware gateway', () => {
   afterEach(() => vi.useRealTimers())
 
@@ -117,6 +153,49 @@ describe('ESP32 HTTP hardware gateway', () => {
     await expect(gateway.getStatus()).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
   })
 
+  it('accepts typed optional offline-cache metadata while preserving legacy status', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse({
+      device: 'dental-inventory-esp32',
+      online: true,
+      mode: 'idle',
+      rtc: true,
+      sd: true,
+      desktopOnline: true,
+      offlineCacheAvailable: true,
+      offlineCacheGeneration: cacheGeneration,
+      offlineCacheItems: 2
+    }))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.getStatus()).resolves.toMatchObject({
+      offlineCacheAvailable: true,
+      offlineCacheGeneration: cacheGeneration,
+      offlineCacheItems: 2
+    })
+  })
+
+  it.each([
+    { offlineCacheAvailable: true },
+    { offlineCacheAvailable: 'yes', offlineCacheGeneration: cacheGeneration, offlineCacheItems: 2 },
+    { offlineCacheAvailable: true, offlineCacheGeneration: 'latest', offlineCacheItems: 2 },
+    { offlineCacheAvailable: true, offlineCacheGeneration: null, offlineCacheItems: 2 },
+    { offlineCacheAvailable: true, offlineCacheGeneration: cacheGeneration, offlineCacheItems: 10_001 },
+    { offlineCacheAvailable: false, offlineCacheGeneration: cacheGeneration, offlineCacheItems: 2 },
+    { offlineCacheAvailable: false, offlineCacheGeneration: null, offlineCacheItems: 1 }
+  ])('rejects malformed optional offline-cache metadata %#', async (cacheMetadata) => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse({
+      device: 'dental-inventory-esp32',
+      online: true,
+      mode: 'idle',
+      rtc: true,
+      sd: true,
+      ...cacheMetadata
+    }))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.getStatus()).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+  })
+
   it('posts a desktop heartbeat through only the fixed endpoint', async () => {
     const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
       jsonResponse({ desktopOnline: true })
@@ -154,6 +233,140 @@ describe('ESP32 HTTP hardware gateway', () => {
     const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
 
     await expect(gateway.sendDesktopHeartbeat()).rejects.toMatchObject({ code: 'UNAVAILABLE' })
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it('installs an offline cache through bounded begin, item, and commit requests', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('begin', 0)))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('item', 1)))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('item', 2)))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('commit', 2)))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: cacheProducts
+    })).resolves.toEqual({
+      generation: cacheGeneration,
+      itemCount: 2,
+      alreadyCurrent: false
+    })
+
+    expect(fetcher).toHaveBeenCalledTimes(4)
+    expect(JSON.parse(fetcher.mock.calls[0]?.[1].body ?? '')).toEqual({
+      operation: 'begin', generation: cacheGeneration, itemCount: 2
+    })
+    expect(JSON.parse(fetcher.mock.calls[1]?.[1].body ?? '')).toEqual({
+      operation: 'item', generation: cacheGeneration, index: 0, product: cacheProducts[0]
+    })
+    expect(JSON.parse(fetcher.mock.calls[2]?.[1].body ?? '')).toEqual({
+      operation: 'item', generation: cacheGeneration, index: 1, product: cacheProducts[1]
+    })
+    expect(JSON.parse(fetcher.mock.calls[3]?.[1].body ?? '')).toEqual({
+      operation: 'commit', generation: cacheGeneration, itemCount: 2
+    })
+    for (const [url, options] of fetcher.mock.calls) {
+      expect(url).toBe('http://esp32.local/offline/cache')
+      expect(options.method).toBe('POST')
+    }
+  })
+
+  it('rejects a non-current begin response that claims a trusted staged prefix', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValueOnce(
+      jsonResponse(cacheResponse('begin', 1))
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: cacheProducts
+    })).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it('treats an already-current generation as success without sending items or commit', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+      jsonResponse(cacheResponse('begin', 2, true))
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: cacheProducts
+    })).resolves.toEqual({
+      generation: cacheGeneration,
+      itemCount: 2,
+      alreadyCurrent: true
+    })
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it('safely installs an empty active inventory with no item request', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('begin', 0)))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('commit', 0)))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: []
+    })).resolves.toMatchObject({ itemCount: 0 })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects malformed cache snapshots before making an HTTP request', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.installOfflineInventoryCache({
+      generation: 'not-a-generation',
+      products: cacheProducts
+    })).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: [{ ...cacheProducts[0], barcode: 123 }]
+    } as never)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: [{ ...cacheProducts[0], status: 'LOW' }]
+    })).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: [{ ...cacheProducts[0], unexpected: true }]
+    } as never)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: cacheProducts,
+      unexpected: true
+    } as never)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('rejects inconsistent cache progress without sending a later item or commit', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('begin', 0)))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('item', 0)))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: cacheProducts
+    })).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects cache responses with untracked contract fields', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValueOnce(
+      jsonResponse({ ...cacheResponse('begin', 0), diagnostic: 'unexpected' })
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: cacheProducts
+    })).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
     expect(fetcher).toHaveBeenCalledOnce()
   })
 

@@ -1,6 +1,7 @@
 import { ipcMain, type IpcMainInvokeEvent } from 'electron'
 import type { AuthSessionController } from '../application/auth-session'
 import type { HardwareTransactionEventGateway } from '../hardware/hardware-gateway'
+import type { OfflineInventoryCacheCoordinator } from '../hardware/offline-inventory-cache'
 import {
   HardwareTransactionCoordinatorError,
   type HardwareTransactionCoordinator
@@ -28,6 +29,7 @@ export interface RegisterHardwareIpcHandlersOptions {
   transactionCoordinator: HardwareTransactionCoordinator
   authSession: AuthSessionController
   getMainWindow: MainWindowProvider
+  offlineInventoryCacheCoordinator?: OfflineInventoryCacheCoordinator | null
 }
 
 const unauthorizedError: IpcError = {
@@ -101,8 +103,29 @@ function offlineStatus(): HardwareStatusDto {
 export function registerHardwareIpcHandlers(
   options: RegisterHardwareIpcHandlersOptions
 ): () => void {
-  const { gateway, inventoryService, transactionCoordinator, authSession, getMainWindow } = options
+  const {
+    gateway,
+    inventoryService,
+    transactionCoordinator,
+    authSession,
+    getMainWindow,
+    offlineInventoryCacheCoordinator = null
+  } = options
   let hardwareMutationTail: Promise<void> = Promise.resolve()
+  function refreshOfflineCacheBestEffort(force: boolean): void {
+    if (offlineInventoryCacheCoordinator === null) return
+    try {
+      const refresh = force
+        ? offlineInventoryCacheCoordinator.refresh()
+        : offlineInventoryCacheCoordinator.refreshIfNeeded()
+      void refresh.catch(() => {
+        // The SQLite write or online transaction has already succeeded. Cache
+        // transport is best-effort and a later heartbeat can retry it safely.
+      })
+    } catch {
+      // A cache implementation failure must not escape into Phase 5 IPC.
+    }
+  }
 
   function serializeHardwareMutation<T>(operation: () => Promise<T>): Promise<T> {
     const result = hardwareMutationTail.then(operation, operation)
@@ -148,8 +171,10 @@ export function registerHardwareIpcHandlers(
 
       try {
         await gateway.sendDesktopHeartbeat()
+        refreshOfflineCacheBestEffort(false)
         return true
       } catch {
+        offlineInventoryCacheCoordinator?.markStale()
         // Presence is a renewable lease. A later heartbeat will recover
         // automatically, while this failure remains harmless to inventory work.
         return false
@@ -292,11 +317,11 @@ export function registerHardwareIpcHandlers(
 
       return serializeHardwareMutation(async () => {
         try {
-          return ok(
-            await transactionCoordinator.processTransaction(
-              validateProcessHardwareTransactionInput(input)
-            )
+          const outcome = await transactionCoordinator.processTransaction(
+            validateProcessHardwareTransactionInput(input)
           )
+          refreshOfflineCacheBestEffort(true)
+          return ok(outcome)
         } catch (error: unknown) {
           return sanitizedTransactionFailure(error, 'Unable to process this hardware transaction.')
         }
@@ -311,11 +336,11 @@ export function registerHardwareIpcHandlers(
 
       return serializeHardwareMutation(async () => {
         try {
-          return ok(
-            await transactionCoordinator.retryTransactionResultDelivery(
-              validateHardwareTransactionEventIdPayload(eventId)
-            )
+          const outcome = await transactionCoordinator.retryTransactionResultDelivery(
+            validateHardwareTransactionEventIdPayload(eventId)
           )
+          refreshOfflineCacheBestEffort(true)
+          return ok(outcome)
         } catch (error: unknown) {
           return sanitizedTransactionFailure(
             error,
@@ -333,11 +358,11 @@ export function registerHardwareIpcHandlers(
 
       return serializeHardwareMutation(async () => {
         try {
-          return ok(
-            await transactionCoordinator.retryTransactionAcknowledgement(
-              validateHardwareTransactionEventIdPayload(eventId)
-            )
+          const outcome = await transactionCoordinator.retryTransactionAcknowledgement(
+            validateHardwareTransactionEventIdPayload(eventId)
           )
+          refreshOfflineCacheBestEffort(true)
+          return ok(outcome)
         } catch (error: unknown) {
           return sanitizedTransactionFailure(
             error,

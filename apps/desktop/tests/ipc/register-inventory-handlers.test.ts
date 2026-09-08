@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import type { BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createAuthSessionController } from '../../src/main/application/auth-session'
+import type { OfflineInventoryCacheCoordinator } from '../../src/main/hardware/offline-inventory-cache'
 import { ProductImageStore } from '../../src/main/images'
 import {
   InventoryServiceError,
@@ -67,6 +68,7 @@ describe('authenticated inventory IPC boundary', () => {
   let temporaryDirectory: string
   let imageStore: ProductImageStore
   let inventoryService: InventoryService
+  let offlineInventoryCacheCoordinator: OfflineInventoryCacheCoordinator
   let authSession: ReturnType<typeof createAuthSessionController>
   let trustedEvent: IpcMainInvokeEvent
   let mainWindow: BrowserWindow
@@ -77,6 +79,15 @@ describe('authenticated inventory IPC boundary', () => {
     temporaryDirectory = await mkdtemp(join(tmpdir(), 'dental-ipc-handler-'))
     imageStore = new ProductImageStore(join(temporaryDirectory, 'product-images'))
     inventoryService = createService()
+    offlineInventoryCacheCoordinator = {
+      refresh: vi.fn().mockResolvedValue({
+        generation: `v1-${'a'.repeat(64)}`,
+        itemCount: 1,
+        alreadyCurrent: false
+      }),
+      refreshIfNeeded: vi.fn().mockResolvedValue(null),
+      markStale: vi.fn()
+    }
     authSession = createAuthSessionController()
 
     const mainFrame = {}
@@ -97,7 +108,8 @@ describe('authenticated inventory IPC boundary', () => {
       inventoryService,
       imageStore,
       authSession,
-      getMainWindow: () => mainWindow
+      getMainWindow: () => mainWindow,
+      offlineInventoryCacheCoordinator
     })
   })
 
@@ -390,5 +402,98 @@ describe('authenticated inventory IPC boundary', () => {
       }
     })
     expect(JSON.stringify(result)).not.toContain('SQLITE_CONSTRAINT')
+    expect(offlineInventoryCacheCoordinator.refresh).not.toHaveBeenCalled()
+  })
+
+  it('refreshes the offline cache only after each authoritative create, update, and delete', async () => {
+    authSession.signIn('admin')
+
+    await expect(handler(IPC_CHANNELS.productsCreate)(trustedEvent, {
+      barcode: PRODUCT.barcode,
+      itemName: PRODUCT.itemName,
+      category: PRODUCT.category,
+      initialStock: PRODUCT.currentStock,
+      lowStockThreshold: PRODUCT.lowStockThreshold,
+      imageSelectionToken: null,
+      offlineCacheProducts: [{ barcode: 'renderer-controlled' }]
+    })).resolves.toMatchObject({ ok: true, value: { id: PRODUCT.id } })
+    const createOrder = vi.mocked(inventoryService.createProduct).mock.invocationCallOrder[0]
+    const createRefreshOrder = vi.mocked(
+      offlineInventoryCacheCoordinator.refresh
+    ).mock.invocationCallOrder[0]
+    expect(createOrder).toBeLessThan(createRefreshOrder as number)
+    expect(offlineInventoryCacheCoordinator.refresh).toHaveBeenNthCalledWith(1)
+
+    await expect(handler(IPC_CHANNELS.productsUpdate)(trustedEvent, {
+      id: PRODUCT.id,
+      itemName: PRODUCT.itemName,
+      category: PRODUCT.category,
+      currentStock: PRODUCT.currentStock,
+      lowStockThreshold: PRODUCT.lowStockThreshold
+    })).resolves.toMatchObject({ ok: true, value: { id: PRODUCT.id } })
+    const updateOrder = vi.mocked(inventoryService.updateProduct).mock.invocationCallOrder[0]
+    const updateRefreshOrder = vi.mocked(
+      offlineInventoryCacheCoordinator.refresh
+    ).mock.invocationCallOrder[1]
+    expect(updateOrder).toBeLessThan(updateRefreshOrder as number)
+
+    await expect(handler(IPC_CHANNELS.productsDelete)(trustedEvent, {
+      id: PRODUCT.id
+    })).resolves.toEqual({ ok: true, value: { deletedProductId: PRODUCT.id } })
+    const deleteOrder = vi.mocked(inventoryService.deleteProduct).mock.invocationCallOrder[0]
+    const deleteRefreshOrder = vi.mocked(
+      offlineInventoryCacheCoordinator.refresh
+    ).mock.invocationCallOrder[2]
+    expect(deleteOrder).toBeLessThan(deleteRefreshOrder as number)
+    expect(offlineInventoryCacheCoordinator.refresh).toHaveBeenCalledTimes(3)
+  })
+
+  it('keeps a successful inventory mutation successful when cache delivery is rejected', async () => {
+    authSession.signIn('admin')
+    vi.mocked(offlineInventoryCacheCoordinator.refresh).mockRejectedValueOnce(
+      new Error('ESP32 cache unavailable')
+    )
+
+    await expect(handler(IPC_CHANNELS.productsCreate)(trustedEvent, {
+      barcode: PRODUCT.barcode,
+      itemName: PRODUCT.itemName,
+      category: PRODUCT.category,
+      initialStock: PRODUCT.currentStock,
+      lowStockThreshold: PRODUCT.lowStockThreshold,
+      imageSelectionToken: null
+    })).resolves.toMatchObject({ ok: true, value: { id: PRODUCT.id } })
+    expect(inventoryService.createProduct).toHaveBeenCalledOnce()
+    expect(offlineInventoryCacheCoordinator.refresh).toHaveBeenCalledOnce()
+  })
+
+  it('does not refresh after unauthorized, invalid, or failed inventory mutations', async () => {
+    const create = handler(IPC_CHANNELS.productsCreate)
+    await expect(create(trustedEvent, {
+      barcode: PRODUCT.barcode,
+      itemName: PRODUCT.itemName,
+      category: PRODUCT.category,
+      initialStock: PRODUCT.currentStock,
+      lowStockThreshold: PRODUCT.lowStockThreshold,
+      imageSelectionToken: null
+    })).resolves.toMatchObject({ ok: false, error: { code: 'UNAUTHORIZED' } })
+
+    authSession.signIn('admin')
+    await expect(create(trustedEvent, { barcode: '' })).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'VALIDATION_ERROR' }
+    })
+    vi.mocked(inventoryService.createProduct).mockImplementationOnce(() => {
+      throw new Error('database unavailable')
+    })
+    await expect(create(trustedEvent, {
+      barcode: PRODUCT.barcode,
+      itemName: PRODUCT.itemName,
+      category: PRODUCT.category,
+      initialStock: PRODUCT.currentStock,
+      lowStockThreshold: PRODUCT.lowStockThreshold,
+      imageSelectionToken: null
+    })).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } })
+
+    expect(offlineInventoryCacheCoordinator.refresh).not.toHaveBeenCalled()
   })
 })

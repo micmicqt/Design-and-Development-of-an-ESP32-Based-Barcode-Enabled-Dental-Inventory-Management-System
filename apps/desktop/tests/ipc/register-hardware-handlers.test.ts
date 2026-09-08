@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createAuthSessionController } from '../../src/main/application/auth-session'
 import { initializeDatabase } from '../../src/main/database'
 import type { HardwareTransactionEventGateway } from '../../src/main/hardware/hardware-gateway'
+import type { OfflineInventoryCacheCoordinator } from '../../src/main/hardware/offline-inventory-cache'
 import {
   createHardwareTransactionCoordinator,
   type HardwareTransactionCoordinator
@@ -69,7 +70,8 @@ describe('authenticated hardware IPC boundary', () => {
   function setup(
     gateway: HardwareTransactionEventGateway | null = createGateway(),
     inventoryService: InventoryService = createInventoryService(),
-    transactionCoordinator: HardwareTransactionCoordinator = createTransactionCoordinator()
+    transactionCoordinator: HardwareTransactionCoordinator = createTransactionCoordinator(),
+    offlineInventoryCacheCoordinator: OfflineInventoryCacheCoordinator | null = null
   ) {
     const authSession = createAuthSessionController()
     const mainFrame = {}
@@ -87,7 +89,8 @@ describe('authenticated hardware IPC boundary', () => {
       inventoryService,
       transactionCoordinator,
       authSession,
-      getMainWindow: () => mainWindow
+      getMainWindow: () => mainWindow,
+      offlineInventoryCacheCoordinator
     })
     const handler = electronMock.handlers.get(IPC_CHANNELS.hardwareGetStatus)
     if (handler === undefined) throw new Error('Hardware status handler was not registered.')
@@ -123,7 +126,8 @@ describe('authenticated hardware IPC boundary', () => {
       dispose,
       gateway,
       inventoryService,
-      transactionCoordinator
+      transactionCoordinator,
+      offlineInventoryCacheCoordinator
     }
   }
 
@@ -177,6 +181,18 @@ describe('authenticated hardware IPC boundary', () => {
         receipt: transactionReceipt,
         acknowledged: true
       })
+    }
+  }
+
+  function createOfflineInventoryCacheCoordinator(): OfflineInventoryCacheCoordinator {
+    return {
+      refresh: vi.fn().mockResolvedValue({
+        generation: `v1-${'a'.repeat(64)}`,
+        itemCount: 1,
+        alreadyCurrent: false
+      }),
+      refreshIfNeeded: vi.fn().mockResolvedValue(null),
+      markStale: vi.fn()
     }
   }
 
@@ -269,6 +285,30 @@ describe('authenticated hardware IPC boundary', () => {
     unconfigured.authSession.signIn('admin')
     await expect(unconfigured.heartbeat(unconfigured.trustedEvent)).resolves.toBe(false)
     unconfigured.dispose()
+  })
+
+  it('uses authenticated heartbeats to refresh once when needed and marks a failed link stale', async () => {
+    const gateway = createGateway()
+    const cacheCoordinator = createOfflineInventoryCacheCoordinator()
+    const { authSession, trustedEvent, heartbeat, dispose } = setup(
+      gateway,
+      createInventoryService(),
+      createTransactionCoordinator(),
+      cacheCoordinator
+    )
+    authSession.signIn('admin')
+
+    await expect(heartbeat(trustedEvent)).resolves.toBe(true)
+    await expect(heartbeat(trustedEvent)).resolves.toBe(true)
+    expect(cacheCoordinator.refreshIfNeeded).toHaveBeenCalledTimes(2)
+    expect(cacheCoordinator.refresh).not.toHaveBeenCalled()
+    expect(cacheCoordinator.markStale).not.toHaveBeenCalled()
+
+    vi.mocked(gateway.sendDesktopHeartbeat).mockRejectedValueOnce(new Error('link lost'))
+    await expect(heartbeat(trustedEvent)).resolves.toBe(false)
+    expect(cacheCoordinator.markStale).toHaveBeenCalledOnce()
+    expect(cacheCoordinator.refreshIfNeeded).toHaveBeenCalledTimes(2)
+    dispose()
   })
 
   it('delivers a scan without implicitly acknowledging it', async () => {
@@ -703,6 +743,123 @@ describe('authenticated hardware IPC boundary', () => {
       eventId: hardwareEvent.eventId,
       quantity: 2
     })
+  })
+
+  it('starts cache refresh only after the Phase 5 transaction coordinator settles', async () => {
+    const coordinator = createTransactionCoordinator()
+    const cacheCoordinator = createOfflineInventoryCacheCoordinator()
+    let finishTransaction!: () => void
+    vi.mocked(coordinator.processTransaction).mockImplementationOnce(
+      () => new Promise((resolve) => {
+        finishTransaction = () => resolve({
+          receipt: transactionReceipt,
+          acknowledged: true
+        })
+      })
+    )
+    const { authSession, trustedEvent, process } = setup(
+      createGateway(),
+      createInventoryService(),
+      coordinator,
+      cacheCoordinator
+    )
+    authSession.signIn('admin')
+
+    const pending = process(trustedEvent, {
+      eventId: hardwareEvent.eventId,
+      quantity: 2
+    })
+    await vi.waitFor(() => expect(coordinator.processTransaction).toHaveBeenCalledOnce())
+    expect(cacheCoordinator.refresh).not.toHaveBeenCalled()
+
+    finishTransaction()
+    await expect(pending).resolves.toEqual({
+      ok: true,
+      value: { receipt: transactionReceipt, acknowledged: true }
+    })
+    expect(cacheCoordinator.refresh).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a committed hardware outcome successful when cache delivery is rejected', async () => {
+    const cacheCoordinator = createOfflineInventoryCacheCoordinator()
+    vi.mocked(cacheCoordinator.refresh).mockRejectedValueOnce(
+      new Error('ESP32 cache unavailable')
+    )
+    const { authSession, trustedEvent, process } = setup(
+      createGateway(),
+      createInventoryService(),
+      createTransactionCoordinator(),
+      cacheCoordinator
+    )
+    authSession.signIn('admin')
+
+    await expect(process(trustedEvent, {
+      eventId: hardwareEvent.eventId,
+      quantity: 2
+    })).resolves.toEqual({
+      ok: true,
+      value: { receipt: transactionReceipt, acknowledged: true }
+    })
+    expect(cacheCoordinator.refresh).toHaveBeenCalledOnce()
+  })
+
+  it('refreshes after successful result and acknowledgement recovery', async () => {
+    const cacheCoordinator = createOfflineInventoryCacheCoordinator()
+    const coordinator = createTransactionCoordinator()
+    const { authSession, trustedEvent, retryResult, retryAck } = setup(
+      createGateway(),
+      createInventoryService(),
+      coordinator,
+      cacheCoordinator
+    )
+    authSession.signIn('admin')
+
+    await expect(retryResult(trustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
+      ok: true
+    })
+    const resultRecoveryOrder = vi.mocked(
+      coordinator.retryTransactionResultDelivery
+    ).mock.invocationCallOrder[0]
+    const resultRefreshOrder = vi.mocked(cacheCoordinator.refresh).mock.invocationCallOrder[0]
+    expect(resultRecoveryOrder).toBeLessThan(resultRefreshOrder as number)
+
+    await expect(retryAck(trustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
+      ok: true
+    })
+    const ackRecoveryOrder = vi.mocked(
+      coordinator.retryTransactionAcknowledgement
+    ).mock.invocationCallOrder[0]
+    const ackRefreshOrder = vi.mocked(cacheCoordinator.refresh).mock.invocationCallOrder[1]
+    expect(ackRecoveryOrder).toBeLessThan(ackRefreshOrder as number)
+    expect(cacheCoordinator.refresh).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not refresh after unauthorized, invalid, or failed hardware processing', async () => {
+    const cacheCoordinator = createOfflineInventoryCacheCoordinator()
+    const coordinator = createTransactionCoordinator()
+    const { authSession, trustedEvent, process } = setup(
+      createGateway(),
+      createInventoryService(),
+      coordinator,
+      cacheCoordinator
+    )
+
+    await expect(process(trustedEvent, {
+      eventId: hardwareEvent.eventId,
+      quantity: 2
+    })).resolves.toMatchObject({ ok: false, error: { code: 'UNAUTHORIZED' } })
+    authSession.signIn('admin')
+    await expect(process(trustedEvent, {
+      eventId: hardwareEvent.eventId,
+      quantity: 0
+    })).resolves.toMatchObject({ ok: false, error: { code: 'VALIDATION_ERROR' } })
+    vi.mocked(coordinator.processTransaction).mockRejectedValueOnce(new Error('transaction failed'))
+    await expect(process(trustedEvent, {
+      eventId: hardwareEvent.eventId,
+      quantity: 2
+    })).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } })
+
+    expect(cacheCoordinator.refresh).not.toHaveBeenCalled()
   })
 
   it('preserves DB-success/ACK-failure as a successful committed outcome', async () => {

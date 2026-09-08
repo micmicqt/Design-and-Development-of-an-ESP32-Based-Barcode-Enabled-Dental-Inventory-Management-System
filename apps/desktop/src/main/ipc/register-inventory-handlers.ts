@@ -7,6 +7,7 @@ import {
   type ProductRecord
 } from '../inventory'
 import { ProductImageError, type ProductImageStore } from '../images'
+import type { OfflineInventoryCacheCoordinator } from '../hardware/offline-inventory-cache'
 import {
   IPC_CHANNELS,
   type CreateProductInput,
@@ -35,6 +36,7 @@ export interface RegisterInventoryIpcHandlersOptions {
   imageStore: ProductImageStore
   authSession: AuthSessionController
   getMainWindow: MainWindowProvider
+  offlineInventoryCacheCoordinator?: OfflineInventoryCacheCoordinator | null
 }
 
 const unauthorizedError: IpcError = {
@@ -145,7 +147,25 @@ async function removeReplacedImage(
 export function registerInventoryIpcHandlers(
   options: RegisterInventoryIpcHandlersOptions
 ): () => void {
-  const { inventoryService, imageStore, authSession, getMainWindow } = options
+  const {
+    inventoryService,
+    imageStore,
+    authSession,
+    getMainWindow,
+    offlineInventoryCacheCoordinator = null
+  } = options
+
+  function refreshOfflineCacheAfterMutation(): void {
+    if (offlineInventoryCacheCoordinator === null) return
+    try {
+      void offlineInventoryCacheCoordinator.refresh().catch(() => {
+        // The desktop database is authoritative. A cache transport failure must
+        // never turn a successful inventory write into a failed UI operation.
+      })
+    } catch {
+      // A cache implementation failure must not escape into inventory IPC.
+    }
+  }
 
   ipcMain.handle(
     IPC_CHANNELS.productsFindByBarcode,
@@ -203,6 +223,7 @@ export function registerInventoryIpcHandlers(
           managedImagePath: storedImagePath
         })
         if (selectionToken !== null) imageStore.discardSelection(selectionToken)
+        refreshOfflineCacheAfterMutation()
         return ok(toProductDto(product, imageStore))
       } catch (error: unknown) {
         await compensateImageCopy(imageStore, storedImagePath)
@@ -242,6 +263,7 @@ export function registerInventoryIpcHandlers(
         if (selectionToken !== undefined || input.removeImage === true) {
           await removeReplacedImage(imageStore, previousProduct?.imagePath)
         }
+        refreshOfflineCacheAfterMutation()
         return ok(toProductDto(product, imageStore))
       } catch (error: unknown) {
         await compensateImageCopy(imageStore, storedImagePath)
@@ -259,6 +281,7 @@ export function registerInventoryIpcHandlers(
         const input = validateDeleteProductInput(rawInput)
         const deletedProduct = inventoryService.deleteProduct(input)
         await removeReplacedImage(imageStore, deletedProduct.imagePath)
+        refreshOfflineCacheAfterMutation()
         return ok({ deletedProductId: deletedProduct.id })
       } catch (error: unknown) {
         return sanitizedFailure(error)

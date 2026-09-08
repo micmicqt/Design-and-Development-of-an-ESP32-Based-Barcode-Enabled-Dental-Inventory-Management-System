@@ -1,6 +1,8 @@
 import type {
   HardwareTransactionEvent,
-  HardwareTransactionResult
+  HardwareTransactionResult,
+  InventoryCategory,
+  StockStatus
 } from '../../shared/ipc-contract'
 
 /**
@@ -27,6 +29,10 @@ export interface Esp32StatusResponse {
   sd: boolean
   /** Optional for compatibility with Phase 5 firmware. */
   desktopOnline?: boolean
+  /** Optional for compatibility with firmware predating the offline cache. */
+  offlineCacheAvailable?: boolean
+  offlineCacheGeneration?: string | null
+  offlineCacheItems?: number
 }
 
 /** Narrow status boundary implemented during Phase 4 Step 2. */
@@ -42,6 +48,43 @@ export interface HardwareTransactionEventGateway extends HardwareStatusGateway {
   deliverTransactionResult(result: HardwareTransactionResult): Promise<void>
   acknowledgeTransactionEvent(eventId: string): Promise<void>
 }
+
+export const OFFLINE_CACHE_GENERATION_PATTERN = /^v1-[0-9a-f]{64}$/
+
+/** One authoritative active-product row sent in a bounded HTTP request. */
+export interface OfflineInventoryCacheProduct {
+  /** SQLite product IDs are serialized as decimal text for embedded portability. */
+  id: string
+  barcode: string
+  name: string
+  category: InventoryCategory
+  currentStock: number
+  lowStockThreshold: number
+  status: StockStatus
+}
+
+export interface OfflineInventoryCacheSnapshot {
+  generation: string
+  products: readonly OfflineInventoryCacheProduct[]
+}
+
+export interface OfflineInventoryCacheInstallResult {
+  generation: string
+  itemCount: number
+  alreadyCurrent: boolean
+}
+
+/** Bounded, sequential transport for atomically installing a MicroSD cache. */
+export interface OfflineInventoryCacheGateway {
+  installOfflineInventoryCache(
+    snapshot: OfflineInventoryCacheSnapshot
+  ): Promise<OfflineInventoryCacheInstallResult>
+}
+
+/** Production desktop boundary. Transaction and cache APIs stay backend-only. */
+export interface DesktopHardwareGateway
+  extends HardwareTransactionEventGateway,
+    OfflineInventoryCacheGateway {}
 
 export function isValidHardwareTransactionEventId(value: unknown): value is string {
   return (

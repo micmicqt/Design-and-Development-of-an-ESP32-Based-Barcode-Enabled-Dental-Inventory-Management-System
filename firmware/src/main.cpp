@@ -13,6 +13,7 @@
 
 #include "desktop_presence_lease.h"
 #include "hardware_config.h"
+#include "offline_inventory_cache.h"
 #include "protocol_config.h"
 #include "secrets.h"
 #include "transaction_event_queue.h"
@@ -49,6 +50,11 @@ using dental::events::StockStatus;
 using dental::events::TransactionResult;
 using dental::events::TransactionResultQueue;
 using dental::events::appendJsonString;
+using dental::cache::BeginResult;
+using dental::cache::CacheOperation;
+using dental::cache::CacheRequest;
+using dental::cache::CommitResult;
+using dental::cache::ItemResult;
 constexpr char kWiFiSsidPlaceholder[] = "replace-with-local-wifi-ssid";
 constexpr char kWiFiPasswordPlaceholder[] =
     "replace-with-local-wifi-password";
@@ -134,6 +140,94 @@ WebServer httpServer(kHttpServerPort);
 bool lcdAvailable = false;
 bool rtcAvailable = false;
 bool microSdAvailable = false;
+
+class SdCacheStorage : public dental::cache::CacheStorage {
+ public:
+  bool available() const override { return microSdAvailable; }
+
+  bool exists(const char* path) override { return SD.exists(path); }
+
+  bool remove(const char* path) override { return SD.remove(path); }
+
+  bool rename(const char* from, const char* to) override {
+    return SD.rename(from, to);
+  }
+
+  bool writeFile(const char* path, const char* data, size_t length) override {
+    File file = SD.open(path, FILE_WRITE);
+    if (!file || file.isDirectory()) {
+      if (file) file.close();
+      return false;
+    }
+    const size_t written = file.write(
+        reinterpret_cast<const uint8_t*>(data), length);
+    file.flush();
+    file.close();
+    return written == length;
+  }
+
+  bool appendFile(const char* path, const char* data, size_t length) override {
+    File file = SD.open(path, FILE_APPEND);
+    if (!file || file.isDirectory()) {
+      if (file) file.close();
+      return false;
+    }
+    const size_t written = file.write(
+        reinterpret_cast<const uint8_t*>(data), length);
+    file.flush();
+    file.close();
+    return written == length;
+  }
+
+  bool beginRead(const char* path) override {
+    endRead();
+    readFile_ = SD.open(path, FILE_READ);
+    if (!readFile_ || readFile_.isDirectory()) {
+      endRead();
+      return false;
+    }
+    return true;
+  }
+
+  dental::cache::ReadLineResult readLine(char* line,
+                                          size_t capacity) override {
+    if (!readFile_ || capacity == 0U) {
+      return dental::cache::ReadLineResult::kError;
+    }
+    if (!readFile_.available()) {
+      line[0] = '\0';
+      return dental::cache::ReadLineResult::kEnd;
+    }
+
+    size_t written = 0U;
+    bool tooLong = false;
+    while (readFile_.available()) {
+      const int input = readFile_.read();
+      if (input < 0) return dental::cache::ReadLineResult::kError;
+      const char value = static_cast<char>(input);
+      if (value == '\n') break;
+      if (value == '\r') continue;
+      if (written + 1U >= capacity) {
+        tooLong = true;
+        continue;
+      }
+      line[written++] = value;
+    }
+    line[written] = '\0';
+    return tooLong ? dental::cache::ReadLineResult::kTooLong
+                   : dental::cache::ReadLineResult::kLine;
+  }
+
+  void endRead() override {
+    if (readFile_) readFile_.close();
+  }
+
+ private:
+  File readFile_;
+};
+
+SdCacheStorage cacheStorage;
+dental::cache::OfflineInventoryCache offlineInventoryCache(cacheStorage);
 
 struct DebouncedButtonState {
   const TransactionProfile* transaction;
@@ -298,7 +392,7 @@ void handleHealthRequest() {
 
 void handleStatusRequest() {
   String response;
-  response.reserve(160U);
+  response.reserve(300U);
   response =
       "{\"device\":\"dental-inventory-esp32\",\"online\":true,\"mode\":\"";
   response += currentHttpMode();
@@ -308,6 +402,18 @@ void handleStatusRequest() {
   response += microSdAvailable ? "true" : "false";
   response += ",\"desktopOnline\":";
   response += desktopPresence.desktopAvailable() ? "true" : "false";
+  const dental::cache::CacheMetadata& cacheMetadata =
+      offlineInventoryCache.metadata();
+  response += ",\"offlineCacheAvailable\":";
+  response += cacheMetadata.available ? "true" : "false";
+  response += ",\"offlineCacheGeneration\":";
+  if (cacheMetadata.available) {
+    appendJsonString(response, cacheMetadata.generation);
+  } else {
+    response += "null";
+  }
+  response += ",\"offlineCacheItems\":";
+  response += cacheMetadata.available ? String(cacheMetadata.itemCount) : "0";
   response += '}';
 
   httpServer.send(200, "application/json", response);
@@ -316,6 +422,130 @@ void handleStatusRequest() {
 void handleDesktopHeartbeatRequest() {
   desktopPresence.recordHeartbeat(millis());
   httpServer.send(200, "application/json", "{\"desktopOnline\":true}");
+}
+
+const char* cacheOperationName(CacheOperation operation) {
+  switch (operation) {
+    case CacheOperation::kBegin: return "begin";
+    case CacheOperation::kItem: return "item";
+    case CacheOperation::kCommit: return "commit";
+  }
+  return "";
+}
+
+void sendCacheError(int statusCode, const char* errorCode) {
+  String response = "{\"accepted\":false,\"error\":";
+  appendJsonString(response, errorCode);
+  response += '}';
+  httpServer.send(statusCode, "application/json", response);
+}
+
+void sendCacheSuccess(const CacheRequest& request, uint32_t receivedItems,
+                      bool alreadyCurrent) {
+  String response;
+  response.reserve(220U);
+  response = "{\"accepted\":true,\"operation\":";
+  appendJsonString(response, cacheOperationName(request.operation));
+  response += ",\"generation\":";
+  appendJsonString(response, request.generation);
+  response += ",\"receivedItems\":";
+  response += String(receivedItems);
+  response += ",\"alreadyCurrent\":";
+  response += alreadyCurrent ? "true" : "false";
+  response += '}';
+  httpServer.send(200, "application/json", response);
+}
+
+void handleOfflineCacheRequest() {
+  const String body = httpServer.arg("plain");
+  CacheRequest request = {};
+  if (!dental::cache::parseCacheRequest(body.c_str(), body.length(), request)) {
+    sendCacheError(400, "invalid_request");
+    return;
+  }
+  if (!microSdAvailable) {
+    sendCacheError(503, "storage_unavailable");
+    return;
+  }
+
+  if (request.operation == CacheOperation::kBegin) {
+    const BeginResult result = offlineInventoryCache.begin(
+        request.generation, request.itemCount);
+    if (result == BeginResult::kStorageUnavailable) {
+      sendCacheError(503, "storage_unavailable");
+      return;
+    }
+    if (result == BeginResult::kWriteFailed) {
+      sendCacheError(500, "cache_write_failed");
+      return;
+    }
+    const bool alreadyCurrent = result == BeginResult::kAlreadyCurrent;
+    sendCacheSuccess(request, offlineInventoryCache.receivedItems(),
+                     alreadyCurrent);
+    return;
+  }
+
+  if (request.operation == CacheOperation::kItem) {
+    const ItemResult result = offlineInventoryCache.item(
+        request.generation, request.index, request.product);
+    if (result == ItemResult::kNoTransfer) {
+      sendCacheError(409, "no_active_transfer");
+      return;
+    }
+    if (result == ItemResult::kGenerationMismatch) {
+      sendCacheError(409, "generation_mismatch");
+      return;
+    }
+    if (result == ItemResult::kUnexpectedIndex) {
+      sendCacheError(409, "unexpected_index");
+      return;
+    }
+    if (result == ItemResult::kConflictingItem) {
+      sendCacheError(409, "conflicting_item");
+      return;
+    }
+    if (result == ItemResult::kWriteFailed) {
+      sendCacheError(500, "cache_write_failed");
+      return;
+    }
+    sendCacheSuccess(request, offlineInventoryCache.receivedItems(), false);
+    return;
+  }
+
+  const CommitResult result = offlineInventoryCache.commit(
+      request.generation, request.itemCount);
+  if (result == CommitResult::kStorageUnavailable) {
+    sendCacheError(503, "storage_unavailable");
+    return;
+  }
+  if (result == CommitResult::kNoTransfer) {
+    sendCacheError(409, "no_active_transfer");
+    return;
+  }
+  if (result == CommitResult::kGenerationMismatch) {
+    sendCacheError(409, "generation_mismatch");
+    return;
+  }
+  if (result == CommitResult::kCountMismatch) {
+    sendCacheError(409, "item_count_mismatch");
+    return;
+  }
+  if (result == CommitResult::kValidationFailed) {
+    sendCacheError(422, "cache_validation_failed");
+    return;
+  }
+  if (result == CommitResult::kReplacementFailed) {
+    sendCacheError(500, "cache_replacement_failed");
+    return;
+  }
+  const bool alreadyCurrent = result == CommitResult::kAlreadyCurrent;
+  sendCacheSuccess(request, request.itemCount, alreadyCurrent);
+  if (!alreadyCurrent) {
+    Serial.print("Offline inventory cache installed: ");
+    Serial.print(request.generation);
+    Serial.print(" / items: ");
+    Serial.println(request.itemCount);
+  }
 }
 
 void handleNextEventRequest() {
@@ -435,6 +665,7 @@ void configureHttpRoutes() {
   httpServer.on("/status", HTTP_GET, handleStatusRequest);
   httpServer.on("/desktop/heartbeat", HTTP_POST,
                 handleDesktopHeartbeatRequest);
+  httpServer.on("/offline/cache", HTTP_POST, handleOfflineCacheRequest);
   httpServer.on("/events/next", HTTP_GET, handleNextEventRequest);
   httpServer.on("/events/ack", HTTP_POST,
                 handleEventAcknowledgementRequest);
@@ -1146,6 +1377,16 @@ void setup() {
     Serial.println("MicroSD workflow storage: UNAVAILABLE");
   } else {
     Serial.println("MicroSD workflow storage: READY");
+    if (offlineInventoryCache.loadAtBoot()) {
+      const dental::cache::CacheMetadata& cacheMetadata =
+          offlineInventoryCache.metadata();
+      Serial.print("Offline inventory cache: READY - generation ");
+      Serial.print(cacheMetadata.generation);
+      Serial.print(" / items: ");
+      Serial.println(cacheMetadata.itemCount);
+    } else {
+      Serial.println("Offline inventory cache: no valid cache installed");
+    }
   }
 
   scannerSerial.begin(kScannerBaud, SERIAL_8N1,

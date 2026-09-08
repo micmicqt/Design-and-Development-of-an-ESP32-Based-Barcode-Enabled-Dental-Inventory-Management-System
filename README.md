@@ -1,6 +1,6 @@
 # Dental Inventory System
 
-Phase 6 Step 1 implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+Phase 6 Step 2A implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
 
 This repository currently provides:
 
@@ -12,13 +12,16 @@ This repository currently provides:
 - shared, versioned TypeScript protocol types and JSON Schema validation;
 - a local-network ESP32 `HardwareGateway` with status, FIFO scan delivery, result feedback, and acknowledgement;
 - atomic online RESTOCK/CHECKOUT persistence with durable event and delivery-state idempotency; and
-- the verified ESP32 PlatformIO hardware integration from Phases 3 and 4; and
-- a renewable desktop-presence heartbeat that is separate from Wi-Fi connectivity.
+- the verified ESP32 PlatformIO hardware integration from Phases 3 and 4;
+- a renewable desktop-presence heartbeat that is separate from Wi-Fi connectivity; and
+- a bounded, durable MicroSD snapshot of authoritative active inventory.
 
-Committed online results now drive the kiosk LCD plus SUCCESS and stock-status
-indicators before the ESP32 event is acknowledged. Offline operation and
-synchronization remain outside this step. Manual barcode entry remains available
-for item registration; physical scans use the hardware event path.
+Committed online results drive the kiosk LCD plus SUCCESS and stock-status
+indicators before the ESP32 event is acknowledged. The ESP32 now retains a
+last-known active-inventory cache, but offline stock mutation, pending sync,
+reconciliation, and synchronization remain outside this step. Manual barcode
+entry remains available for item registration; physical scans use the hardware
+event path.
 
 ## Repository layout
 
@@ -123,6 +126,15 @@ React communicates only through narrow authentication, inventory, and hardware-s
 
 ### Local ESP32 status connection
 
+Phase 6 Step 2A builds an active-product snapshot from authoritative SQLite data
+and installs it on MicroSD through bounded `begin` → one-item → `commit`
+requests. Refreshes occur after initial authenticated availability and inventory
+changes, not on every heartbeat. Temporary-file validation and backup recovery
+preserve the previous valid cache after an incomplete or failed replacement.
+This adds no offline transaction or synchronization behavior. The firmware HTTP
+route is trusted-local-LAN only and must not be exposed to the public Internet.
+See [the offline inventory-cache guide](docs/phase6-step2a-offline-inventory-cache.md).
+
 Phase 6 Step 1 adds an authenticated, backend-only desktop heartbeat. While the
 authenticated application shell is active, Electron immediately posts to the
 fixed `/desktop/heartbeat` route and renews it about every four seconds. The
@@ -153,7 +165,11 @@ For local development, copy `apps/desktop/.env.example` to `apps/desktop/.env.lo
 DENTAL_ESP32_BASE_URL=http://192.168.1.100
 ```
 
-The local file is ignored by Git because the address can change with DHCP. Electron main—not React—uses this URL to call the ESP32 `/health` and `/status` endpoints. Status requests time out after 2.5 seconds and appear as **Offline** without interrupting inventory features. No Wi-Fi credential or device token is stored in the desktop configuration.
+The local file is ignored by Git because the address can change with DHCP.
+Electron main—not React—uses this URL only through the fixed status, presence,
+event, and cache routes. Status requests time out after 2.5 seconds and appear as
+**Offline** without interrupting inventory features. No Wi-Fi credential or
+device token is stored in the desktop configuration.
 
 ## Product images
 
