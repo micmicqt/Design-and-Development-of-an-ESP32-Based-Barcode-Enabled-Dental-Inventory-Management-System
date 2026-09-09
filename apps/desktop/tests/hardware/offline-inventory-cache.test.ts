@@ -10,6 +10,7 @@ import {
   buildOfflineInventoryCacheSnapshot,
   createOfflineInventoryCacheCoordinator
 } from '../../src/main/hardware/offline-inventory-cache'
+import { HardwareGatewayError } from '../../src/main/hardware/esp32-http-gateway'
 import { createInventoryService } from '../../src/main/inventory'
 
 function createGateway() {
@@ -181,7 +182,7 @@ describe('offline inventory cache coordinator', () => {
     }
   })
 
-  it('keeps a failed refresh harmless and suppresses four-second heartbeat retries', async () => {
+  it('keeps a pending-journal rejection harmless and suppresses four-second heartbeat retries', async () => {
     const database = initializeDatabase({ databasePath: ':memory:' })
     const inventory = createInventoryService(database)
     inventory.createProduct({
@@ -194,7 +195,9 @@ describe('offline inventory cache coordinator', () => {
     const gateway = createGateway()
     let currentTime = 1_000
     vi.mocked(gateway.installOfflineInventoryCache)
-      .mockRejectedValueOnce(new Error('ESP32 unavailable'))
+      .mockRejectedValueOnce(
+        new HardwareGatewayError('REJECTED', 'Pending offline transactions preserve the cache.')
+      )
     const coordinator = createOfflineInventoryCacheCoordinator({
       inventoryService: inventory,
       gateway,
@@ -203,7 +206,7 @@ describe('offline inventory cache coordinator', () => {
     })
 
     try {
-      await expect(coordinator.refreshIfNeeded()).rejects.toThrow('ESP32 unavailable')
+      await expect(coordinator.refreshIfNeeded()).rejects.toMatchObject({ code: 'REJECTED' })
       expect(inventory.findProductByBarcode('0099')).toMatchObject({ currentStock: 9 })
       expect(inventory.listMovementHistory()).toHaveLength(0)
 

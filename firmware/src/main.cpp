@@ -14,6 +14,7 @@
 #include "desktop_presence_lease.h"
 #include "hardware_config.h"
 #include "offline_inventory_cache.h"
+#include "offline_pending_journal.h"
 #include "protocol_config.h"
 #include "secrets.h"
 #include "transaction_event_queue.h"
@@ -226,8 +227,111 @@ class SdCacheStorage : public dental::cache::CacheStorage {
   File readFile_;
 };
 
+class SdPendingJournalStorage
+    : public dental::offline::PendingJournalStorage {
+ public:
+  bool available() const override { return microSdAvailable; }
+
+  bool exists(const char* path) override { return SD.exists(path); }
+
+  bool remove(const char* path) override { return SD.remove(path); }
+
+  bool rename(const char* from, const char* to) override {
+    return SD.rename(from, to);
+  }
+
+  bool writeFile(const char* path, const char* data, size_t length) override {
+    File file = SD.open(path, FILE_WRITE);
+    if (!file || file.isDirectory()) {
+      if (file) file.close();
+      return false;
+    }
+    const size_t written =
+        file.write(reinterpret_cast<const uint8_t*>(data), length);
+    file.flush();
+    file.close();
+    return written == length;
+  }
+
+  bool appendFile(const char* path, const char* data, size_t length) override {
+    File file = SD.open(path, FILE_APPEND);
+    if (!file || file.isDirectory()) {
+      if (file) file.close();
+      return false;
+    }
+    const size_t written =
+        file.write(reinterpret_cast<const uint8_t*>(data), length);
+    file.flush();
+    file.close();
+    return written == length;
+  }
+
+  bool beginRead(const char* path) override {
+    endRead();
+    readFile_ = SD.open(path, FILE_READ);
+    if (!readFile_ || readFile_.isDirectory()) {
+      endRead();
+      return false;
+    }
+    return true;
+  }
+
+  dental::offline::JournalReadLineResult readLine(
+      char* line, size_t capacity) override {
+    using dental::offline::JournalReadLineResult;
+    if (!readFile_ || capacity == 0U) {
+      return JournalReadLineResult::kError;
+    }
+    if (!readFile_.available()) {
+      line[0] = '\0';
+      return JournalReadLineResult::kEnd;
+    }
+
+    size_t written = 0U;
+    bool tooLong = false;
+    bool terminated = false;
+    while (readFile_.available()) {
+      const int input = readFile_.read();
+      if (input < 0) return JournalReadLineResult::kError;
+      const char value = static_cast<char>(input);
+      if (value == '\n') {
+        terminated = true;
+        break;
+      }
+      if (value == '\r') continue;
+      if (written + 1U >= capacity) {
+        tooLong = true;
+        continue;
+      }
+      line[written++] = value;
+    }
+    line[written] = '\0';
+    if (tooLong) {
+      return terminated ? JournalReadLineResult::kTooLongTerminated
+                        : JournalReadLineResult::kTooLongUnterminated;
+    }
+    return terminated ? JournalReadLineResult::kTerminatedLine
+                      : JournalReadLineResult::kUnterminatedLine;
+  }
+
+  void endRead() override {
+    if (readFile_) readFile_.close();
+  }
+
+ private:
+  File readFile_;
+};
+
 SdCacheStorage cacheStorage;
 dental::cache::OfflineInventoryCache offlineInventoryCache(cacheStorage);
+SdPendingJournalStorage pendingJournalStorage;
+dental::offline::OfflineCacheLookup offlineCacheLookup(cacheStorage);
+dental::offline::PendingJournal offlinePendingJournal(pendingJournalStorage);
+// These bounded records are reused by the single-threaded transaction state
+// machine. Keeping them in static storage prevents maximum-size desktop fields
+// from exhausting the Arduino loop task stack during nested SD validation.
+dental::cache::CacheProduct offlineProductBuffer = {};
+dental::offline::OfflineJournalRecord offlineCommittedRecordBuffer = {};
 
 struct DebouncedButtonState {
   const TransactionProfile* transaction;
@@ -246,6 +350,11 @@ uint32_t workflowStateStartedMs = 0UL;
 bool feedbackIndicatorIsOn = false;
 const TransactionProfile* activeTransaction = nullptr;
 bool buttonsMustBeReleased = false;
+dental::offline::TransactionRoute activeTransactionRoute =
+    dental::offline::TransactionRoute::kOnline;
+bool transactionRouteCaptured = false;
+char capturedCacheGeneration[dental::cache::kGenerationCapacity] = {};
+uint32_t capturedCacheItemCount = 0U;
 
 WiFiConnectionState wiFiConnectionState = WiFiConnectionState::kDisabled;
 uint32_t wiFiStateStartedMs = 0UL;
@@ -257,6 +366,7 @@ dental::presence::DesktopPresenceLease desktopPresence(
 dental::events::PendingEventQueue pendingEvents;
 uint64_t nextEventSequence = 1ULL;
 char bootSessionIdentifier[40U] = {};
+char offlineDeviceIdentifier[dental::offline::kDeviceIdentifierCapacity] = {};
 
 TransactionResultQueue committedResultFeedbacks;
 TransactionResult activeCommittedResultFeedback =
@@ -270,6 +380,15 @@ uint32_t lastBarcodeByteMs = 0UL;
 
 void setStockStatusIndicator(StockStatus status);
 void startNextCommittedResultFeedback(uint32_t nowMs);
+
+StockStatus toEventStockStatus(dental::cache::StockStatus status) {
+  switch (status) {
+    case dental::cache::StockStatus::kHigh: return StockStatus::kHigh;
+    case dental::cache::StockStatus::kLow: return StockStatus::kLow;
+    case dental::cache::StockStatus::kEmpty: return StockStatus::kEmpty;
+  }
+  return StockStatus::kEmpty;
+}
 
 void writePaddedLcdLine(uint8_t row, const String& text) {
   if (!lcdAvailable) {
@@ -315,8 +434,34 @@ const char* currentHttpMode() {
   return "busy";
 }
 
+bool offlineTransactionIsActive() {
+  return activeTransaction != nullptr &&
+         activeTransactionRoute == dental::offline::TransactionRoute::kOffline;
+}
+
+bool offlineOperationIsReady() {
+  const dental::cache::CacheMetadata& cacheMetadata =
+      offlineInventoryCache.metadata();
+  return lcdAvailable && rtcAvailable && microSdAvailable &&
+         cacheMetadata.available &&
+         offlinePendingJournal.compatibleWith(cacheMetadata);
+}
+
+bool requestIsInstalledCacheNoOp(const CacheRequest& request) {
+  const dental::cache::CacheMetadata& cacheMetadata =
+      offlineInventoryCache.metadata();
+  return request.operation == CacheOperation::kBegin &&
+         cacheMetadata.available &&
+         request.itemCount == cacheMetadata.itemCount &&
+         strcmp(request.generation, cacheMetadata.generation) == 0;
+}
+
 void initializeEventSession() {
   const uint64_t chipIdentifier = ESP.getEfuseMac();
+  if (!dental::offline::formatDeviceIdentifier(chipIdentifier,
+                                                offlineDeviceIdentifier)) {
+    offlineDeviceIdentifier[0] = '\0';
+  }
   // setup calls this before peripherals/Wi-Fi start. Enable true hardware
   // entropy while RF is off, then disable it before any normal initialization.
   bootloader_random_enable();
@@ -332,6 +477,12 @@ void initializeEventSession() {
   nextEventSequence = 1ULL;
   Serial.print("Hardware event boot session: ");
   Serial.println(bootSessionIdentifier);
+  if (offlineDeviceIdentifier[0] != '\0') {
+    Serial.print("Offline journal device identifier: ");
+    Serial.println(offlineDeviceIdentifier);
+  } else {
+    Serial.println("Offline journal device identifier: UNAVAILABLE");
+  }
 }
 
 const PendingTransactionEvent* oldestPendingEvent() {
@@ -392,7 +543,7 @@ void handleHealthRequest() {
 
 void handleStatusRequest() {
   String response;
-  response.reserve(300U);
+  response.reserve(384U);
   response =
       "{\"device\":\"dental-inventory-esp32\",\"online\":true,\"mode\":\"";
   response += currentHttpMode();
@@ -414,6 +565,14 @@ void handleStatusRequest() {
   }
   response += ",\"offlineCacheItems\":";
   response += cacheMetadata.available ? String(cacheMetadata.itemCount) : "0";
+  const dental::offline::PendingJournalMetadata& journalMetadata =
+      offlinePendingJournal.metadata();
+  if (journalMetadata.available && !offlinePendingJournal.uncertain()) {
+    response += ",\"pendingSyncItems\":";
+    response += String(journalMetadata.pendingCount);
+    response += ",\"offlineReady\":";
+    response += offlineOperationIsReady() ? "true" : "false";
+  }
   response += '}';
 
   httpServer.send(200, "application/json", response);
@@ -465,6 +624,20 @@ void handleOfflineCacheRequest() {
   }
   if (!microSdAvailable) {
     sendCacheError(503, "storage_unavailable");
+    return;
+  }
+
+  // An identical begin request is a true no-op and retains Step 2A retry
+  // semantics. Any operation that could replace or advance a cache transfer is
+  // interlocked while an offline scan is using the installed generation or
+  // while pending/uncertain journal data still refers to that generation.
+  const bool installedNoOp = requestIsInstalledCacheNoOp(request);
+  if (offlineTransactionIsActive() && !installedNoOp) {
+    sendCacheError(409, "offline_transaction_active");
+    return;
+  }
+  if (offlinePendingJournal.blocksCacheReplacement() && !installedNoOp) {
+    sendCacheError(409, "pending_sync_interlock");
     return;
   }
 
@@ -924,6 +1097,40 @@ void beginSuccessFeedback(const char* timestamp, const String& barcode) {
   resetScannerWorkflowBuffers();
 }
 
+void beginOfflineSuccessFeedback(
+    const dental::offline::OfflineJournalRecord& record) {
+  char stockLine[32U] = {};
+  snprintf(stockLine, sizeof(stockLine), "Stock: %llu",
+           static_cast<unsigned long long>(record.resultingStock));
+  String statusLine = "Status: ";
+  statusLine += dental::cache::stockStatusName(record.resultingStatus);
+
+  Serial.print("OFFLINE ");
+  Serial.print(activeTransaction->action);
+  Serial.println(" EVENT SAVED");
+  Serial.print("Event ID: ");
+  Serial.println(record.eventId);
+  Serial.print("Timestamp: ");
+  Serial.println(record.timestamp);
+  Serial.print("Barcode: ");
+  Serial.println(record.barcode);
+  Serial.println(activeTransaction->serialQuantity);
+  Serial.print("Resulting stock: ");
+  Serial.println(static_cast<unsigned long long>(record.resultingStock));
+  Serial.print("Status: ");
+  Serial.println(dental::cache::stockStatusName(record.resultingStatus));
+
+  String title = "OFFLINE ";
+  title += activeTransaction->action;
+  showLcdScreen(title, activeTransaction->lcdQuantity, stockLine, statusLine);
+  setStockStatusIndicator(toEventStockStatus(record.resultingStatus));
+  setSuccessIndicator();
+  feedbackIndicatorIsOn = true;
+  workflowState = WorkflowState::kShowingFeedback;
+  workflowStateStartedMs = millis();
+  resetScannerWorkflowBuffers();
+}
+
 bool ensureIntegrationTestFile() {
   if (SD.exists(kIntegrationTestPath)) {
     File existingFile = SD.open(kIntegrationTestPath, FILE_READ);
@@ -1045,6 +1252,114 @@ bool barcodeContainsVisibleCharacter(const String& barcode) {
   return false;
 }
 
+void completeOfflineBarcode(const char* timestamp) {
+  const dental::cache::CacheMetadata& cacheMetadata =
+      offlineInventoryCache.metadata();
+  if (!transactionRouteCaptured || !cacheMetadata.available ||
+      cacheMetadata.itemCount != capturedCacheItemCount ||
+      strcmp(cacheMetadata.generation, capturedCacheGeneration) != 0) {
+    beginErrorFeedback("Offline cache generation changed", "Cache changed");
+    return;
+  }
+
+  offlineProductBuffer = dental::cache::CacheProduct{};
+  dental::cache::CacheProduct& product = offlineProductBuffer;
+  const dental::offline::CacheLookupResult lookupResult =
+      offlineCacheLookup.find(cacheMetadata, barcodeBuffer.c_str(), product);
+  if (lookupResult == dental::offline::CacheLookupResult::kNotFound) {
+    beginErrorFeedback("Offline barcode not found", "ITEM NOT FOUND");
+    return;
+  }
+  if (lookupResult ==
+      dental::offline::CacheLookupResult::kStorageUnavailable) {
+    beginErrorFeedback("Offline cache storage unavailable", "SD unavailable");
+    return;
+  }
+  if (lookupResult ==
+      dental::offline::CacheLookupResult::kCacheUnavailable) {
+    beginErrorFeedback("Offline inventory cache unavailable",
+                       "Cache unavailable");
+    return;
+  }
+  if (lookupResult != dental::offline::CacheLookupResult::kFound) {
+    beginErrorFeedback("Offline inventory cache validation failed",
+                       "Cache invalid");
+    return;
+  }
+
+  uint64_t currentStock = 0ULL;
+  const dental::offline::OverlayResult overlayResult =
+      offlinePendingJournal.deriveCurrentStock(
+          product, capturedCacheGeneration, currentStock);
+  if (overlayResult == dental::offline::OverlayResult::kGenerationMismatch) {
+    beginErrorFeedback("Pending journal cache generation mismatch",
+                       "Cache mismatch");
+    return;
+  }
+  if (overlayResult == dental::offline::OverlayResult::kStockInvalid) {
+    beginErrorFeedback("Pending journal stock chain is invalid",
+                       "Journal invalid");
+    return;
+  }
+  if (overlayResult != dental::offline::OverlayResult::kSuccess) {
+    beginErrorFeedback("Pending offline journal unavailable",
+                       "Journal unavailable");
+    return;
+  }
+
+  const dental::offline::OfflineAction action =
+      activeTransaction == &kRestockTransaction
+          ? dental::offline::OfflineAction::kRestock
+          : dental::offline::OfflineAction::kCheckout;
+  uint64_t resultingStock = currentStock;
+  dental::cache::StockStatus resultingStatus =
+      dental::offline::deriveStockStatus(currentStock,
+                                         product.lowStockThreshold);
+  const dental::offline::OfflineStockResult stockResult =
+      dental::offline::calculateOfflineStock(
+          action, currentStock, product.lowStockThreshold, resultingStock,
+          resultingStatus);
+  if (stockResult == dental::offline::OfflineStockResult::kOutOfStock) {
+    beginErrorFeedback("Offline checkout rejected: no stock available",
+                       "OUT OF STOCK");
+    return;
+  }
+  if (stockResult == dental::offline::OfflineStockResult::kOverflow) {
+    beginErrorFeedback("Offline restock rejected: stock limit reached",
+                       "Stock limit reached");
+    return;
+  }
+  if (stockResult != dental::offline::OfflineStockResult::kSuccess) {
+    beginErrorFeedback("Offline stock calculation failed", "Stock invalid");
+    return;
+  }
+
+  offlineCommittedRecordBuffer = dental::offline::OfflineJournalRecord{};
+  dental::offline::OfflineJournalRecord& committedRecord =
+      offlineCommittedRecordBuffer;
+  const dental::offline::JournalAppendResult appendResult =
+      offlinePendingJournal.append(
+          action, timestamp, product, capturedCacheGeneration,
+          resultingStock, resultingStatus, committedRecord);
+  if (appendResult == dental::offline::JournalAppendResult::kFull) {
+    beginErrorFeedback("Pending offline journal is full", "Journal full");
+    return;
+  }
+  if (appendResult ==
+      dental::offline::JournalAppendResult::kGenerationMismatch) {
+    beginErrorFeedback("Pending journal cache generation mismatch",
+                       "Cache mismatch");
+    return;
+  }
+  if (appendResult != dental::offline::JournalAppendResult::kCommitted) {
+    beginErrorFeedback("Offline transaction was not durably saved",
+                       "SD save failed");
+    return;
+  }
+
+  beginOfflineSuccessFeedback(committedRecord);
+}
+
 void completeBarcode() {
   if (activeTransaction == nullptr) {
     beginErrorFeedback("No transaction action selected", "Mode unavailable");
@@ -1061,6 +1376,12 @@ void completeBarcode() {
   if (!readRtcTimestamp(timestamp, sizeof(timestamp))) {
     beginErrorFeedback(activeTransaction->rtcReadFailure,
                        "RTC read failed");
+    return;
+  }
+
+  if (transactionRouteCaptured &&
+      activeTransactionRoute == dental::offline::TransactionRoute::kOffline) {
+    completeOfflineBarcode(timestamp);
     return;
   }
 
@@ -1147,8 +1468,32 @@ void serviceScanner(uint32_t nowMs) {
 
 void beginTransactionWorkflow(const TransactionProfile& transaction) {
   activeTransaction = &transaction;
+  const uint32_t acceptedAtMs = millis();
+  const bool networkConnected = WiFi.status() == WL_CONNECTED;
+  desktopPresence.setNetworkConnected(networkConnected);
+  desktopPresence.service(acceptedAtMs);
+  activeTransactionRoute = dental::offline::selectTransactionRoute(
+      desktopPresence.desktopAvailable());
+  transactionRouteCaptured = true;
+  capturedCacheGeneration[0] = '\0';
+  capturedCacheItemCount = 0U;
+  if (activeTransactionRoute ==
+      dental::offline::TransactionRoute::kOffline) {
+    const dental::cache::CacheMetadata& cacheMetadata =
+        offlineInventoryCache.metadata();
+    if (cacheMetadata.available) {
+      snprintf(capturedCacheGeneration, sizeof(capturedCacheGeneration), "%s",
+               cacheMetadata.generation);
+      capturedCacheItemCount = cacheMetadata.itemCount;
+    }
+  }
   Serial.print(activeTransaction->action);
   Serial.println(" button pressed");
+  Serial.print("Transaction route captured: ");
+  Serial.println(activeTransactionRoute ==
+                         dental::offline::TransactionRoute::kOnline
+                     ? "ONLINE"
+                     : "OFFLINE");
   showLcdScreen(activeTransaction->modeTitle, "Scanner starting...",
                 "Scan barcode", "Please wait");
 
@@ -1164,6 +1509,26 @@ void beginTransactionWorkflow(const TransactionProfile& transaction) {
   if (!microSdAvailable) {
     beginErrorFeedback("MicroSD is unavailable; event was not started",
                        "SD unavailable");
+    return;
+  }
+  if (activeTransactionRoute ==
+          dental::offline::TransactionRoute::kOffline &&
+      !offlineOperationIsReady()) {
+    if (!offlineInventoryCache.metadata().available) {
+      beginErrorFeedback("Offline inventory cache is unavailable",
+                         "Cache unavailable");
+    } else if (offlinePendingJournal.metadata().available &&
+               offlinePendingJournal.metadata().pendingCount >=
+                   dental::offline::kMaximumPendingRecords) {
+      beginErrorFeedback("Pending offline journal is full", "Journal full");
+    } else if (!offlinePendingJournal.metadata().available ||
+               offlinePendingJournal.uncertain()) {
+      beginErrorFeedback("Pending offline journal is unavailable",
+                         "Journal unavailable");
+    } else {
+      beginErrorFeedback("Offline cache and journal are incompatible",
+                         "Cache mismatch");
+    }
     return;
   }
 
@@ -1307,6 +1672,10 @@ void serviceWorkflowTimeouts(uint32_t nowMs) {
       drainScannerInput();
       resetScannerWorkflowBuffers();
       activeTransaction = nullptr;
+      transactionRouteCaptured = false;
+      activeTransactionRoute = dental::offline::TransactionRoute::kOnline;
+      capturedCacheGeneration[0] = '\0';
+      capturedCacheItemCount = 0U;
       workflowState = WorkflowState::kIdle;
       if (committedResultFeedbacks.size() > 0U) {
         startNextCommittedResultFeedback(nowMs);
@@ -1386,6 +1755,31 @@ void setup() {
       Serial.println(cacheMetadata.itemCount);
     } else {
       Serial.println("Offline inventory cache: no valid cache installed");
+    }
+
+    const dental::offline::JournalLoadResult journalLoadResult =
+        offlinePendingJournal.loadOrCreate(offlineDeviceIdentifier);
+    if (journalLoadResult == dental::offline::JournalLoadResult::kReady ||
+        journalLoadResult ==
+            dental::offline::JournalLoadResult::kRecoveredTornTail) {
+      const dental::offline::PendingJournalMetadata& journalMetadata =
+          offlinePendingJournal.metadata();
+      Serial.print("Pending offline journal: READY - items: ");
+      Serial.println(journalMetadata.pendingCount);
+      if (journalLoadResult ==
+          dental::offline::JournalLoadResult::kRecoveredTornTail) {
+        Serial.println(
+            "Pending offline journal: recovered incomplete final record");
+      }
+    } else if (journalLoadResult ==
+               dental::offline::JournalLoadResult::kWriteFailed) {
+      Serial.println("Pending offline journal: FAILED - create/write error");
+    } else if (journalLoadResult ==
+               dental::offline::JournalLoadResult::kStorageUnavailable) {
+      Serial.println("Pending offline journal: FAILED - storage unavailable");
+    } else {
+      Serial.println(
+          "Pending offline journal: FAILED - integrity/recovery error");
     }
   }
 

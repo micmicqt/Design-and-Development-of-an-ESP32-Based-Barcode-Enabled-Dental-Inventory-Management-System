@@ -33,6 +33,9 @@ export interface Esp32StatusResponse {
   offlineCacheAvailable?: boolean
   offlineCacheGeneration?: string | null
   offlineCacheItems?: number
+  /** Optional for compatibility with firmware predating offline journaling. */
+  pendingSyncItems?: number
+  offlineReady?: boolean
 }
 
 /** Narrow status boundary implemented during Phase 4 Step 2. */

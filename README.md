@@ -1,6 +1,6 @@
 # Dental Inventory System
 
-Phase 6 Step 2A implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+Phase 6 Step 2B implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
 
 This repository currently provides:
 
@@ -11,17 +11,20 @@ This repository currently provides:
 - SQLite migrations and one preconfigured-administrator credential slot;
 - shared, versioned TypeScript protocol types and JSON Schema validation;
 - a local-network ESP32 `HardwareGateway` with status, FIFO scan delivery, result feedback, and acknowledgement;
-- atomic online RESTOCK/CHECKOUT persistence with durable event and delivery-state idempotency; and
+- atomic online RESTOCK/CHECKOUT persistence with durable event and delivery-state idempotency;
 - the verified ESP32 PlatformIO hardware integration from Phases 3 and 4;
-- a renewable desktop-presence heartbeat that is separate from Wi-Fi connectivity; and
-- a bounded, durable MicroSD snapshot of authoritative active inventory.
+- a renewable desktop-presence heartbeat that is separate from Wi-Fi connectivity;
+- a bounded, durable MicroSD snapshot of authoritative active inventory; and
+- fixed-quantity offline RESTOCK/CHECKOUT with a durable pending journal.
 
 Committed online results drive the kiosk LCD plus SUCCESS and stock-status
-indicators before the ESP32 event is acknowledged. The ESP32 now retains a
-last-known active-inventory cache, but offline stock mutation, pending sync,
-reconciliation, and synchronization remain outside this step. Manual barcode
-entry remains available for item registration; physical scans use the hardware
-event path.
+indicators before the ESP32 event is acknowledged. When the authenticated
+desktop-presence lease is unavailable, the ESP32 can instead apply one-unit
+RESTOCK/CHECKOUT operations against its last-known inventory snapshot and append
+them to a durable pending journal. Importing, reconciling, or clearing those
+records remains deferred to Phase 7. Manual barcode entry remains available for
+item registration; physical scans use the hardware path selected when each
+transaction begins.
 
 ## Repository layout
 
@@ -125,6 +128,16 @@ Then:
 React communicates only through narrow authentication, inventory, and hardware-status methods exposed by the preload. It cannot access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
 
 ### Local ESP32 status connection
+
+Phase 6 Step 2B freezes each accepted scan as either ONLINE or OFFLINE based on
+the desktop-presence lease. The existing online FIFO and quantity workflow are
+unchanged. Offline scans use exact barcode text, derive stock from the immutable
+`/inventory_cache.csv` snapshot plus prior valid `/pending_sync.csv` deltas, and
+append one durable `+1` RESTOCK or `-1` CHECKOUT record without touching SQLite.
+Firmware blocks cache-generation replacement while pending rows exist, and
+`/status` can report `pendingSyncItems` and `offlineReady` without breaking
+older desktop clients. Phase 7 synchronization is not part of this step. See
+[the offline transaction guide](docs/phase6-step2b-offline-transactions.md).
 
 Phase 6 Step 2A builds an active-product snapshot from authoritative SQLite data
 and installs it on MicroSD through bounded `begin` → one-item → `commit`

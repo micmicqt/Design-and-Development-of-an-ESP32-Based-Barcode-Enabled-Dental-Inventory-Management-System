@@ -196,6 +196,61 @@ describe('ESP32 HTTP hardware gateway', () => {
     await expect(gateway.getStatus()).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
   })
 
+  it('accepts bounded optional offline-journal status while preserving older firmware', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        device: 'dental-inventory-esp32',
+        online: true,
+        mode: 'idle',
+        rtc: true,
+        sd: true
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        device: 'dental-inventory-esp32',
+        online: true,
+        mode: 'idle',
+        rtc: true,
+        sd: true,
+        offlineCacheAvailable: true,
+        offlineCacheGeneration: cacheGeneration,
+        offlineCacheItems: 2,
+        pendingSyncItems: 10_000,
+        offlineReady: true
+      }))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.getStatus()).resolves.not.toHaveProperty('pendingSyncItems')
+    await expect(gateway.getStatus()).resolves.toMatchObject({
+      pendingSyncItems: 10_000,
+      offlineReady: true
+    })
+  })
+
+  it.each([
+    { pendingSyncItems: 3 },
+    { offlineReady: true },
+    { pendingSyncItems: -1 },
+    { pendingSyncItems: 1.5 },
+    { pendingSyncItems: 10_001 },
+    { pendingSyncItems: '3' },
+    { pendingSyncItems: null },
+    { offlineReady: 'yes' },
+    { offlineReady: 1 },
+    { offlineReady: null }
+  ])('rejects malformed optional offline-journal status %#', async (metadata) => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse({
+      device: 'dental-inventory-esp32',
+      online: true,
+      mode: 'idle',
+      rtc: true,
+      sd: true,
+      ...metadata
+    }))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.getStatus()).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+  })
+
   it('posts a desktop heartbeat through only the fixed endpoint', async () => {
     const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
       jsonResponse({ desktopOnline: true })
@@ -367,6 +422,17 @@ describe('ESP32 HTTP hardware gateway', () => {
       generation: cacheGeneration,
       products: cacheProducts
     })).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it('reports a pending-offline-journal cache interlock as a retryable rejection', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse({}, 409))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: cacheProducts
+    })).rejects.toMatchObject({ code: 'REJECTED' })
     expect(fetcher).toHaveBeenCalledOnce()
   })
 

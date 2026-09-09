@@ -209,6 +209,15 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
       (value.offlineCacheAvailable
         ? typeof value.offlineCacheGeneration === 'string'
         : value.offlineCacheGeneration === null && value.offlineCacheItems === 0))
+  const hasAnyOfflineJournalMetadata =
+    isRecord(value) && ('pendingSyncItems' in value || 'offlineReady' in value)
+  const hasValidOfflineJournalMetadata =
+    !hasAnyOfflineJournalMetadata ||
+    (isRecord(value) &&
+      Number.isSafeInteger(value.pendingSyncItems) &&
+      (value.pendingSyncItems as number) >= 0 &&
+      (value.pendingSyncItems as number) <= MAX_OFFLINE_CACHE_ITEMS &&
+      typeof value.offlineReady === 'boolean')
 
   if (
     !isRecord(value) ||
@@ -219,7 +228,8 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
     typeof value.rtc !== 'boolean' ||
     typeof value.sd !== 'boolean' ||
     (value.desktopOnline !== undefined && typeof value.desktopOnline !== 'boolean') ||
-    !hasValidCacheMetadata
+    !hasValidCacheMetadata ||
+    !hasValidOfflineJournalMetadata
   ) {
     throw new HardwareGatewayError('INVALID_RESPONSE', 'The ESP32 status response is invalid.')
   }
@@ -239,6 +249,12 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
     status.offlineCacheAvailable = value.offlineCacheAvailable
     status.offlineCacheGeneration = value.offlineCacheGeneration as string | null
     status.offlineCacheItems = value.offlineCacheItems as number
+  }
+  if (typeof value.pendingSyncItems === 'number') {
+    status.pendingSyncItems = value.pendingSyncItems
+  }
+  if (typeof value.offlineReady === 'boolean') {
+    status.offlineReady = value.offlineReady
   }
   return status
 }

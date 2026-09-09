@@ -143,7 +143,9 @@ describe('authenticated hardware IPC boundary', () => {
         online: true,
         mode: 'restock',
         rtc: true,
-        sd: true
+        sd: true,
+        pendingSyncItems: 4,
+        offlineReady: true
       }),
       sendDesktopHeartbeat: vi.fn().mockResolvedValue(undefined),
       getNextTransactionEvent: vi.fn().mockResolvedValue(hardwareEvent),
@@ -780,10 +782,10 @@ describe('authenticated hardware IPC boundary', () => {
     expect(cacheCoordinator.refresh).toHaveBeenCalledOnce()
   })
 
-  it('keeps a committed hardware outcome successful when cache delivery is rejected', async () => {
+  it('keeps a committed hardware outcome successful when pending records defer cache refresh', async () => {
     const cacheCoordinator = createOfflineInventoryCacheCoordinator()
     vi.mocked(cacheCoordinator.refresh).mockRejectedValueOnce(
-      new Error('ESP32 cache unavailable')
+      new Error('ESP32 has pending offline records')
     )
     const { authSession, trustedEvent, process } = setup(
       createGateway(),

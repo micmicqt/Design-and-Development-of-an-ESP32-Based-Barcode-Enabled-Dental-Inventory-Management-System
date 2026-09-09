@@ -448,10 +448,10 @@ describe('authenticated inventory IPC boundary', () => {
     expect(offlineInventoryCacheCoordinator.refresh).toHaveBeenCalledTimes(3)
   })
 
-  it('keeps a successful inventory mutation successful when cache delivery is rejected', async () => {
+  it('keeps a successful inventory mutation successful when pending records defer cache refresh', async () => {
     authSession.signIn('admin')
     vi.mocked(offlineInventoryCacheCoordinator.refresh).mockRejectedValueOnce(
-      new Error('ESP32 cache unavailable')
+      new Error('ESP32 has pending offline records')
     )
 
     await expect(handler(IPC_CHANNELS.productsCreate)(trustedEvent, {
