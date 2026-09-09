@@ -1,6 +1,6 @@
 # Dental Inventory System
 
-Phase 6 Step 2B implementation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+Phase 6 offline operation and power-loss recovery for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
 
 This repository currently provides:
 
@@ -15,7 +15,8 @@ This repository currently provides:
 - the verified ESP32 PlatformIO hardware integration from Phases 3 and 4;
 - a renewable desktop-presence heartbeat that is separate from Wi-Fi connectivity;
 - a bounded, durable MicroSD snapshot of authoritative active inventory; and
-- fixed-quantity offline RESTOCK/CHECKOUT with a durable pending journal.
+- fixed-quantity offline RESTOCK/CHECKOUT with a durable pending journal that
+  has been physically verified across ESP32 reset and complete power loss.
 
 Committed online results drive the kiosk LCD plus SUCCESS and stock-status
 indicators before the ESP32 event is acknowledged. When the authenticated
@@ -138,6 +139,11 @@ Firmware blocks cache-generation replacement while pending rows exist, and
 `/status` can report `pendingSyncItems` and `offlineReady` without breaking
 older desktop clients. Phase 7 synchronization is not part of this step. See
 [the offline transaction guide](docs/phase6-step2b-offline-transactions.md).
+
+Phase 6 Step 3 physically verified that the cache, journal count, effective
+stock, and monotonic offline event sequence recover after both EN/RESET and a
+complete power cycle. See
+[the power-loss recovery record](docs/phase6-step3-power-loss-recovery.md).
 
 Phase 6 Step 2A builds an active-product snapshot from authoritative SQLite data
 and installs it on MicroSD through bounded `begin` → one-item → `commit`
