@@ -9,6 +9,7 @@ import type {
   HardwareTransactionReceipt,
   InventoryCategory,
   MovementHistoryDto,
+  OfflinePendingEvent,
   ProductDto,
   ProductListQuery
 } from '../../shared/ipc-contract'
@@ -97,6 +98,7 @@ function createDesktopApi({
         sd: null
       }),
       getNextTransactionEvent: vi.fn().mockResolvedValue(null),
+      getNextOfflineEvent: vi.fn().mockResolvedValue({ ok: true, value: null }),
       acknowledgeTransactionEvent: vi.fn().mockResolvedValue({
         ok: false,
         error: { code: 'INTERNAL_ERROR', message: 'Not configured for this test.' }
@@ -1610,7 +1612,7 @@ describe('Phase 2 desktop application', () => {
     }
   })
 
-  it('uses Any Time Dental shell branding and clinic-facing inactive sync guidance', async () => {
+  it('uses Any Time Dental shell branding and clearly labels the read-only sync preview', async () => {
     const user = userEvent.setup()
     installDesktopApi(createDesktopApi())
 
@@ -1627,17 +1629,95 @@ describe('Phase 2 desktop application', () => {
 
     await user.click(screen.getByRole('tab', { name: 'SYNC OFFLINE' }))
     expect(
-      screen.getByRole('heading', { name: 'Offline synchronization is waiting for the kiosk' })
+      screen.getByRole('heading', { name: 'No pending transaction is available.' })
     ).toBeVisible()
     expect(
       screen.getByText(
-        'Offline synchronization will become available when the inventory kiosk is connected.'
+        'Synchronization has not been executed. No record has been applied to SQLite, acknowledged, or removed from the ESP32.'
       )
     ).toBeVisible()
 
     expect(screen.queryByText(/Phase 2/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Hardware disabled/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Not implemented in this phase/i)).not.toBeInTheDocument()
+  })
+
+  it('shows the oldest pending offline event without exposing mutation controls', async () => {
+    const user = userEvent.setup()
+    const event: OfflinePendingEvent = {
+      eventId: 'off-A1B2C3D4E5F6-0000000000000001',
+      timestamp: '2026-09-09 09:08:07',
+      productId: '42',
+      barcode: '000012340005',
+      action: 'RESTOCK',
+      delta: 1,
+      resultingStock: 4,
+      stockStatus: 'LOW',
+      cacheGeneration: `v1-${'a'.repeat(64)}`
+    }
+    const getNextOfflineEvent = vi.fn().mockResolvedValue({ ok: true, value: event })
+    installDesktopApi(
+      createDesktopApi({
+        hardware: {
+          getStatus: vi.fn().mockResolvedValue({
+            connection: 'CONNECTED',
+            device: 'dental-inventory-esp32',
+            mode: 'idle',
+            rtc: true,
+            sd: true,
+            pendingSyncItems: 6,
+            offlineReady: true
+          }),
+          getNextOfflineEvent
+        }
+      })
+    )
+
+    render(<App />)
+    await user.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
+
+    const preview = await screen.findByRole('region', {
+      name: 'Offline sync transport preview'
+    })
+    expect(getNextOfflineEvent).toHaveBeenCalledOnce()
+    expect(within(preview).getByText('6')).toBeVisible()
+    expect(within(preview).getByText('Ready')).toBeVisible()
+    expect(within(preview).getByRole('heading', { name: event.eventId })).toBeVisible()
+    expect(within(preview).getByText(event.timestamp)).toBeVisible()
+    expect(within(preview).getByText(event.productId)).toBeVisible()
+    expect(within(preview).getByText('000012340005')).toBeVisible()
+    expect(within(preview).getByText('RESTOCK')).toBeVisible()
+    expect(within(preview).getByText('+1')).toBeVisible()
+    expect(within(preview).getByText('4')).toBeVisible()
+    expect(within(preview).getByText('LOW')).toBeVisible()
+    expect(within(preview).getByText(event.cacheGeneration)).toBeVisible()
+    expect(within(preview).getByText('Still pending')).toBeVisible()
+    expect(
+      within(preview).queryByRole('button', { name: /apply|acknowledge|delete|synchronize/i })
+    ).not.toBeInTheDocument()
+  })
+
+  it('reports a retryable pending-preview failure without implying any record changed', async () => {
+    const user = userEvent.setup()
+    installDesktopApi(
+      createDesktopApi({
+        hardware: {
+          getNextOfflineEvent: vi.fn().mockResolvedValue({
+            ok: false,
+            error: { code: 'INTERNAL_ERROR', message: 'ESP32 unavailable' }
+          })
+        }
+      })
+    )
+
+    render(<App />)
+    await user.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Pending transaction preview is unavailable.')
+    expect(alert).toHaveTextContent(
+      'The request is safe to retry after reconnecting. No pending record was changed.'
+    )
   })
 
   it('renders database products, image fallbacks, and all stock statuses', async () => {

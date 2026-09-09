@@ -83,6 +83,56 @@ describe('preload hardware API', () => {
     await expect(api.hardware.getNextTransactionEvent()).resolves.toBeNull()
   })
 
+  it('exposes parameter-free offline retrieval on one fixed IPC channel', async () => {
+    const event = {
+      eventId: 'off-20500DE58C14-0000000000000001',
+      timestamp: '2026-09-04 08:30:00',
+      productId: '7',
+      barcode: '0000000000000123',
+      action: 'CHECKOUT',
+      delta: -1,
+      resultingStock: 2,
+      stockStatus: 'LOW',
+      cacheGeneration: `v1-${'a'.repeat(64)}`
+    } as const
+    const result = { ok: true, value: event } as const
+    electronMock.invoke.mockResolvedValueOnce(result)
+
+    await expect(api.hardware.getNextOfflineEvent()).resolves.toEqual(result)
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareGetNextOfflineEvent
+    )
+
+    electronMock.invoke.mockClear()
+    electronMock.invoke.mockResolvedValueOnce({ ok: true, value: null })
+    const callWithUnexpectedArguments = api.hardware.getNextOfflineEvent as (
+      url: unknown,
+      method: unknown,
+      payload: unknown
+    ) => Promise<unknown>
+    await callWithUnexpectedArguments(
+      'http://untrusted.example/offline/events/next',
+      'DELETE',
+      { eventId: event.eventId }
+    )
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareGetNextOfflineEvent
+    )
+  })
+
+  it('passes offline retrieval failures through without fabricating an empty journal', async () => {
+    const result = {
+      ok: false,
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: 'Unable to read pending offline transactions. Check the ESP32 and retry.'
+      }
+    } as const
+    electronMock.invoke.mockResolvedValueOnce(result)
+
+    await expect(api.hardware.getNextOfflineEvent()).resolves.toEqual(result)
+  })
+
   it('forwards only the event ID to the fixed acknowledgement channel', async () => {
     const result = { ok: true, value: { eventId: 'device-session-1' } }
     electronMock.invoke.mockResolvedValueOnce(result)
@@ -159,6 +209,7 @@ describe('preload hardware API', () => {
     expect(Object.isFrozen(api.hardware)).toBe(true)
     expect(Object.keys(api.hardware).sort()).toEqual([
       'acknowledgeTransactionEvent',
+      'getNextOfflineEvent',
       'getNextTransactionEvent',
       'getStatus',
       'getTransactionReceipt',

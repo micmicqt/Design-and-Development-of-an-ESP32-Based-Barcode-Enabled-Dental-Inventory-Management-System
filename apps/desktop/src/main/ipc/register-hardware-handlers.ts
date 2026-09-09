@@ -1,6 +1,9 @@
 import { ipcMain, type IpcMainInvokeEvent } from 'electron'
 import type { AuthSessionController } from '../application/auth-session'
-import type { HardwareTransactionEventGateway } from '../hardware/hardware-gateway'
+import type {
+  HardwareTransactionEventGateway,
+  OfflinePendingEventGateway
+} from '../hardware/hardware-gateway'
 import type { OfflineInventoryCacheCoordinator } from '../hardware/offline-inventory-cache'
 import {
   HardwareTransactionCoordinatorError,
@@ -14,7 +17,8 @@ import {
   type HardwareTransactionOutcome,
   type HardwareTransactionReceipt,
   type IpcError,
-  type IpcResult
+  type IpcResult,
+  type OfflinePendingEvent
 } from '../../shared/ipc-contract'
 import { isTrustedMainFrame, type MainWindowProvider } from './ipc-security'
 import {
@@ -24,7 +28,7 @@ import {
 } from './payload-validation'
 
 export interface RegisterHardwareIpcHandlersOptions {
-  gateway: HardwareTransactionEventGateway | null
+  gateway: (HardwareTransactionEventGateway & OfflinePendingEventGateway) | null
   inventoryService: InventoryService
   transactionCoordinator: HardwareTransactionCoordinator
   authSession: AuthSessionController
@@ -154,7 +158,11 @@ export function registerHardwareIpcHandlers(
           device: status.device,
           mode: status.mode,
           rtc: status.rtc,
-          sd: status.sd
+          sd: status.sd,
+          ...(status.pendingSyncItems === undefined
+            ? {}
+            : { pendingSyncItems: status.pendingSyncItems }),
+          ...(status.offlineReady === undefined ? {} : { offlineReady: status.offlineReady })
         }
       } catch {
         return offlineStatus()
@@ -178,6 +186,25 @@ export function registerHardwareIpcHandlers(
         // Presence is a renewable lease. A later heartbeat will recover
         // automatically, while this failure remains harmless to inventory work.
         return false
+      }
+    }
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.hardwareGetNextOfflineEvent,
+    async (event): Promise<IpcResult<OfflinePendingEvent | null>> => {
+      if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
+
+      try {
+        if (gateway === null) throw new Error('Hardware is not configured.')
+        return ok(await gateway.getNextOfflineEvent())
+      } catch {
+        // Retrieval is non-destructive. A later request can safely retry either
+        // a transport failure or a response rejected by the gateway validator.
+        return failure({
+          code: 'INTERNAL_ERROR',
+          message: 'Unable to read pending offline transactions. Check the ESP32 and retry.'
+        })
       }
     }
   )
@@ -376,6 +403,7 @@ export function registerHardwareIpcHandlers(
   return () => {
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetStatus)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareSendDesktopHeartbeat)
+    ipcMain.removeHandler(IPC_CHANNELS.hardwareGetNextOfflineEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetTransactionReceipt)

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "offline_inventory_cache.h"
+#include "transaction_event_queue.h"
 
 namespace dental {
 namespace offline {
@@ -231,6 +232,49 @@ struct PendingJournalMetadata {
   bool recoveredTornTail;
 };
 
+enum class JournalPeekResult : uint8_t {
+  kFound,
+  kEmpty,
+  kJournalUnavailable,
+  kInvalidJournal,
+};
+
+// Produces the exact Step 7.1 wire representation from a record that has
+// already passed the journal's bounded integrity scan. Keeping this serializer
+// shared with host tests protects exact text fields (especially barcodes) and
+// uses the same strict JSON escaping as the existing online event endpoint.
+template <typename Text>
+void appendPendingEventJson(Text& destination,
+                            const OfflineJournalRecord& record) {
+  destination += "{\"eventId\":";
+  events::appendJsonString(destination, record.eventId);
+  destination += ",\"timestamp\":";
+  events::appendJsonString(destination, record.timestamp);
+  destination += ",\"productId\":";
+  events::appendJsonString(destination, record.productId);
+  destination += ",\"barcode\":";
+  events::appendJsonString(destination, record.barcode);
+  destination += ",\"action\":";
+  events::appendJsonString(destination, actionName(record.action));
+
+  char delta[4U] = {};
+  snprintf(delta, sizeof(delta), "%d", static_cast<int>(record.delta));
+  destination += ",\"delta\":";
+  destination += delta;
+
+  char resultingStock[24U] = {};
+  snprintf(resultingStock, sizeof(resultingStock), "%llu",
+           static_cast<unsigned long long>(record.resultingStock));
+  destination += ",\"resultingStock\":";
+  destination += resultingStock;
+  destination += ",\"stockStatus\":";
+  events::appendJsonString(destination,
+                           cache::stockStatusName(record.resultingStatus));
+  destination += ",\"cacheGeneration\":";
+  events::appendJsonString(destination, record.cacheGeneration);
+  destination += '}';
+}
+
 enum class CacheLookupResult : uint8_t {
   kFound,
   kNotFound,
@@ -430,6 +474,38 @@ class PendingJournal {
            (metadata_.pendingCount == 0U ||
             strcmp(metadata_.cacheGeneration,
                    cacheMetadata.generation) == 0);
+  }
+
+  // Reads only one logical record into RAM but validates the complete active
+  // journal before publishing it. This deliberately does not repair, rewrite,
+  // acknowledge, archive, or advance the journal, so retries and reboots keep
+  // returning the same oldest durable synchronization identity.
+  JournalPeekResult peekOldest(OfflineJournalRecord& record) {
+    memset(&record, 0, sizeof(record));
+    if (uncertain_) return JournalPeekResult::kInvalidJournal;
+    if (!metadata_.available || !storage_.available()) {
+      return JournalPeekResult::kJournalUnavailable;
+    }
+
+    ScanState state = {};
+    const ScanResult result =
+        scan(kPendingJournalPath, nullptr, nullptr, state, &record);
+    if (result == ScanResult::kUnavailable) {
+      memset(&record, 0, sizeof(record));
+      return JournalPeekResult::kJournalUnavailable;
+    }
+    if (result != ScanResult::kValid ||
+        state.pendingCount != metadata_.pendingCount ||
+        state.maximumSequence != metadata_.maximumSequence ||
+        strcmp(state.cacheGeneration, metadata_.cacheGeneration) != 0) {
+      memset(&record, 0, sizeof(record));
+      return JournalPeekResult::kInvalidJournal;
+    }
+    if (state.pendingCount == 0U) {
+      memset(&record, 0, sizeof(record));
+      return JournalPeekResult::kEmpty;
+    }
+    return JournalPeekResult::kFound;
   }
 
   JournalLoadResult loadOrCreate(const char* deviceIdentifier) {
@@ -867,7 +943,8 @@ class PendingJournal {
   }
 
   ScanResult scan(const char* path, const cache::CacheProduct* target,
-                  const char* expectedGeneration, ScanState& state) {
+                  const char* expectedGeneration, ScanState& state,
+                  OfflineJournalRecord* oldestRecord = nullptr) {
     state = ScanState{};
     if (target != nullptr) state.currentStock = target->currentStock;
     if (!storage_.available() || !storage_.beginRead(path)) {
@@ -908,6 +985,9 @@ class PendingJournal {
           scanRecord_.sequence != previousSequence + 1ULL) {
         storage_.endRead();
         return ScanResult::kInvalid;
+      }
+      if (state.pendingCount == 0U && oldestRecord != nullptr) {
+        *oldestRecord = scanRecord_;
       }
       previousSequence = scanRecord_.sequence;
       if (state.pendingCount == 0U) {

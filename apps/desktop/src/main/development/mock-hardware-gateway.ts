@@ -1,4 +1,7 @@
-import type { HardwareTransactionEvent } from '../../shared/ipc-contract'
+import type {
+  HardwareTransactionEvent,
+  OfflinePendingEvent
+} from '../../shared/ipc-contract'
 import type { HardwareTransactionResult } from '../../shared/ipc-contract'
 import type {
   CacheProduct,
@@ -25,6 +28,7 @@ export class MockHardwareGateway implements HardwareGateway {
     (request: HardwareTransactionRequest) => void
   >()
   private offlineTransactions: OfflineTransactionRecord[] = []
+  private offlinePendingEvents: OfflinePendingEvent[] = []
   private transactionEvents: HardwareTransactionEvent[] = []
 
   constructor() {
@@ -76,6 +80,12 @@ export class MockHardwareGateway implements HardwareGateway {
   async getNextTransactionEvent(): Promise<HardwareTransactionEvent | null> {
     this.assertConnected()
     const event = this.transactionEvents[0]
+    return event === undefined ? null : { ...event }
+  }
+
+  async getNextOfflineEvent(): Promise<OfflinePendingEvent | null> {
+    this.assertConnected()
+    const event = this.offlinePendingEvents[0]
     return event === undefined ? null : { ...event }
   }
 
@@ -134,6 +144,10 @@ export class MockHardwareGateway implements HardwareGateway {
 
   setOfflineTransactionsForTest(records: readonly OfflineTransactionRecord[]): void {
     this.offlineTransactions = records.map((record) => ({ ...record }))
+  }
+
+  setOfflinePendingEventsForTest(events: readonly OfflinePendingEvent[]): void {
+    this.offlinePendingEvents = events.map((event) => ({ ...event }))
   }
 
   private assertConnected(): void {

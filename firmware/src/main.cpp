@@ -332,6 +332,7 @@ dental::offline::PendingJournal offlinePendingJournal(pendingJournalStorage);
 // from exhausting the Arduino loop task stack during nested SD validation.
 dental::cache::CacheProduct offlineProductBuffer = {};
 dental::offline::OfflineJournalRecord offlineCommittedRecordBuffer = {};
+dental::offline::OfflineJournalRecord offlinePendingReadBuffer = {};
 
 struct DebouncedButtonState {
   const TransactionProfile* transaction;
@@ -731,6 +732,35 @@ void handleNextEventRequest() {
   httpServer.send(200, "application/json", serializePendingEvent(*event));
 }
 
+void sendOfflinePendingReadError(int statusCode, const char* errorCode) {
+  String response = "{\"error\":";
+  appendJsonString(response, errorCode);
+  response += '}';
+  httpServer.send(statusCode, "application/json", response);
+}
+
+void handleNextOfflineEventRequest() {
+  const dental::offline::JournalPeekResult result =
+      offlinePendingJournal.peekOldest(offlinePendingReadBuffer);
+  if (result == dental::offline::JournalPeekResult::kEmpty) {
+    httpServer.send(204, "application/json", "");
+    return;
+  }
+  if (result == dental::offline::JournalPeekResult::kJournalUnavailable) {
+    sendOfflinePendingReadError(503, "pending_journal_unavailable");
+    return;
+  }
+  if (result != dental::offline::JournalPeekResult::kFound) {
+    sendOfflinePendingReadError(500, "pending_journal_invalid");
+    return;
+  }
+
+  String response;
+  response.reserve(1024U);
+  dental::offline::appendPendingEventJson(response, offlinePendingReadBuffer);
+  httpServer.send(200, "application/json", response);
+}
+
 void sendAcknowledgementError(int statusCode, const char* errorCode) {
   String response = "{\"acknowledged\":false,\"error\":";
   appendJsonString(response, errorCode);
@@ -839,6 +869,8 @@ void configureHttpRoutes() {
   httpServer.on("/desktop/heartbeat", HTTP_POST,
                 handleDesktopHeartbeatRequest);
   httpServer.on("/offline/cache", HTTP_POST, handleOfflineCacheRequest);
+  httpServer.on("/offline/events/next", HTTP_GET,
+                handleNextOfflineEventRequest);
   httpServer.on("/events/next", HTTP_GET, handleNextEventRequest);
   httpServer.on("/events/ack", HTTP_POST,
                 handleEventAcknowledgementRequest);

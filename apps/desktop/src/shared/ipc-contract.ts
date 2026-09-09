@@ -31,6 +31,7 @@ export const IPC_CHANNELS = {
   movementHistoryList: 'movement-history:list',
   hardwareGetStatus: 'hardware:get-status',
   hardwareSendDesktopHeartbeat: 'hardware:send-desktop-heartbeat',
+  hardwareGetNextOfflineEvent: 'hardware:get-next-offline-event',
   hardwareGetNextTransactionEvent: 'hardware:get-next-transaction-event',
   hardwareAcknowledgeTransactionEvent: 'hardware:acknowledge-transaction-event',
   hardwareGetTransactionReceipt: 'hardware:get-transaction-receipt',
@@ -49,6 +50,9 @@ export interface HardwareStatusDto {
   mode: HardwareMode | null
   rtc: boolean | null
   sd: boolean | null
+  /** Omitted when connected firmware predates durable offline journaling. */
+  pendingSyncItems?: number
+  offlineReady?: boolean
 }
 
 export type HardwareTransactionMode = 'restock' | 'checkout'
@@ -58,6 +62,22 @@ export interface HardwareTransactionEvent {
   mode: HardwareTransactionMode
   barcode: string
   timestamp: string
+}
+
+export type OfflinePendingAction = 'RESTOCK' | 'CHECKOUT'
+
+/** Read-only view of the oldest durable ESP32 offline journal record. */
+export interface OfflinePendingEvent {
+  eventId: string
+  timestamp: string
+  /** Stable SQLite identity is kept as decimal text across the embedded boundary. */
+  productId: string
+  barcode: string
+  action: OfflinePendingAction
+  delta: 1 | -1
+  resultingStock: number
+  stockStatus: StockStatus
+  cacheGeneration: string
 }
 
 /** Durable snapshot of a committed online transaction, not live product stock. */
@@ -222,6 +242,8 @@ export interface DesktopApi {
     getStatus: () => Promise<HardwareStatusDto>
     /** Refreshes the ESP32 desktop-presence lease through a fixed backend route. */
     sendDesktopHeartbeat: () => Promise<boolean>
+    /** Retrieves without retiring the oldest durable offline event. */
+    getNextOfflineEvent: () => Promise<IpcResult<OfflinePendingEvent | null>>
     getNextTransactionEvent: () => Promise<HardwareTransactionEvent | null>
     acknowledgeTransactionEvent: (
       eventId: string

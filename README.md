@@ -1,6 +1,6 @@
 # Dental Inventory System
 
-Phase 6 offline operation and power-loss recovery for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+Phase 7 bounded offline sync transport for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
 
 This repository currently provides:
 
@@ -14,16 +14,19 @@ This repository currently provides:
 - atomic online RESTOCK/CHECKOUT persistence with durable event and delivery-state idempotency;
 - the verified ESP32 PlatformIO hardware integration from Phases 3 and 4;
 - a renewable desktop-presence heartbeat that is separate from Wi-Fi connectivity;
-- a bounded, durable MicroSD snapshot of authoritative active inventory; and
+- a bounded, durable MicroSD snapshot of authoritative active inventory;
 - fixed-quantity offline RESTOCK/CHECKOUT with a durable pending journal that
-  has been physically verified across ESP32 reset and complete power loss.
+  has been physically verified across ESP32 reset and complete power loss; and
+- bounded, oldest-first inspection of one pending offline record without
+  applying, acknowledging, or removing it.
 
 Committed online results drive the kiosk LCD plus SUCCESS and stock-status
 indicators before the ESP32 event is acknowledged. When the authenticated
 desktop-presence lease is unavailable, the ESP32 can instead apply one-unit
 RESTOCK/CHECKOUT operations against its last-known inventory snapshot and append
-them to a durable pending journal. Importing, reconciling, or clearing those
-records remains deferred to Phase 7. Manual barcode entry remains available for
+them to a durable pending journal. Step 7.1 can retrieve the oldest record for
+inspection, while importing, reconciling, or clearing records remains deferred
+to later Phase 7 steps. Manual barcode entry remains available for
 item registration; physical scans use the hardware path selected when each
 transaction begins.
 
@@ -123,12 +126,20 @@ Then:
 2. Invalid credentials display exactly `Access Denied`.
 3. Use **ADD NEW ITEM** to register a product. Barcode text retains leading zeroes, the category must be one of the six fixed choices, and stock values must be non-negative integers.
 4. Use **ITEM INVENTORY** to search by name or barcode, filter by category, and edit or safely delete products. A manual stock change creates a permanent `STOCK_CORRECTION` movement.
-5. Use **MOVEMENT HISTORY** to review persisted stock corrections newest first. **SYNC OFFLINE** remains inactive in Phase 2.
+5. Use **MOVEMENT HISTORY** to review persisted stock corrections newest first. **SYNC OFFLINE** can inspect the oldest pending ESP32 record, but does not apply or retire it in Step 7.1.
 6. Select **Logout** to return to the login screen.
 
-React communicates only through narrow authentication, inventory, and hardware-status methods exposed by the preload. It cannot access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
+React communicates only through narrow authentication, inventory, hardware-status, and pending-event inspection methods exposed by the preload. It cannot access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
 
 ### Local ESP32 status connection
+
+Phase 7 Step 1 adds `GET /offline/events/next`, a bounded, oldest-first read of
+one durable pending transaction. A `204` means none is pending; a validated
+`200` record remains pending across repeated reads and reboot because this step
+does not apply it to SQLite or acknowledge, archive, delete, or rewrite it. The
+existing **SYNC OFFLINE** page reports this inspection-only state through a
+parameter-free frozen-preload method. See
+[the bounded offline sync transport guide](docs/phase7-step1-offline-sync-transport.md).
 
 Phase 6 Step 2B freezes each accepted scan as either ONLINE or OFFLINE based on
 the desktop-presence lease. The existing online FIFO and quantity workflow are

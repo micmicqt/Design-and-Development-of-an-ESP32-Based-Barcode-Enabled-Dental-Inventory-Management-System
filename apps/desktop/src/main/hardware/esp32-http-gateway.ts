@@ -16,6 +16,8 @@ import {
   type HardwareTransactionEvent,
   type HardwareTransactionMode,
   type HardwareTransactionResult,
+  type OfflinePendingAction,
+  type OfflinePendingEvent,
   type StockStatus
 } from '../../shared/ipc-contract'
 
@@ -28,6 +30,19 @@ const HARDWARE_MODES: readonly Esp32HardwareMode[] = [
 ]
 const TRANSACTION_MODES: readonly HardwareTransactionMode[] = ['restock', 'checkout']
 const TRANSACTION_EVENT_KEYS = ['barcode', 'eventId', 'mode', 'timestamp'] as const
+const OFFLINE_PENDING_EVENT_KEYS = [
+  'eventId',
+  'timestamp',
+  'productId',
+  'barcode',
+  'action',
+  'delta',
+  'resultingStock',
+  'stockStatus',
+  'cacheGeneration'
+] as const
+const OFFLINE_PENDING_ACTIONS: readonly OfflinePendingAction[] = ['RESTOCK', 'CHECKOUT']
+const OFFLINE_EVENT_ID_PATTERN = /^off-[0-9A-F]{12}-[0-9A-F]{16}$/
 const ACKNOWLEDGEMENT_KEYS = ['acknowledged', 'eventId'] as const
 const RESULT_ACCEPTANCE_KEYS = ['accepted', 'eventId'] as const
 const DESKTOP_HEARTBEAT_KEYS = ['desktopOnline'] as const
@@ -111,6 +126,14 @@ function isValidBarcode(value: unknown): value is string {
     value.trim().length > 0 &&
     /^[\x20-\x7E]+$/.test(value) &&
     !value.includes(',')
+  )
+}
+
+function isValidOfflineEventId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    OFFLINE_EVENT_ID_PATTERN.test(value) &&
+    value.slice(-16) !== '0000000000000000'
   )
 }
 
@@ -402,6 +425,46 @@ function validateTransactionEvent(value: unknown): HardwareTransactionEvent {
   }
 }
 
+function validateOfflinePendingEvent(value: unknown): OfflinePendingEvent {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, OFFLINE_PENDING_EVENT_KEYS) ||
+    !isValidOfflineEventId(value.eventId) ||
+    !isValidRtcTimestamp(value.timestamp) ||
+    typeof value.productId !== 'string' ||
+    value.productId.length === 0 ||
+    value.productId.length > 31 ||
+    !/^[1-9]\d*$/.test(value.productId) ||
+    !isValidBarcode(value.barcode) ||
+    typeof value.action !== 'string' ||
+    !OFFLINE_PENDING_ACTIONS.includes(value.action as OfflinePendingAction) ||
+    (value.action === 'RESTOCK' ? value.delta !== 1 : value.delta !== -1) ||
+    !Number.isSafeInteger(value.resultingStock) ||
+    (value.resultingStock as number) < 0 ||
+    !STOCK_STATUSES.includes(value.stockStatus as StockStatus) ||
+    ((value.resultingStock === 0) !== (value.stockStatus === 'EMPTY')) ||
+    typeof value.cacheGeneration !== 'string' ||
+    !OFFLINE_CACHE_GENERATION_PATTERN.test(value.cacheGeneration)
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The ESP32 offline pending event response is invalid.'
+    )
+  }
+
+  return {
+    eventId: value.eventId,
+    timestamp: value.timestamp as string,
+    productId: value.productId,
+    barcode: value.barcode as string,
+    action: value.action as OfflinePendingAction,
+    delta: value.delta as 1 | -1,
+    resultingStock: value.resultingStock as number,
+    stockStatus: value.stockStatus as StockStatus,
+    cacheGeneration: value.cacheGeneration
+  }
+}
+
 function validateAcknowledgement(value: unknown, expectedEventId: string): void {
   if (
     !isRecord(value) ||
@@ -568,6 +631,11 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
     return response === NO_CONTENT ? null : validateTransactionEvent(response)
   }
 
+  async getNextOfflineEvent(): Promise<OfflinePendingEvent | null> {
+    const response = await this.request('/offline/events/next', { allowNoContent: true })
+    return response === NO_CONTENT ? null : validateOfflinePendingEvent(response)
+  }
+
   async deliverTransactionResult(result: HardwareTransactionResult): Promise<void> {
     validateResult(result)
     const response = await this.request('/events/result', {
@@ -598,6 +666,7 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
       | '/status'
       | '/desktop/heartbeat'
       | '/offline/cache'
+      | '/offline/events/next'
       | '/events/next'
       | '/events/result'
       | '/events/ack',
@@ -643,6 +712,12 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
         throw new HardwareGatewayError(
           'INVALID_RESPONSE',
           'The ESP32 returned an unexpected event response status.'
+        )
+      }
+      if (path === '/offline/events/next' && response.status !== 200) {
+        throw new HardwareGatewayError(
+          'INVALID_RESPONSE',
+          'The ESP32 returned an unexpected offline event response status.'
         )
       }
       if (path === '/offline/cache' && response.status !== 200) {

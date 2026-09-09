@@ -33,6 +33,17 @@ const transactionResult = {
 } as const
 
 const cacheGeneration = `v1-${'a'.repeat(64)}`
+const offlinePendingEvent = {
+  eventId: 'off-20500DE58C14-0000000000000001',
+  timestamp: '2026-09-04 12:34:56',
+  productId: '7',
+  barcode: '0004806016001569',
+  action: 'RESTOCK',
+  delta: 1,
+  resultingStock: 22,
+  stockStatus: 'HIGH',
+  cacheGeneration
+} as const
 const cacheProducts = [
   {
     id: '7',
@@ -570,6 +581,141 @@ describe('ESP32 HTTP hardware gateway', () => {
     const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
 
     await expect(gateway.getNextTransactionEvent()).resolves.toEqual(expected)
+  })
+
+  it('retrieves the same oldest offline event repeatedly without changing its exact fields', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(offlinePendingEvent))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.getNextOfflineEvent()).resolves.toEqual(offlinePendingEvent)
+    await expect(gateway.getNextOfflineEvent()).resolves.toEqual(offlinePendingEvent)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    for (const call of fetcher.mock.calls) {
+      expect(call).toEqual([
+        'http://192.0.2.10/offline/events/next',
+        expect.objectContaining({ method: 'GET', headers: { Accept: 'application/json' } })
+      ])
+      expect(call[1]).not.toHaveProperty('body')
+    }
+  })
+
+  it.each(['0000000000000001', ' 0000001 '])(
+    'preserves exact offline barcode text: %s',
+    async (barcode) => {
+      const expected = { ...offlinePendingEvent, barcode }
+      const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(expected))
+      const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+      await expect(gateway.getNextOfflineEvent()).resolves.toEqual(expected)
+    }
+  )
+
+  it('maps only HTTP 204 to no pending offline event without parsing a body', async () => {
+    const response = jsonResponse(undefined, 204)
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(response)
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.getNextOfflineEvent()).resolves.toBeNull()
+    expect(response.json).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    null,
+    [],
+    {},
+    { ...offlinePendingEvent, eventId: '' },
+    { ...offlinePendingEvent, eventId: transactionEvent.eventId },
+    { ...offlinePendingEvent, eventId: 'off-20500de58c14-0000000000000001' },
+    { ...offlinePendingEvent, eventId: 'off-20500DE58C14-0000000000000000' },
+    { ...offlinePendingEvent, eventId: 1 },
+    { ...offlinePendingEvent, timestamp: '2026-09-04T12:34:56Z' },
+    { ...offlinePendingEvent, productId: '' },
+    { ...offlinePendingEvent, productId: '0' },
+    { ...offlinePendingEvent, productId: '007' },
+    { ...offlinePendingEvent, productId: '1'.repeat(32) },
+    { ...offlinePendingEvent, productId: 7 },
+    { ...offlinePendingEvent, barcode: 4806016001569 },
+    { ...offlinePendingEvent, barcode: 'abc,123' },
+    { ...offlinePendingEvent, action: 'checkout' },
+    { ...offlinePendingEvent, action: 'DELETE' },
+    { ...offlinePendingEvent, action: 'RESTOCK', delta: -1 },
+    { ...offlinePendingEvent, action: 'CHECKOUT', delta: 1 },
+    { ...offlinePendingEvent, delta: 0 },
+    { ...offlinePendingEvent, delta: 1.5 },
+    { ...offlinePendingEvent, resultingStock: -1 },
+    { ...offlinePendingEvent, resultingStock: 1.5 },
+    { ...offlinePendingEvent, resultingStock: Number.MAX_SAFE_INTEGER + 1 },
+    { ...offlinePendingEvent, resultingStock: 0, stockStatus: 'HIGH' },
+    { ...offlinePendingEvent, resultingStock: 1, stockStatus: 'EMPTY' },
+    { ...offlinePendingEvent, stockStatus: 'UNKNOWN' },
+    { ...offlinePendingEvent, cacheGeneration: 'latest' },
+    { ...offlinePendingEvent, unexpected: true }
+  ])('rejects a malformed offline event as an explicit protocol error %#', async (payload) => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(payload))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.getNextOfflineEvent()).rejects.toMatchObject<
+      Partial<HardwareGatewayError>
+    >({ code: 'INVALID_RESPONSE' })
+  })
+
+  it.each([201, 202, 206])(
+    'rejects HTTP %s as an unexpected offline-event success status',
+    async (status) => {
+      const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+        jsonResponse(offlinePendingEvent, status)
+      )
+      const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+      await expect(gateway.getNextOfflineEvent()).rejects.toMatchObject({
+        code: 'INVALID_RESPONSE'
+      })
+    }
+  )
+
+  it('rejects malformed offline-event JSON as an explicit protocol error', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockRejectedValue(new SyntaxError('Invalid JSON'))
+    })
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.getNextOfflineEvent()).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE'
+    })
+  })
+
+  it('keeps offline-event network failure retryable without implicit retries', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockRejectedValueOnce(new Error('network failed'))
+      .mockResolvedValueOnce(jsonResponse(offlinePendingEvent))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.getNextOfflineEvent()).rejects.toMatchObject({ code: 'UNAVAILABLE' })
+    await expect(gateway.getNextOfflineEvent()).resolves.toEqual(offlinePendingEvent)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('aborts a stalled offline-event request as retryable unavailability', async () => {
+    vi.useFakeTimers()
+    const fetcher = vi.fn<HardwareFetch>().mockImplementation((_url, options) =>
+      new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+      })
+    )
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://192.0.2.10',
+      requestTimeoutMs: 25,
+      fetcher
+    })
+    const expectation = expect(gateway.getNextOfflineEvent()).rejects.toMatchObject({
+      code: 'UNAVAILABLE'
+    })
+
+    await vi.advanceTimersByTimeAsync(25)
+    await expectation
+    expect(fetcher).toHaveBeenCalledOnce()
   })
 
   it('posts the complete committed result and accepts an explicit matching response', async () => {

@@ -2,6 +2,7 @@ import type {
   HardwareTransactionEvent,
   HardwareTransactionResult,
   InventoryCategory,
+  OfflinePendingEvent,
   StockStatus
 } from '../../shared/ipc-contract'
 
@@ -84,10 +85,16 @@ export interface OfflineInventoryCacheGateway {
   ): Promise<OfflineInventoryCacheInstallResult>
 }
 
+/** Non-destructive, oldest-first access to the durable offline journal. */
+export interface OfflinePendingEventGateway {
+  getNextOfflineEvent(): Promise<OfflinePendingEvent | null>
+}
+
 /** Production desktop boundary. Transaction and cache APIs stay backend-only. */
 export interface DesktopHardwareGateway
   extends HardwareTransactionEventGateway,
-    OfflineInventoryCacheGateway {}
+    OfflineInventoryCacheGateway,
+    OfflinePendingEventGateway {}
 
 export function isValidHardwareTransactionEventId(value: unknown): value is string {
   return (
@@ -149,7 +156,9 @@ export interface OfflineTransactionRecord {
 
 export type Unsubscribe = () => void
 
-export interface HardwareGateway extends HardwareTransactionEventGateway {
+export interface HardwareGateway
+  extends HardwareTransactionEventGateway,
+    OfflinePendingEventGateway {
   connect(): Promise<void>
   disconnect(): Promise<void>
   getDeviceStatus(): Promise<HardwareDeviceStatus>

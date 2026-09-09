@@ -4,7 +4,10 @@ import type { BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createAuthSessionController } from '../../src/main/application/auth-session'
 import { initializeDatabase } from '../../src/main/database'
-import type { HardwareTransactionEventGateway } from '../../src/main/hardware/hardware-gateway'
+import type {
+  HardwareTransactionEventGateway,
+  OfflinePendingEventGateway
+} from '../../src/main/hardware/hardware-gateway'
 import type { OfflineInventoryCacheCoordinator } from '../../src/main/hardware/offline-inventory-cache'
 import {
   createHardwareTransactionCoordinator,
@@ -18,7 +21,8 @@ import { registerHardwareIpcHandlers } from '../../src/main/ipc/register-hardwar
 import {
   IPC_CHANNELS,
   type HardwareStatusDto,
-  type HardwareTransactionReceipt
+  type HardwareTransactionReceipt,
+  type OfflinePendingEvent
 } from '../../src/shared/ipc-contract'
 
 const electronMock = vi.hoisted(() => {
@@ -60,6 +64,18 @@ const transactionReceipt: HardwareTransactionReceipt = {
   resultDeliveredToHardware: true
 }
 
+const offlinePendingEvent: OfflinePendingEvent = {
+  eventId: 'off-20500DE58C14-0000000000000001',
+  timestamp: '2026-09-04 08:30:00',
+  productId: '7',
+  barcode: '0004806016001569',
+  action: 'CHECKOUT',
+  delta: -1,
+  resultingStock: 19,
+  stockStatus: 'HIGH',
+  cacheGeneration: `v1-${'a'.repeat(64)}`
+}
+
 describe('authenticated hardware IPC boundary', () => {
   beforeEach(() => {
     electronMock.handlers.clear()
@@ -68,7 +84,7 @@ describe('authenticated hardware IPC boundary', () => {
   })
 
   function setup(
-    gateway: HardwareTransactionEventGateway | null = createGateway(),
+    gateway: (HardwareTransactionEventGateway & OfflinePendingEventGateway) | null = createGateway(),
     inventoryService: InventoryService = createInventoryService(),
     transactionCoordinator: HardwareTransactionCoordinator = createTransactionCoordinator(),
     offlineInventoryCacheCoordinator: OfflineInventoryCacheCoordinator | null = null
@@ -95,6 +111,7 @@ describe('authenticated hardware IPC boundary', () => {
     const handler = electronMock.handlers.get(IPC_CHANNELS.hardwareGetStatus)
     if (handler === undefined) throw new Error('Hardware status handler was not registered.')
     const heartbeat = electronMock.handlers.get(IPC_CHANNELS.hardwareSendDesktopHeartbeat)
+    const offlineNext = electronMock.handlers.get(IPC_CHANNELS.hardwareGetNextOfflineEvent)
     const next = electronMock.handlers.get(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     const acknowledge = electronMock.handlers.get(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     const getReceipt = electronMock.handlers.get(IPC_CHANNELS.hardwareGetTransactionReceipt)
@@ -103,6 +120,7 @@ describe('authenticated hardware IPC boundary', () => {
     const retryResult = electronMock.handlers.get(IPC_CHANNELS.hardwareRetryTransactionResultDelivery)
     if (
       heartbeat === undefined ||
+      offlineNext === undefined ||
       next === undefined ||
       acknowledge === undefined ||
       getReceipt === undefined ||
@@ -117,6 +135,7 @@ describe('authenticated hardware IPC boundary', () => {
       trustedEvent,
       handler,
       heartbeat,
+      offlineNext,
       next,
       acknowledge,
       getReceipt,
@@ -131,7 +150,7 @@ describe('authenticated hardware IPC boundary', () => {
     }
   }
 
-  function createGateway(): HardwareTransactionEventGateway {
+  function createGateway(): HardwareTransactionEventGateway & OfflinePendingEventGateway {
     return {
       healthCheck: vi.fn().mockResolvedValue({
         status: 'ok',
@@ -148,6 +167,7 @@ describe('authenticated hardware IPC boundary', () => {
         offlineReady: true
       }),
       sendDesktopHeartbeat: vi.fn().mockResolvedValue(undefined),
+      getNextOfflineEvent: vi.fn().mockResolvedValue(offlinePendingEvent),
       getNextTransactionEvent: vi.fn().mockResolvedValue(hardwareEvent),
       deliverTransactionResult: vi.fn().mockResolvedValue(undefined),
       acknowledgeTransactionEvent: vi.fn().mockResolvedValue(undefined)
@@ -207,7 +227,9 @@ describe('authenticated hardware IPC boundary', () => {
       device: 'dental-inventory-esp32',
       mode: 'restock',
       rtc: true,
-      sd: true
+      sd: true,
+      pendingSyncItems: 4,
+      offlineReady: true
     })
     dispose()
   })
@@ -226,6 +248,23 @@ describe('authenticated hardware IPC boundary', () => {
       sd: null
     })
     dispose()
+  })
+
+  it('omits offline journal metadata when older firmware does not report it', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getStatus).mockResolvedValueOnce({
+      device: 'dental-inventory-esp32',
+      online: true,
+      mode: 'idle',
+      rtc: true,
+      sd: true
+    })
+    const { authSession, trustedEvent, handler } = setup(gateway)
+    authSession.signIn('admin')
+
+    const status = await handler(trustedEvent)
+    expect(status).not.toHaveProperty('pendingSyncItems')
+    expect(status).not.toHaveProperty('offlineReady')
   })
 
   it('does not contact hardware for a signed-out or untrusted renderer', async () => {
@@ -321,6 +360,85 @@ describe('authenticated hardware IPC boundary', () => {
     await expect(next(trustedEvent)).resolves.toEqual(hardwareEvent)
     expect(gateway.getNextTransactionEvent).toHaveBeenCalledExactlyOnceWith()
     expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  })
+
+  it('retrieves a pending offline event without mutating hardware, inventory, or receipts', async () => {
+    const gateway = createGateway()
+    const inventoryService = createInventoryService()
+    const transactionCoordinator = createTransactionCoordinator()
+    const { authSession, trustedEvent, offlineNext } = setup(
+      gateway,
+      inventoryService,
+      transactionCoordinator
+    )
+    authSession.signIn('admin')
+
+    await expect(offlineNext(trustedEvent)).resolves.toEqual({
+      ok: true,
+      value: offlinePendingEvent
+    })
+    expect(gateway.getNextOfflineEvent).toHaveBeenCalledExactlyOnceWith()
+    expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+    expect(gateway.deliverTransactionResult).not.toHaveBeenCalled()
+    expect(inventoryService.processHardwareTransaction).not.toHaveBeenCalled()
+    expect(transactionCoordinator.processTransaction).not.toHaveBeenCalled()
+  })
+
+  it('distinguishes authoritative empty offline state from sanitized retryable failure', async () => {
+    const gateway = createGateway()
+    const { authSession, trustedEvent, offlineNext } = setup(gateway)
+    authSession.signIn('admin')
+    vi.mocked(gateway.getNextOfflineEvent)
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error('private URL or protocol detail'))
+      .mockResolvedValueOnce(offlinePendingEvent)
+
+    await expect(offlineNext(trustedEvent)).resolves.toEqual({ ok: true, value: null })
+    await expect(offlineNext(trustedEvent)).resolves.toEqual({
+      ok: false,
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: 'Unable to read pending offline transactions. Check the ESP32 and retry.'
+      }
+    })
+    await expect(offlineNext(trustedEvent)).resolves.toEqual({
+      ok: true,
+      value: offlinePendingEvent
+    })
+    expect(gateway.getNextOfflineEvent).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not retrieve offline records for signed-out or untrusted renderers', async () => {
+    const gateway = createGateway()
+    const { authSession, trustedEvent, offlineNext } = setup(gateway)
+
+    await expect(offlineNext(trustedEvent)).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'UNAUTHORIZED' }
+    })
+    authSession.signIn('admin')
+    await expect(offlineNext({
+      ...trustedEvent,
+      sender: { isDestroyed: () => false, mainFrame: {} }
+    })).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'UNAUTHORIZED' }
+    })
+    await expect(offlineNext({ ...trustedEvent, senderFrame: {} })).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'UNAUTHORIZED' }
+    })
+    expect(gateway.getNextOfflineEvent).not.toHaveBeenCalled()
+  })
+
+  it('reports missing hardware as retryable offline retrieval failure', async () => {
+    const { authSession, trustedEvent, offlineNext } = setup(null)
+    authSession.signIn('admin')
+
+    await expect(offlineNext(trustedEvent)).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'INTERNAL_ERROR' }
+    })
   })
 
   it('returns null for an empty queue or a failed poll without acknowledging anything', async () => {
@@ -1021,6 +1139,9 @@ describe('authenticated hardware IPC boundary', () => {
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetStatus)
     expect(electronMock.removeHandler).toHaveBeenCalledWith(
       IPC_CHANNELS.hardwareSendDesktopHeartbeat
+    )
+    expect(electronMock.removeHandler).toHaveBeenCalledWith(
+      IPC_CHANNELS.hardwareGetNextOfflineEvent
     )
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)

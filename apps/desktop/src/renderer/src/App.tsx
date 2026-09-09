@@ -14,6 +14,7 @@ import { HardwareTransactionDialog } from './components/HardwareTransactionDialo
 import { AddItemPage } from './pages/AddItemPage'
 import { InventoryPage } from './pages/InventoryPage'
 import { MovementHistoryPage } from './pages/MovementHistoryPage'
+import { SyncOfflinePage } from './pages/SyncOfflinePage'
 
 const NAVIGATION_ITEMS = [
   'ITEM INVENTORY',
@@ -70,29 +71,6 @@ const sectionMetadata: Record<
     title: 'Sync Offline',
     description: 'Keep inventory ready for future kiosk synchronization.'
   }
-}
-
-function EmptyState({
-  badge,
-  title,
-  message
-}: {
-  badge: string
-  title: string
-  message: string
-}): ReactNode {
-  return (
-    <div className="empty-state">
-      <div className="empty-state__icon" aria-hidden="true">
-        <span />
-        <span />
-        <span />
-      </div>
-      <span className="phase-badge">{badge}</span>
-      <h3>{title}</h3>
-      <p>{message}</p>
-    </div>
-  )
 }
 
 function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
@@ -408,10 +386,9 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
         )
       case 'SYNC OFFLINE':
         return (
-          <EmptyState
-            badge="Clinic kiosk"
-            title="Offline synchronization is waiting for the kiosk"
-            message="Offline synchronization will become available when the inventory kiosk is connected."
+          <SyncOfflinePage
+            pendingCount={hardwareStatus?.pendingSyncItems}
+            offlineReady={hardwareStatus?.offlineReady}
           />
         )
     }
