@@ -9,6 +9,7 @@ import type {
   OfflinePendingEventGateway
 } from '../../src/main/hardware/hardware-gateway'
 import type { OfflineInventoryCacheCoordinator } from '../../src/main/hardware/offline-inventory-cache'
+import type { OfflineSyncCoordinator } from '../../src/main/hardware/offline-sync-coordinator'
 import {
   createHardwareTransactionCoordinator,
   type HardwareTransactionCoordinator
@@ -24,7 +25,8 @@ import {
   type HardwareStatusDto,
   type HardwareTransactionReceipt,
   type OfflinePendingEvent,
-  type OfflineReconciliationReceipt
+  type OfflineReconciliationReceipt,
+  type OfflineSyncOutcome
 } from '../../src/shared/ipc-contract'
 
 const electronMock = vi.hoisted(() => {
@@ -107,7 +109,8 @@ describe('authenticated hardware IPC boundary', () => {
     gateway: (HardwareTransactionEventGateway & OfflinePendingEventGateway) | null = createGateway(),
     inventoryService: InventoryService = createInventoryService(),
     transactionCoordinator: HardwareTransactionCoordinator = createTransactionCoordinator(),
-    offlineInventoryCacheCoordinator: OfflineInventoryCacheCoordinator | null = null
+    offlineInventoryCacheCoordinator: OfflineInventoryCacheCoordinator | null = null,
+    offlineSyncCoordinator: OfflineSyncCoordinator | null = null
   ) {
     const authSession = createAuthSessionController()
     const mainFrame = {}
@@ -126,7 +129,8 @@ describe('authenticated hardware IPC boundary', () => {
       transactionCoordinator,
       authSession,
       getMainWindow: () => mainWindow,
-      offlineInventoryCacheCoordinator
+      offlineInventoryCacheCoordinator,
+      offlineSyncCoordinator
     })
     const handler = electronMock.handlers.get(IPC_CHANNELS.hardwareGetStatus)
     if (handler === undefined) throw new Error('Hardware status handler was not registered.')
@@ -134,6 +138,9 @@ describe('authenticated hardware IPC boundary', () => {
     const offlineNext = electronMock.handlers.get(IPC_CHANNELS.hardwareGetNextOfflineEvent)
     const reconcileOffline = electronMock.handlers.get(
       IPC_CHANNELS.hardwareReconcileNextOfflineEvent
+    )
+    const synchronizeOffline = electronMock.handlers.get(
+      IPC_CHANNELS.hardwareSynchronizeOfflineInventory
     )
     const next = electronMock.handlers.get(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     const acknowledge = electronMock.handlers.get(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
@@ -145,6 +152,7 @@ describe('authenticated hardware IPC boundary', () => {
       heartbeat === undefined ||
       offlineNext === undefined ||
       reconcileOffline === undefined ||
+      synchronizeOffline === undefined ||
       next === undefined ||
       acknowledge === undefined ||
       getReceipt === undefined ||
@@ -161,6 +169,7 @@ describe('authenticated hardware IPC boundary', () => {
       heartbeat,
       offlineNext,
       reconcileOffline,
+      synchronizeOffline,
       next,
       acknowledge,
       getReceipt,
@@ -245,6 +254,25 @@ describe('authenticated hardware IPC boundary', () => {
       refreshIfNeeded: vi.fn().mockResolvedValue(null),
       markStale: vi.fn()
     }
+  }
+
+  function createOfflineSyncCoordinator(
+    outcome: OfflineSyncOutcome = {
+      status: 'COMPLETE',
+      counts: {
+        appliedEvents: 1,
+        alreadyAppliedEvents: 0,
+        acknowledgedEvents: 1
+      },
+      pendingSyncItems: 0,
+      cache: {
+        generation: `v1-${'a'.repeat(64)}`,
+        itemCount: 1,
+        alreadyCurrent: false
+      }
+    }
+  ): OfflineSyncCoordinator {
+    return { synchronize: vi.fn().mockResolvedValue(outcome) }
   }
 
   it('returns validated status to the authenticated trusted renderer', async () => {
@@ -469,6 +497,166 @@ describe('authenticated hardware IPC boundary', () => {
     })
     expect(inventoryService.reconcileOfflineEvent).not.toHaveBeenCalled()
     expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  })
+
+  it('invokes the backend-owned offline sync without forwarding renderer arguments', async () => {
+    const syncCoordinator = createOfflineSyncCoordinator()
+    const gateway = createGateway()
+    const inventoryService = createInventoryService()
+    const { authSession, trustedEvent, synchronizeOffline } = setup(
+      gateway,
+      inventoryService,
+      createTransactionCoordinator(),
+      null,
+      syncCoordinator
+    )
+    authSession.signIn('admin')
+
+    await expect(synchronizeOffline(
+      trustedEvent,
+      { eventId: 'off-FORGED', resultingStock: 999_999 },
+      'http://untrusted.example/offline/events/ack',
+      { method: 'DELETE', products: [{ currentStock: 999_999 }] }
+    )).resolves.toMatchObject({
+      ok: true,
+      value: {
+        status: 'COMPLETE',
+        counts: { appliedEvents: 1, acknowledgedEvents: 1 },
+        pendingSyncItems: 0
+      }
+    })
+    expect(syncCoordinator.synchronize).toHaveBeenCalledExactlyOnceWith()
+    expect(gateway.getNextOfflineEvent).not.toHaveBeenCalled()
+    expect(inventoryService.reconcileOfflineEvent).not.toHaveBeenCalled()
+  })
+
+  it('blocks offline sync while signed out or outside the trusted main frame', async () => {
+    const syncCoordinator = createOfflineSyncCoordinator()
+    const { authSession, trustedEvent, synchronizeOffline } = setup(
+      createGateway(),
+      createInventoryService(),
+      createTransactionCoordinator(),
+      null,
+      syncCoordinator
+    )
+
+    await expect(synchronizeOffline(trustedEvent)).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'UNAUTHORIZED' }
+    })
+    authSession.signIn('admin')
+    for (const untrustedEvent of [
+      { ...trustedEvent, sender: { isDestroyed: () => false, mainFrame: {} } },
+      { ...trustedEvent, senderFrame: {} },
+      {
+        ...trustedEvent,
+        sender: { isDestroyed: () => true, mainFrame: trustedEvent.senderFrame }
+      }
+    ]) {
+      await expect(synchronizeOffline(untrustedEvent)).resolves.toMatchObject({
+        ok: false,
+        error: { code: 'UNAUTHORIZED' }
+      })
+    }
+    expect(syncCoordinator.synchronize).not.toHaveBeenCalled()
+  })
+
+  it('sanitizes offline sync failures and leaves the fixed API retryable', async () => {
+    const retryOutcome: OfflineSyncOutcome = {
+      status: 'ACKNOWLEDGEMENT_PENDING',
+      counts: {
+        appliedEvents: 1,
+        alreadyAppliedEvents: 0,
+        acknowledgedEvents: 0
+      },
+      eventId: offlinePendingEvent.eventId
+    }
+    const syncCoordinator = createOfflineSyncCoordinator(retryOutcome)
+    vi.mocked(syncCoordinator.synchronize)
+      .mockRejectedValueOnce(new Error('SQLITE_IOERR at C:/private/inventory.db'))
+      .mockResolvedValueOnce(retryOutcome)
+    const { authSession, trustedEvent, synchronizeOffline } = setup(
+      createGateway(),
+      createInventoryService(),
+      createTransactionCoordinator(),
+      null,
+      syncCoordinator
+    )
+    authSession.signIn('admin')
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    await expect(synchronizeOffline(trustedEvent)).resolves.toEqual({
+      ok: false,
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: 'Unable to synchronize offline transactions. Check the ESP32 and retry.'
+      }
+    })
+    await expect(synchronizeOffline(trustedEvent)).resolves.toEqual({
+      ok: true,
+      value: retryOutcome
+    })
+    expect(consoleError).toHaveBeenCalledExactlyOnceWith(
+      'Offline synchronization IPC request failed internally.'
+    )
+    consoleError.mockRestore()
+  })
+
+  it('coalesces concurrent offline sync IPC requests', async () => {
+    const completeOutcome: OfflineSyncOutcome = {
+      status: 'COMPLETE',
+      counts: {
+        appliedEvents: 0,
+        alreadyAppliedEvents: 0,
+        acknowledgedEvents: 0
+      },
+      pendingSyncItems: 0,
+      cache: {
+        generation: `v1-${'b'.repeat(64)}`,
+        itemCount: 0,
+        alreadyCurrent: true
+      }
+    }
+    let release: ((outcome: OfflineSyncOutcome) => void) | undefined
+    const syncCoordinator = createOfflineSyncCoordinator()
+    vi.mocked(syncCoordinator.synchronize).mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve
+      })
+    )
+    const { authSession, trustedEvent, synchronizeOffline } = setup(
+      createGateway(),
+      createInventoryService(),
+      createTransactionCoordinator(),
+      null,
+      syncCoordinator
+    )
+    authSession.signIn('admin')
+
+    const first = synchronizeOffline(trustedEvent)
+    const second = synchronizeOffline(trustedEvent)
+    await Promise.resolve()
+    expect(syncCoordinator.synchronize).toHaveBeenCalledOnce()
+    release?.(completeOutcome)
+
+    await expect(first).resolves.toEqual({ ok: true, value: completeOutcome })
+    await expect(second).resolves.toEqual({ ok: true, value: completeOutcome })
+    expect(syncCoordinator.synchronize).toHaveBeenCalledOnce()
+  })
+
+  it('reports unconfigured offline sync through the sanitized failure boundary', async () => {
+    const { authSession, trustedEvent, synchronizeOffline } = setup(null)
+    authSession.signIn('admin')
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    await expect(synchronizeOffline(trustedEvent)).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'INTERNAL_ERROR' }
+    })
+    expect(consoleError).toHaveBeenCalledWith(
+      'Offline synchronization IPC request failed internally.'
+    )
+    consoleError.mockRestore()
   })
 
   it('returns the durable replay disposition while leaving firmware pending', async () => {
@@ -1385,6 +1573,9 @@ describe('authenticated hardware IPC boundary', () => {
     )
     expect(electronMock.removeHandler).toHaveBeenCalledWith(
       IPC_CHANNELS.hardwareReconcileNextOfflineEvent
+    )
+    expect(electronMock.removeHandler).toHaveBeenCalledWith(
+      IPC_CHANNELS.hardwareSynchronizeOfflineInventory
     )
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)

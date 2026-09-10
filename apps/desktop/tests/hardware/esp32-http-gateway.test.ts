@@ -740,6 +740,229 @@ describe('ESP32 HTTP hardware gateway', () => {
     expect(fetcher).toHaveBeenCalledOnce()
   })
 
+  it('posts exactly one offline event ID and validates the complete ACK receipt', async () => {
+    const acknowledgement = {
+      acknowledged: true,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: 3,
+      alreadyAcknowledged: false
+    } as const
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(acknowledgement))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)).resolves.toEqual(
+      acknowledgement
+    )
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith(
+      'http://192.0.2.10/offline/events/ack',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ eventId: offlinePendingEvent.eventId })
+      })
+    )
+    expect(JSON.parse(fetcher.mock.calls[0]?.[1].body ?? '{}')).toEqual({
+      eventId: offlinePendingEvent.eventId
+    })
+  })
+
+  it('allows the real SD-backed ACK latency beyond the lightweight request timeout', async () => {
+    vi.useFakeTimers()
+    const acknowledgement = {
+      acknowledged: true,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: 5,
+      alreadyAcknowledged: false
+    } as const
+    const fetcher = vi.fn<HardwareFetch>().mockImplementation(
+      (_url, options) =>
+        new Promise((resolve, reject) => {
+          const completion = setTimeout(() => resolve(jsonResponse(acknowledgement)), 3_000)
+          options.signal.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(completion)
+              reject(new Error('aborted'))
+            },
+            { once: true }
+          )
+        })
+    )
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://192.0.2.10',
+      requestTimeoutMs: 2_500,
+      fetcher
+    })
+
+    const acknowledgementRequest = gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    await expect(acknowledgementRequest).resolves.toEqual(acknowledgement)
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it.each([0, 10_000])(
+    'accepts bounded pending count %s on an idempotent offline ACK receipt',
+    async (pendingSyncItems) => {
+      const acknowledgement = {
+        acknowledged: true,
+        eventId: offlinePendingEvent.eventId,
+        pendingSyncItems,
+        alreadyAcknowledged: true
+      } as const
+      const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(acknowledgement))
+      const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+      await expect(
+        gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)
+      ).resolves.toEqual(acknowledgement)
+    }
+  )
+
+  it.each([
+    '',
+    transactionEvent.eventId,
+    'off-20500de58c14-0000000000000001',
+    'off-20500DE58C14-0000000000000000',
+    'off-20500DE58C14-0000000000000001/next'
+  ])('rejects invalid outgoing offline ACK IDs before HTTP: %s', async (eventId) => {
+    const fetcher = vi.fn<HardwareFetch>()
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.acknowledgeOfflineEvent(eventId)).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE'
+    })
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    null,
+    {},
+    {
+      acknowledged: false,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: 0,
+      alreadyAcknowledged: false
+    },
+    {
+      acknowledged: true,
+      eventId: 'off-20500DE58C14-0000000000000002',
+      pendingSyncItems: 0,
+      alreadyAcknowledged: false
+    },
+    {
+      acknowledged: true,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: -1,
+      alreadyAcknowledged: false
+    },
+    {
+      acknowledged: true,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: 1.5,
+      alreadyAcknowledged: false
+    },
+    {
+      acknowledged: true,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: 10_001,
+      alreadyAcknowledged: false
+    },
+    {
+      acknowledged: true,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: 0,
+      alreadyAcknowledged: 'false'
+    },
+    {
+      acknowledged: true,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: 0
+    },
+    {
+      acknowledged: true,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: 0,
+      alreadyAcknowledged: true,
+      resultingStock: 999
+    }
+  ])('rejects a malformed offline ACK receipt %#', async (payload) => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(payload))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(
+      gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)
+    ).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+  })
+
+  it.each([400, 404, 409])(
+    'reports HTTP %s offline ACK refusal as REJECTED with bounded safe diagnostics',
+    async (status) => {
+      const response = jsonResponse({ error: 'ack refused' }, status)
+      const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(response)
+      const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+      await expect(
+        gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)
+      ).rejects.toMatchObject({ code: 'REJECTED' })
+      expect(response.json).toHaveBeenCalledOnce()
+    }
+  )
+
+  it('preserves the firmware journal failure code without exposing a raw response', async () => {
+    const fetcher = vi
+      .fn<HardwareFetch>()
+      .mockResolvedValue(jsonResponse({ acknowledged: false, error: 'pending_journal_invalid' }, 500))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(
+      gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)
+    ).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+      diagnosticCode: 'pending_journal_invalid'
+    })
+  })
+
+  it.each([201, 202, 204, 206])(
+    'rejects HTTP %s as an unexpected offline ACK success status',
+    async (status) => {
+      const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+        jsonResponse({
+          acknowledged: true,
+          eventId: offlinePendingEvent.eventId,
+          pendingSyncItems: 0,
+          alreadyAcknowledged: false
+        }, status)
+      )
+      const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+      await expect(
+        gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)
+      ).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    }
+  )
+
+  it('keeps offline ACK network failure retryable without an implicit retry', async () => {
+    const acknowledgement = {
+      acknowledged: true,
+      eventId: offlinePendingEvent.eventId,
+      pendingSyncItems: 0,
+      alreadyAcknowledged: true
+    } as const
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockRejectedValueOnce(new Error('network failed after ACK'))
+      .mockResolvedValueOnce(jsonResponse(acknowledgement))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(
+      gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)
+    ).rejects.toMatchObject({ code: 'UNAVAILABLE' })
+    await expect(
+      gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)
+    ).resolves.toEqual(acknowledgement)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
   it('posts the complete committed result and accepts an explicit matching response', async () => {
     const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
       jsonResponse({ accepted: true, eventId: transactionEvent.eventId })

@@ -5,6 +5,7 @@ import type {
   OfflinePendingEventGateway
 } from '../hardware/hardware-gateway'
 import type { OfflineInventoryCacheCoordinator } from '../hardware/offline-inventory-cache'
+import type { OfflineSyncCoordinator } from '../hardware/offline-sync-coordinator'
 import {
   HardwareTransactionCoordinatorError,
   type HardwareTransactionCoordinator
@@ -23,7 +24,8 @@ import {
   type IpcError,
   type IpcResult,
   type OfflinePendingEvent,
-  type OfflineReconciliationOutcome
+  type OfflineReconciliationOutcome,
+  type OfflineSyncOutcome
 } from '../../shared/ipc-contract'
 import { isTrustedMainFrame, type MainWindowProvider } from './ipc-security'
 import {
@@ -39,6 +41,7 @@ export interface RegisterHardwareIpcHandlersOptions {
   authSession: AuthSessionController
   getMainWindow: MainWindowProvider
   offlineInventoryCacheCoordinator?: OfflineInventoryCacheCoordinator | null
+  offlineSyncCoordinator?: OfflineSyncCoordinator | null
 }
 
 const unauthorizedError: IpcError = {
@@ -142,9 +145,11 @@ export function registerHardwareIpcHandlers(
     transactionCoordinator,
     authSession,
     getMainWindow,
-    offlineInventoryCacheCoordinator = null
+    offlineInventoryCacheCoordinator = null,
+    offlineSyncCoordinator = null
   } = options
   let hardwareMutationTail: Promise<void> = Promise.resolve()
+  let activeOfflineSynchronization: Promise<IpcResult<OfflineSyncOutcome>> | null = null
   function refreshOfflineCacheBestEffort(force: boolean): void {
     if (offlineInventoryCacheCoordinator === null) return
     try {
@@ -259,6 +264,45 @@ export function registerHardwareIpcHandlers(
           return sanitizedOfflineReconciliationFailure(error)
         }
       })
+    }
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.hardwareSynchronizeOfflineInventory,
+    async (event): Promise<IpcResult<OfflineSyncOutcome>> => {
+      if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
+      if (activeOfflineSynchronization !== null) return activeOfflineSynchronization
+
+      const request = serializeHardwareMutation<IpcResult<OfflineSyncOutcome>>(async () => {
+        try {
+          if (offlineSyncCoordinator === null) {
+            throw new Error('Offline synchronization is not configured.')
+          }
+          return ok(await offlineSyncCoordinator.synchronize())
+        } catch {
+          // Coordinator errors intentionally omit ESP32 URLs, journal payloads,
+          // and SQLite diagnostics. All pre-ACK failures remain safe to retry.
+          console.error('Offline synchronization IPC request failed internally.')
+          return failure({
+            code: 'INTERNAL_ERROR',
+            message: 'Unable to synchronize offline transactions. Check the ESP32 and retry.'
+          })
+        }
+      })
+      activeOfflineSynchronization = request
+      void request.then(
+        () => {
+          if (activeOfflineSynchronization === request) {
+            activeOfflineSynchronization = null
+          }
+        },
+        () => {
+          if (activeOfflineSynchronization === request) {
+            activeOfflineSynchronization = null
+          }
+        }
+      )
+      return request
     }
   )
 
@@ -458,6 +502,7 @@ export function registerHardwareIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.hardwareSendDesktopHeartbeat)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetNextOfflineEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareReconcileNextOfflineEvent)
+    ipcMain.removeHandler(IPC_CHANNELS.hardwareSynchronizeOfflineInventory)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetTransactionReceipt)

@@ -1502,6 +1502,364 @@ void pendingTransportUnavailableIsHarmless() {
   assert(storage.files == filesBefore);
 }
 
+std::string journalColumnsAndRows(const std::string& contents) {
+  const size_t columns = contents.find(dental::offline::kPendingJournalColumns);
+  assert(columns != std::string::npos);
+  return contents.substr(columns);
+}
+
+void offlineAcknowledgementRetiresOnlyHeadAndUsesExactContract() {
+  MemoryPendingJournalStorage storage;
+  dental::offline::PendingJournal journal(storage);
+  assert(journal.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  const dental::cache::CacheProduct product = makeCachedProduct();
+  const dental::offline::OfflineJournalRecord first = appendOfflineRecord(
+      journal, dental::offline::OfflineAction::kRestock, product,
+      cacheGenerationA(), "2026-09-09 01:02:03");
+  const dental::offline::OfflineJournalRecord second = appendOfflineRecord(
+      journal, dental::offline::OfflineAction::kCheckout, product,
+      cacheGenerationA(), "2026-09-09 01:02:04");
+  const dental::offline::OfflineJournalRecord third = appendOfflineRecord(
+      journal, dental::offline::OfflineAction::kRestock, product,
+      cacheGenerationA(), "2026-09-09 01:02:05");
+  const std::string before =
+      storage.files[dental::offline::kPendingJournalPath];
+
+  assert(journal.acknowledgeOldest(second.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kMismatch);
+  assert(storage.files[dental::offline::kPendingJournalPath] == before);
+  assert(journal.metadata().pendingCount == 3U);
+
+  assert(journal.acknowledgeOldest(first.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kAcknowledged);
+  assert(journal.metadata().pendingCount == 2U);
+  assert(journal.metadata().storedCount == 3U);
+  assert(journal.metadata().acknowledgedSequence == first.sequence);
+  assert(journal.metadata().maximumSequence == third.sequence);
+  assert(journalColumnsAndRows(
+             storage.files[dental::offline::kPendingJournalPath]) ==
+         journalColumnsAndRows(before));
+
+  dental::offline::OfflineJournalRecord head = {};
+  assert(journal.peekOldest(head) ==
+         dental::offline::JournalPeekResult::kFound);
+  assert(strcmp(head.eventId, second.eventId) == 0);
+
+  std::string response;
+  dental::offline::appendOfflineAcknowledgementJson(
+      response, first.eventId, journal.metadata().pendingCount, false);
+  assert(response ==
+         "{\"acknowledged\":true,\"eventId\":\"off-20500DE58C14-"
+         "0000000000000001\",\"pendingSyncItems\":2,"
+         "\"alreadyAcknowledged\":false}");
+}
+
+void offlineAcknowledgementRequestParserIsStrictAndNonMutating() {
+  char eventId[dental::events::kEventIdCapacity] = {};
+  const std::string valid =
+      "{\"eventId\":\"off-20500DE58C14-0000000000000001\"}";
+  assert(dental::events::parseAcknowledgementBody(
+      valid.c_str(), valid.size(), eventId));
+  assert(strcmp(eventId, "off-20500DE58C14-0000000000000001") == 0);
+
+  MemoryPendingJournalStorage storage;
+  dental::offline::PendingJournal journal(storage);
+  assert(journal.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  appendOfflineRecord(journal, dental::offline::OfflineAction::kRestock,
+                      makeCachedProduct());
+  const std::map<std::string, std::string> before = storage.files;
+  const char* malformed[] = {
+      "", "{}", "{\"eventId\":1}",
+      "{\"eventId\":\"off-20500DE58C14-0000000000000001\",\"x\":1}",
+      "{\"eventId\":\"off\\u002D20500DE58C14-0000000000000001\"}",
+      "{\"eventId\":\"\"}", "[]"};
+  for (const char* body : malformed) {
+    assert(!dental::events::parseAcknowledgementBody(
+        body, strlen(body), eventId));
+  }
+  assert(storage.files == before);
+  assert(journal.metadata().pendingCount == 1U);
+}
+
+void offlineAcknowledgementReplaySurvivesRebootAndProtectsNextHead() {
+  MemoryPendingJournalStorage storage;
+  dental::offline::OfflineJournalRecord first = {};
+  dental::offline::OfflineJournalRecord second = {};
+  {
+    dental::offline::PendingJournal journal(storage);
+    assert(journal.loadOrCreate(offlineDeviceId()) ==
+           dental::offline::JournalLoadResult::kReady);
+    const dental::cache::CacheProduct product = makeCachedProduct();
+    first = appendOfflineRecord(journal,
+                                dental::offline::OfflineAction::kRestock,
+                                product);
+    second = appendOfflineRecord(journal,
+                                 dental::offline::OfflineAction::kCheckout,
+                                 product);
+    assert(journal.acknowledgeOldest(first.eventId) ==
+           dental::offline::JournalAcknowledgementResult::kAcknowledged);
+  }
+
+  dental::offline::PendingJournal rebooted(storage);
+  assert(rebooted.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  const std::map<std::string, std::string> beforeRetry = storage.files;
+  assert(rebooted.acknowledgeOldest(first.eventId) ==
+         dental::offline::JournalAcknowledgementResult::
+             kAlreadyAcknowledged);
+  assert(rebooted.metadata().pendingCount == 1U);
+  assert(storage.files == beforeRetry);
+  dental::offline::OfflineJournalRecord head = {};
+  assert(rebooted.peekOldest(head) ==
+         dental::offline::JournalPeekResult::kFound);
+  assert(strcmp(head.eventId, second.eventId) == 0);
+
+  std::string replayResponse;
+  dental::offline::appendOfflineAcknowledgementJson(
+      replayResponse, first.eventId, rebooted.metadata().pendingCount, true);
+  assert(replayResponse ==
+         "{\"acknowledged\":true,\"eventId\":\"off-20500DE58C14-"
+         "0000000000000001\",\"pendingSyncItems\":1,"
+         "\"alreadyAcknowledged\":true}");
+}
+
+void offlineAcknowledgementWriteFaultsNeverAdvanceTheHead() {
+  const dental::cache::CacheProduct product = makeCachedProduct();
+
+  MemoryPendingJournalStorage headerFailure;
+  dental::offline::PendingJournal headerJournal(headerFailure);
+  assert(headerJournal.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  const dental::offline::OfflineJournalRecord headerHead =
+      appendOfflineRecord(headerJournal,
+                          dental::offline::OfflineAction::kRestock, product);
+  const std::string headerBefore =
+      headerFailure.files[dental::offline::kPendingJournalPath];
+  headerFailure.failNextWrite = true;
+  assert(headerJournal.acknowledgeOldest(headerHead.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kWriteFailed);
+  assert(headerFailure.files[dental::offline::kPendingJournalPath] ==
+         headerBefore);
+  assert(headerJournal.metadata().pendingCount == 1U);
+
+  MemoryPendingJournalStorage copyFailure;
+  dental::offline::PendingJournal copyJournal(copyFailure);
+  assert(copyJournal.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  const dental::offline::OfflineJournalRecord copyHead =
+      appendOfflineRecord(copyJournal,
+                          dental::offline::OfflineAction::kRestock, product);
+  appendOfflineRecord(copyJournal, dental::offline::OfflineAction::kCheckout,
+                      product);
+  const std::string copyBefore =
+      copyFailure.files[dental::offline::kPendingJournalPath];
+  copyFailure.failOnAppendCall = copyFailure.appendCallCount + 1U;
+  assert(copyJournal.acknowledgeOldest(copyHead.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kWriteFailed);
+  assert(copyFailure.files[dental::offline::kPendingJournalPath] == copyBefore);
+  assert(copyJournal.metadata().pendingCount == 2U);
+
+  MemoryPendingJournalStorage promotionFailure;
+  dental::offline::PendingJournal promotionJournal(promotionFailure);
+  assert(promotionJournal.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  const dental::offline::OfflineJournalRecord promotionHead =
+      appendOfflineRecord(promotionJournal,
+                          dental::offline::OfflineAction::kRestock, product);
+  appendOfflineRecord(promotionJournal,
+                      dental::offline::OfflineAction::kCheckout, product);
+  const std::string promotionBefore =
+      promotionFailure.files[dental::offline::kPendingJournalPath];
+  promotionFailure.failTemporaryPromotion = true;
+  assert(promotionJournal.acknowledgeOldest(promotionHead.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kWriteFailed);
+  assert(promotionFailure.files[dental::offline::kPendingJournalPath] ==
+         promotionBefore);
+  assert(promotionJournal.metadata().pendingCount == 2U);
+  assert(promotionJournal.acknowledgeOldest(promotionHead.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kAcknowledged);
+  assert(promotionJournal.metadata().pendingCount == 1U);
+}
+
+void interruptedAcknowledgementRecoveryNeverRetiresTheNextRow() {
+  MemoryPendingJournalStorage source;
+  dental::offline::PendingJournal journal(source);
+  assert(journal.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  const dental::cache::CacheProduct product = makeCachedProduct();
+  const dental::offline::OfflineJournalRecord first = appendOfflineRecord(
+      journal, dental::offline::OfflineAction::kRestock, product);
+  const dental::offline::OfflineJournalRecord second = appendOfflineRecord(
+      journal, dental::offline::OfflineAction::kCheckout, product);
+  const std::string oldActive =
+      source.files[dental::offline::kPendingJournalPath];
+  assert(journal.acknowledgeOldest(first.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kAcknowledged);
+  const std::string acknowledgedActive =
+      source.files[dental::offline::kPendingJournalPath];
+
+  MemoryPendingJournalStorage beforePromotion;
+  beforePromotion.files[dental::offline::kPendingJournalBackupPath] = oldActive;
+  beforePromotion.files[dental::offline::kPendingJournalTemporaryPath] =
+      acknowledgedActive;
+  dental::offline::PendingJournal rolledBack(beforePromotion);
+  assert(rolledBack.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  dental::offline::OfflineJournalRecord head = {};
+  assert(rolledBack.peekOldest(head) ==
+         dental::offline::JournalPeekResult::kFound);
+  assert(strcmp(head.eventId, first.eventId) == 0);
+  assert(rolledBack.acknowledgeOldest(first.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kAcknowledged);
+  assert(rolledBack.peekOldest(head) ==
+         dental::offline::JournalPeekResult::kFound);
+  assert(strcmp(head.eventId, second.eventId) == 0);
+
+  MemoryPendingJournalStorage afterPromotion;
+  afterPromotion.files[dental::offline::kPendingJournalPath] =
+      acknowledgedActive;
+  afterPromotion.files[dental::offline::kPendingJournalBackupPath] = oldActive;
+  dental::offline::PendingJournal committed(afterPromotion);
+  assert(committed.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  assert(committed.acknowledgeOldest(first.eventId) ==
+         dental::offline::JournalAcknowledgementResult::
+             kAlreadyAcknowledged);
+  assert(committed.metadata().pendingCount == 1U);
+  assert(committed.peekOldest(head) ==
+         dental::offline::JournalPeekResult::kFound);
+  assert(strcmp(head.eventId, second.eventId) == 0);
+}
+
+void acknowledgedPrefixKeepsStockOverlayAndUnrelatedRowsExact() {
+  MemoryPendingJournalStorage storage;
+  dental::offline::PendingJournal journal(storage);
+  assert(journal.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  const dental::cache::CacheProduct firstProduct =
+      makeCachedProduct("1", "0001", 8ULL, 3ULL,
+                        dental::cache::StockStatus::kHigh);
+  const dental::cache::CacheProduct secondProduct =
+      makeCachedProduct("2", "0002", 5ULL, 3ULL,
+                        dental::cache::StockStatus::kHigh);
+  const dental::offline::OfflineJournalRecord first = appendOfflineRecord(
+      journal, dental::offline::OfflineAction::kRestock, firstProduct);
+  const dental::offline::OfflineJournalRecord unrelated = appendOfflineRecord(
+      journal, dental::offline::OfflineAction::kCheckout, secondProduct,
+      cacheGenerationA(), "2026-09-09 12:34:57");
+  appendOfflineRecord(journal, dental::offline::OfflineAction::kRestock,
+                      firstProduct, cacheGenerationA(),
+                      "2026-09-09 12:34:58");
+  const std::string rowsBefore = journalColumnsAndRows(
+      storage.files[dental::offline::kPendingJournalPath]);
+
+  assert(journal.acknowledgeOldest(first.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kAcknowledged);
+  assert(journalColumnsAndRows(
+             storage.files[dental::offline::kPendingJournalPath]) ==
+         rowsBefore);
+  dental::offline::OfflineJournalRecord head = {};
+  assert(journal.peekOldest(head) ==
+         dental::offline::JournalPeekResult::kFound);
+  assert(strcmp(head.eventId, unrelated.eventId) == 0);
+  assert(strcmp(head.productId, "2") == 0);
+  assert(strcmp(head.barcode, "0002") == 0);
+
+  uint64_t firstStock = 0ULL;
+  uint64_t secondStock = 0ULL;
+  assert(journal.deriveCurrentStock(firstProduct, cacheGenerationA(),
+                                    firstStock) ==
+         dental::offline::OverlayResult::kSuccess);
+  assert(journal.deriveCurrentStock(secondProduct, cacheGenerationA(),
+                                    secondStock) ==
+         dental::offline::OverlayResult::kSuccess);
+  assert(firstStock == 10ULL);
+  assert(secondStock == 4ULL);
+}
+
+void cacheRefreshCompactionRetainsReplayWatermarkAndSequenceMonotonicity() {
+  MemoryPendingJournalStorage storage;
+  dental::offline::PendingJournal journal(storage);
+  assert(journal.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  const dental::cache::CacheProduct original = makeCachedProduct();
+  const dental::offline::OfflineJournalRecord first = appendOfflineRecord(
+      journal, dental::offline::OfflineAction::kRestock, original);
+  assert(journal.compactAcknowledgedPrefix() ==
+         dental::offline::JournalCompactionResult::kNotReady);
+  assert(journal.acknowledgeOldest(first.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kAcknowledged);
+  assert(journal.metadata().pendingCount == 0U);
+  assert(journal.metadata().storedCount == 1U);
+  assert(journal.compactAcknowledgedPrefix() ==
+         dental::offline::JournalCompactionResult::kCompacted);
+  assert(journal.metadata().pendingCount == 0U);
+  assert(journal.metadata().storedCount == 0U);
+  assert(journal.metadata().compactedSequence == first.sequence);
+  assert(journal.metadata().acknowledgedSequence == first.sequence);
+  assert(storage.files[dental::offline::kPendingJournalPath].find(
+             first.eventId) == std::string::npos);
+
+  dental::offline::PendingJournal rebooted(storage);
+  assert(rebooted.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  assert(rebooted.acknowledgeOldest(first.eventId) ==
+         dental::offline::JournalAcknowledgementResult::
+             kAlreadyAcknowledged);
+  const dental::cache::CacheProduct refreshed =
+      makeCachedProduct("1", "0012345678901", 9ULL, 3ULL,
+                        dental::cache::StockStatus::kHigh);
+  const dental::offline::OfflineJournalRecord next = appendOfflineRecord(
+      rebooted, dental::offline::OfflineAction::kCheckout, refreshed,
+      cacheGenerationB());
+  assert(next.sequence == first.sequence + 1ULL);
+  assert(strcmp(next.eventId,
+                "off-20500DE58C14-0000000000000002") == 0);
+  assert(rebooted.acknowledgeOldest(first.eventId) ==
+         dental::offline::JournalAcknowledgementResult::
+             kAlreadyAcknowledged);
+  dental::offline::OfflineJournalRecord head = {};
+  assert(rebooted.peekOldest(head) ==
+         dental::offline::JournalPeekResult::kFound);
+  assert(strcmp(head.eventId, next.eventId) == 0);
+}
+
+void cacheRefreshCompactionFaultLeavesAcknowledgedOverlayRecoverable() {
+  MemoryPendingJournalStorage storage;
+  dental::offline::PendingJournal journal(storage);
+  assert(journal.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  const dental::cache::CacheProduct product = makeCachedProduct();
+  const dental::offline::OfflineJournalRecord record = appendOfflineRecord(
+      journal, dental::offline::OfflineAction::kRestock, product);
+  assert(journal.acknowledgeOldest(record.eventId) ==
+         dental::offline::JournalAcknowledgementResult::kAcknowledged);
+  const std::string retained =
+      storage.files[dental::offline::kPendingJournalPath];
+  storage.failTemporaryPromotion = true;
+  assert(journal.compactAcknowledgedPrefix() ==
+         dental::offline::JournalCompactionResult::kWriteFailed);
+  assert(storage.files[dental::offline::kPendingJournalPath] == retained);
+  assert(journal.metadata().storedCount == 1U);
+  assert(journal.metadata().pendingCount == 0U);
+
+  uint64_t stock = 0ULL;
+  assert(journal.deriveCurrentStock(product, cacheGenerationA(), stock) ==
+         dental::offline::OverlayResult::kSuccess);
+  assert(stock == 9ULL);
+  dental::offline::PendingJournal rebooted(storage);
+  assert(rebooted.loadOrCreate(offlineDeviceId()) ==
+         dental::offline::JournalLoadResult::kReady);
+  assert(rebooted.metadata().storedCount == 1U);
+  assert(rebooted.acknowledgeOldest(record.eventId) ==
+         dental::offline::JournalAcknowledgementResult::
+             kAlreadyAcknowledged);
+  assert(rebooted.compactAcknowledgedPrefix() ==
+         dental::offline::JournalCompactionResult::kCompacted);
+}
+
 void maximumBoundedFieldsSurviveOfflineLookupAndJournalReuse() {
   // Host tests cannot reproduce the ESP32 loopTask stack limit, but this
   // drives the same lookup -> overlay -> append -> rescan path with the largest
@@ -1968,6 +2326,14 @@ int main() {
   pendingTransportSurvivesRebootAndKeepsOldest();
   pendingTransportFailsClosedWithoutRepairingReadPath();
   pendingTransportUnavailableIsHarmless();
+  offlineAcknowledgementRetiresOnlyHeadAndUsesExactContract();
+  offlineAcknowledgementRequestParserIsStrictAndNonMutating();
+  offlineAcknowledgementReplaySurvivesRebootAndProtectsNextHead();
+  offlineAcknowledgementWriteFaultsNeverAdvanceTheHead();
+  interruptedAcknowledgementRecoveryNeverRetiresTheNextRow();
+  acknowledgedPrefixKeepsStockOverlayAndUnrelatedRowsExact();
+  cacheRefreshCompactionRetainsReplayWatermarkAndSequenceMonotonicity();
+  cacheRefreshCompactionFaultLeavesAcknowledgedOverlayRecoverable();
   maximumBoundedFieldsSurviveOfflineLookupAndJournalReuse();
   pendingOverlayChainsAcrossRebootWithUniqueSequenceIds();
   zeroStockCheckoutNeverAppendsAJournalRecord();
@@ -1982,6 +2348,6 @@ int main() {
   invalidOfflineRecordFieldsCannotReachStorage();
   unavailableJournalAndCacheAreSafeFailures();
   offlineJournalDoesNotAlterOnlineQueueOrIntegrationCsv();
-  puts("Firmware event queue/protocol/presence/cache/offline journal: 70 host test scenarios PASSED");
+  puts("Firmware event queue/protocol/presence/cache/offline journal: 78 host test scenarios PASSED");
   return 0;
 }

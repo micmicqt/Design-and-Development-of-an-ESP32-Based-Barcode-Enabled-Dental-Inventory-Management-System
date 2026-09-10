@@ -10,7 +10,6 @@ import type {
   InventoryCategory,
   MovementHistoryDto,
   OfflinePendingEvent,
-  OfflineReconciliationReceipt,
   ProductDto,
   ProductListQuery
 } from '../../shared/ipc-contract'
@@ -103,6 +102,19 @@ function createDesktopApi({
       reconcileNextOfflineEvent: vi.fn().mockResolvedValue({
         ok: true,
         value: { status: 'NO_PENDING_EVENT' }
+      }),
+      synchronizeOfflineInventory: vi.fn().mockResolvedValue({
+        ok: true,
+        value: {
+          status: 'COMPLETE',
+          counts: { appliedEvents: 0, alreadyAppliedEvents: 0, acknowledgedEvents: 0 },
+          pendingSyncItems: 0,
+          cache: {
+            generation: `v1-${'0'.repeat(64)}`,
+            itemCount: 0,
+            alreadyCurrent: true
+          }
+        }
       }),
       acknowledgeTransactionEvent: vi.fn().mockResolvedValue({
         ok: false,
@@ -1617,7 +1629,7 @@ describe('Phase 2 desktop application', () => {
     }
   })
 
-  it('uses Any Time Dental shell branding and clearly labels local-only reconciliation', async () => {
+  it('uses Any Time Dental shell branding and clearly labels safe offline synchronization', async () => {
     const user = userEvent.setup()
     installDesktopApi(createDesktopApi())
 
@@ -1633,21 +1645,20 @@ describe('Phase 2 desktop application', () => {
     expect(screen.queryByText('DI')).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('tab', { name: 'SYNC OFFLINE' }))
-    expect(
-      screen.getByRole('heading', { name: 'No pending transaction is available.' })
-    ).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'No pending kiosk transaction is visible.' })).toBeVisible()
     expect(
       screen.getByText(
-        'Reconciliation can apply the oldest pending event to SQLite once. Device acknowledgement is not available in this step, so the event remains pending on the ESP32.'
+        'Pending kiosk transactions are applied to SQLite and acknowledged one at a time. The authoritative offline cache is refreshed only after every pending record is retired.'
       )
     ).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Verify and refresh cache' })).toBeVisible()
 
     expect(screen.queryByText(/Phase 2/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Hardware disabled/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Not implemented in this phase/i)).not.toBeInTheDocument()
   })
 
-  it('shows the oldest pending event with only a narrow local-application control', async () => {
+  it('shows the oldest pending event with only a parameter-free synchronization control', async () => {
     const user = userEvent.setup()
     const event: OfflinePendingEvent = {
       eventId: 'off-A1B2C3D4E5F6-0000000000000001',
@@ -1681,9 +1692,7 @@ describe('Phase 2 desktop application', () => {
     render(<App />)
     await user.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
 
-    const preview = await screen.findByRole('region', {
-      name: 'Offline reconciliation'
-    })
+    const preview = await screen.findByRole('region', { name: 'Offline synchronization' })
     expect(getNextOfflineEvent).toHaveBeenCalledOnce()
     expect(within(preview).getByText('6')).toBeVisible()
     expect(within(preview).getByText('Ready')).toBeVisible()
@@ -1698,16 +1707,16 @@ describe('Phase 2 desktop application', () => {
     expect(within(preview).getByText(event.cacheGeneration)).toBeVisible()
     expect(within(preview).getByText('Pending on ESP32')).toBeVisible()
     expect(
-      within(preview).getByRole('button', { name: 'Apply pending transaction locally' })
+      within(preview).getByRole('button', { name: 'Synchronize offline transactions' })
     ).toBeVisible()
     expect(
-      within(preview).queryByRole('button', { name: /acknowledge|delete|synchronize/i })
+      within(preview).queryByRole('button', { name: /acknowledge|delete/i })
     ).not.toBeInTheDocument()
     expect(within(preview).queryByRole('textbox')).not.toBeInTheDocument()
     expect(within(preview).queryByRole('spinbutton')).not.toBeInTheDocument()
   })
 
-  it('distinguishes a new local application from an idempotent replay while the event stays pending', async () => {
+  it('reports complete synchronization only after all events are retired and the cache refreshes', async () => {
     const user = userEvent.setup()
     const event: OfflinePendingEvent = {
       eventId: 'off-A1B2C3D4E5F6-0000000000000001',
@@ -1720,71 +1729,50 @@ describe('Phase 2 desktop application', () => {
       stockStatus: 'LOW',
       cacheGeneration: `v1-${'a'.repeat(64)}`
     }
-    const receipt: OfflineReconciliationReceipt = {
-      eventId: event.eventId,
-      transactionId: 'offline-transaction-1',
-      productId: 42,
-      barcode: event.barcode,
-      itemName: 'Composite Resin',
-      category: 'Restorative & Esthetic',
-      action: event.action,
-      delta: event.delta,
-      previousStock: 3,
-      newTotal: 4,
-      status: 'LOW',
-      offlineResultingStock: event.resultingStock,
-      offlineStockStatus: event.stockStatus,
-      timestamp: event.timestamp,
-      cacheGeneration: event.cacheGeneration
-    }
-    const reconcileNextOfflineEvent = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        value: { status: 'APPLIED', receipt }
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        value: { status: 'ALREADY_APPLIED', receipt }
-      })
+    const synchronizeOfflineInventory = vi.fn().mockResolvedValue({
+      ok: true,
+      value: {
+        status: 'COMPLETE',
+        counts: { appliedEvents: 5, alreadyAppliedEvents: 1, acknowledgedEvents: 6 },
+        pendingSyncItems: 0,
+        cache: {
+          generation: `v1-${'c'.repeat(64)}`,
+          itemCount: 2,
+          alreadyCurrent: false
+        }
+      }
+    })
     installDesktopApi(
       createDesktopApi({
         hardware: {
           getNextOfflineEvent: vi.fn().mockResolvedValue({ ok: true, value: event }),
-          reconcileNextOfflineEvent
+          synchronizeOfflineInventory
         }
       })
     )
 
     render(<App />)
     await user.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
-    const page = await screen.findByRole('region', { name: 'Offline reconciliation' })
-    const apply = within(page).getByRole('button', {
-      name: 'Apply pending transaction locally'
+    const page = await screen.findByRole('region', { name: 'Offline synchronization' })
+    const synchronize = within(page).getByRole('button', {
+      name: 'Synchronize offline transactions'
     })
 
-    await user.click(apply)
-    let result = await within(page).findByRole('status', {
-      name: 'Local reconciliation result'
+    await user.click(synchronize)
+    const result = await within(page).findByRole('status', {
+      name: 'Offline synchronization result'
     })
-    expect(result).toHaveTextContent('Applied locally')
-    expect(result).toHaveTextContent('Awaiting device acknowledgement')
-    expect(result).toHaveTextContent('committed to SQLite and movement history exactly once')
-    expect(within(result).getByText('3 → 4')).toBeVisible()
-    expect(within(result).getByText('LOW')).toBeVisible()
-    expect(within(page).getByText('Pending on ESP32')).toBeVisible()
-    expect(reconcileNextOfflineEvent).toHaveBeenNthCalledWith(1)
-
-    await user.click(apply)
-    result = await within(page).findByRole('status', { name: 'Local reconciliation result' })
-    expect(result).toHaveTextContent('Already applied locally')
-    expect(result).toHaveTextContent('No stock or movement-history row was added by this replay')
-    expect(result).toHaveTextContent('Awaiting device acknowledgement')
-    expect(within(page).getByText('Pending on ESP32')).toBeVisible()
-    expect(reconcileNextOfflineEvent).toHaveBeenNthCalledWith(2)
+    expect(result).toHaveTextContent('Sync Complete')
+    expect(result).toHaveTextContent('Applied now5')
+    expect(result).toHaveTextContent('Already applied1')
+    expect(result).toHaveTextContent('Acknowledged6')
+    expect(result).toHaveTextContent('2 active item(s)')
+    expect(result).toHaveTextContent(`v1-${'c'.repeat(64)}`)
+    expect(within(page).getByText('0')).toBeVisible()
+    expect(synchronizeOfflineInventory).toHaveBeenCalledExactlyOnceWith()
   })
 
-  it('keeps conflicts and unconfirmed failures pending with explicit retry-safe feedback', async () => {
+  it('keeps a conflicted FIFO head pending and reports completed progress before it', async () => {
     const user = userEvent.setup()
     const event: OfflinePendingEvent = {
       eventId: 'off-A1B2C3D4E5F6-0000000000000002',
@@ -1797,57 +1785,173 @@ describe('Phase 2 desktop application', () => {
       stockStatus: 'LOW',
       cacheGeneration: `v1-${'b'.repeat(64)}`
     }
-    const reconcileNextOfflineEvent = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        value: {
-          status: 'CONFLICT',
-          conflict: {
-            code: 'PRODUCT_IDENTITY_CONFLICT',
-            message: 'The product ID and barcode do not identify the same active product.',
-            eventId: event.eventId
-          }
+    const synchronizeOfflineInventory = vi.fn().mockResolvedValue({
+      ok: true,
+      value: {
+        status: 'CONFLICT',
+        counts: { appliedEvents: 2, alreadyAppliedEvents: 1, acknowledgedEvents: 3 },
+        conflict: {
+          code: 'PRODUCT_IDENTITY_CONFLICT',
+          message: 'The product ID and barcode do not identify the same active product.',
+          eventId: event.eventId
         }
-      })
-      .mockResolvedValueOnce({
-        ok: false,
-        error: { code: 'INTERNAL_ERROR', message: 'Reconciliation is temporarily unavailable.' }
-      })
+      }
+    })
     installDesktopApi(
       createDesktopApi({
         hardware: {
           getNextOfflineEvent: vi.fn().mockResolvedValue({ ok: true, value: event }),
-          reconcileNextOfflineEvent
+          synchronizeOfflineInventory
         }
       })
     )
 
     render(<App />)
     await user.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
-    const page = await screen.findByRole('region', { name: 'Offline reconciliation' })
-    const apply = within(page).getByRole('button', {
-      name: 'Apply pending transaction locally'
+    const page = await screen.findByRole('region', { name: 'Offline synchronization' })
+    const synchronize = within(page).getByRole('button', {
+      name: 'Synchronize offline transactions'
     })
 
-    await user.click(apply)
-    let alert = await within(page).findByRole('alert', {
-      name: 'Offline reconciliation problem'
+    await user.click(synchronize)
+    const alert = await within(page).findByRole('alert', {
+      name: 'Offline synchronization problem'
     })
-    expect(alert).toHaveTextContent('Conflict or error')
+    expect(alert).toHaveTextContent('Synchronization stopped at a conflict')
     expect(alert).toHaveTextContent(
       'The product ID and barcode do not identify the same active product.'
     )
-    expect(alert).toHaveTextContent('No local inventory update was committed for this attempt.')
+    expect(alert).toHaveTextContent('remains the pending FIFO head')
+    expect(alert).toHaveTextContent('Acknowledged3')
     expect(within(page).getByText('Pending on ESP32')).toBeVisible()
+    expect(synchronizeOfflineInventory).toHaveBeenCalledExactlyOnceWith()
+  })
 
-    await user.click(apply)
-    alert = await within(page).findByRole('alert', {
-      name: 'Offline reconciliation problem'
+  it('explains ACK-only recovery and completes safely on retry', async () => {
+    const user = userEvent.setup()
+    const event: OfflinePendingEvent = {
+      eventId: 'off-A1B2C3D4E5F6-0000000000000001',
+      timestamp: '2026-09-09 09:08:07',
+      productId: '42',
+      barcode: '000012340005',
+      action: 'RESTOCK',
+      delta: 1,
+      resultingStock: 4,
+      stockStatus: 'LOW',
+      cacheGeneration: `v1-${'a'.repeat(64)}`
+    }
+    const synchronizeOfflineInventory = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        value: {
+          status: 'ACKNOWLEDGEMENT_PENDING',
+          counts: { appliedEvents: 0, alreadyAppliedEvents: 1, acknowledgedEvents: 0 },
+          eventId: event.eventId
+        }
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        value: {
+          status: 'COMPLETE',
+          counts: { appliedEvents: 0, alreadyAppliedEvents: 1, acknowledgedEvents: 1 },
+          pendingSyncItems: 0,
+          cache: {
+            generation: `v1-${'d'.repeat(64)}`,
+            itemCount: 2,
+            alreadyCurrent: false
+          }
+        }
+      })
+    installDesktopApi(
+      createDesktopApi({
+        hardware: {
+          getNextOfflineEvent: vi.fn().mockResolvedValue({ ok: true, value: event }),
+          synchronizeOfflineInventory
+        }
+      })
+    )
+
+    render(<App />)
+    await user.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
+    const page = await screen.findByRole('region', { name: 'Offline synchronization' })
+    const synchronize = within(page).getByRole('button', {
+      name: 'Synchronize offline transactions'
     })
-    expect(alert).toHaveTextContent('Reconciliation is temporarily unavailable.')
-    expect(alert).toHaveTextContent('durable event receipt prevents duplicate local application')
-    expect(within(page).getByText('Pending on ESP32')).toBeVisible()
+
+    await user.click(synchronize)
+    const alert = await within(page).findByRole('alert', {
+      name: 'Offline synchronization problem'
+    })
+    expect(alert).toHaveTextContent('Inventory saved; device acknowledgement pending')
+    expect(alert).toHaveTextContent('Retrying will acknowledge this event without applying')
+
+    await user.click(synchronize)
+    expect(await within(page).findByText('Sync Complete')).toBeVisible()
+    expect(synchronizeOfflineInventory).toHaveBeenCalledTimes(2)
+    expect(synchronizeOfflineInventory).toHaveBeenNthCalledWith(1)
+    expect(synchronizeOfflineInventory).toHaveBeenNthCalledWith(2)
+  })
+
+  it('distinguishes final cache-refresh failure and retries only through the backend capability', async () => {
+    const user = userEvent.setup()
+    const synchronizeOfflineInventory = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        value: {
+          status: 'CACHE_REFRESH_FAILED',
+          counts: { appliedEvents: 6, alreadyAppliedEvents: 0, acknowledgedEvents: 6 },
+          pendingSyncItems: 0
+        }
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        value: {
+          status: 'COMPLETE',
+          counts: { appliedEvents: 6, alreadyAppliedEvents: 0, acknowledgedEvents: 6 },
+          pendingSyncItems: 0,
+          cache: {
+            generation: `v1-${'e'.repeat(64)}`,
+            itemCount: 2,
+            alreadyCurrent: false
+          }
+        }
+      })
+    installDesktopApi(createDesktopApi({ hardware: { synchronizeOfflineInventory } }))
+
+    render(<App />)
+    await user.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
+    const page = await screen.findByRole('region', { name: 'Offline synchronization' })
+    await user.click(within(page).getByRole('button', { name: 'Verify and refresh cache' }))
+
+    const alert = await within(page).findByRole('alert', {
+      name: 'Offline synchronization problem'
+    })
+    expect(alert).toHaveTextContent('Transactions synchronized; cache refresh pending')
+    expect(alert).toHaveTextContent('Retrying performs the cache refresh only')
+
+    await user.click(within(page).getByRole('button', { name: 'Retry cache refresh' }))
+    expect(await within(page).findByText('Sync Complete')).toBeVisible()
+    expect(synchronizeOfflineInventory).toHaveBeenCalledTimes(2)
+  })
+
+  it('prevents overlapping renderer synchronization requests', async () => {
+    const user = userEvent.setup()
+    const synchronizeOfflineInventory = vi.fn<
+      DesktopApi['hardware']['synchronizeOfflineInventory']
+    >(() => new Promise(() => undefined))
+    installDesktopApi(createDesktopApi({ hardware: { synchronizeOfflineInventory } }))
+
+    render(<App />)
+    await user.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
+    const synchronize = await screen.findByRole('button', { name: 'Verify and refresh cache' })
+
+    fireEvent.click(synchronize)
+    fireEvent.click(synchronize)
+
+    expect(synchronize).toBeDisabled()
+    expect(synchronizeOfflineInventory).toHaveBeenCalledExactlyOnceWith()
   })
 
   it('reports a retryable pending-preview failure without implying any record changed', async () => {
@@ -1868,9 +1972,7 @@ describe('Phase 2 desktop application', () => {
 
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('Pending transaction preview is unavailable.')
-    expect(alert).toHaveTextContent(
-      'The request is safe to retry after reconnecting. No pending record was changed.'
-    )
+    expect(alert).toHaveTextContent('No pending record is acknowledged by this preview.')
   })
 
   it('renders database products, image fallbacks, and all stock statuses', async () => {

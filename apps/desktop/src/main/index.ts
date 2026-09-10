@@ -14,6 +14,7 @@ import { resolveEsp32BaseUrl } from './hardware/hardware-configuration'
 import { Esp32HttpGateway } from './hardware/esp32-http-gateway'
 import type { DesktopHardwareGateway } from './hardware/hardware-gateway'
 import { createOfflineInventoryCacheCoordinator } from './hardware/offline-inventory-cache'
+import { createOfflineSyncCoordinator } from './hardware/offline-sync-coordinator'
 import { createHardwareTransactionCoordinator } from './hardware/hardware-transaction-coordinator'
 import { registerAuthIpcHandlers } from './ipc/register-auth-handlers'
 import { registerHardwareIpcHandlers } from './ipc/register-hardware-handlers'
@@ -131,6 +132,14 @@ async function startDesktopApplication(): Promise<void> {
           inventoryService,
           gateway: hardwareGateway
         })
+  const offlineSyncCoordinator =
+    hardwareGateway === null || offlineInventoryCacheCoordinator === null
+      ? null
+      : createOfflineSyncCoordinator({
+          inventoryService,
+          gateway: hardwareGateway,
+          offlineInventoryCacheCoordinator
+        })
 
   disposeImageProtocol = registerDentalImageProtocol(session.defaultSession, imageStore)
   mainWindow = createMainWindow()
@@ -152,6 +161,7 @@ async function startDesktopApplication(): Promise<void> {
     inventoryService,
     transactionCoordinator,
     offlineInventoryCacheCoordinator,
+    offlineSyncCoordinator,
     authSession,
     getMainWindow
   })

@@ -33,6 +33,7 @@ export const IPC_CHANNELS = {
   hardwareSendDesktopHeartbeat: 'hardware:send-desktop-heartbeat',
   hardwareGetNextOfflineEvent: 'hardware:get-next-offline-event',
   hardwareReconcileNextOfflineEvent: 'hardware:reconcile-next-offline-event',
+  hardwareSynchronizeOfflineInventory: 'hardware:synchronize-offline-inventory',
   hardwareGetNextTransactionEvent: 'hardware:get-next-transaction-event',
   hardwareAcknowledgeTransactionEvent: 'hardware:acknowledge-transaction-event',
   hardwareGetTransactionReceipt: 'hardware:get-transaction-receipt',
@@ -128,6 +129,46 @@ export type OfflineReconciliationOutcome =
       }
     }
   | { status: 'NO_PENDING_EVENT' }
+
+export interface OfflineSyncCounts {
+  appliedEvents: number
+  alreadyAppliedEvents: number
+  acknowledgedEvents: number
+}
+
+export interface OfflineSyncCacheResult {
+  generation: string
+  itemCount: number
+  alreadyCurrent: boolean
+}
+
+/** Backend-owned synchronization result; the renderer supplies no journal data. */
+export type OfflineSyncOutcome =
+  | {
+      status: 'COMPLETE'
+      counts: OfflineSyncCounts
+      pendingSyncItems: 0
+      cache: OfflineSyncCacheResult
+    }
+  | {
+      status: 'CONFLICT'
+      counts: OfflineSyncCounts
+      conflict: {
+        code: OfflineReconciliationConflictCode
+        message: string
+        eventId: string
+      }
+    }
+  | {
+      status: 'ACKNOWLEDGEMENT_PENDING'
+      counts: OfflineSyncCounts
+      eventId: string
+    }
+  | {
+      status: 'CACHE_REFRESH_FAILED'
+      counts: OfflineSyncCounts
+      pendingSyncItems: 0
+    }
 
 /** Durable snapshot of a committed online transaction, not live product stock. */
 export interface HardwareTransactionReceipt extends HardwareTransactionEvent {
@@ -295,6 +336,8 @@ export interface DesktopApi {
     getNextOfflineEvent: () => Promise<IpcResult<OfflinePendingEvent | null>>
     /** Applies the backend-retrieved oldest offline event to SQLite without acknowledging it. */
     reconcileNextOfflineEvent: () => Promise<IpcResult<OfflineReconciliationOutcome>>
+    /** Drains, durably reconciles, acknowledges, and refreshes the final cache backend-side. */
+    synchronizeOfflineInventory: () => Promise<IpcResult<OfflineSyncOutcome>>
     getNextTransactionEvent: () => Promise<HardwareTransactionEvent | null>
     acknowledgeTransactionEvent: (
       eventId: string

@@ -90,11 +90,24 @@ export interface OfflinePendingEventGateway {
   getNextOfflineEvent(): Promise<OfflinePendingEvent | null>
 }
 
+export interface OfflineEventAcknowledgement {
+  acknowledged: true
+  eventId: string
+  pendingSyncItems: number
+  alreadyAcknowledged: boolean
+}
+
+/** Idempotent retirement boundary for one durable offline journal head. */
+export interface OfflineEventAcknowledgementGateway {
+  acknowledgeOfflineEvent(eventId: string): Promise<OfflineEventAcknowledgement>
+}
+
 /** Production desktop boundary. Transaction and cache APIs stay backend-only. */
 export interface DesktopHardwareGateway
   extends HardwareTransactionEventGateway,
     OfflineInventoryCacheGateway,
-    OfflinePendingEventGateway {}
+    OfflinePendingEventGateway,
+    OfflineEventAcknowledgementGateway {}
 
 export function isValidHardwareTransactionEventId(value: unknown): value is string {
   return (

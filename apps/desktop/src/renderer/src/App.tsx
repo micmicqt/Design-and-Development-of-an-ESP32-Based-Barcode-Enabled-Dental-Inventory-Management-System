@@ -69,7 +69,7 @@ const sectionMetadata: Record<
   'SYNC OFFLINE': {
     eyebrow: 'Clinic kiosk',
     title: 'Sync Offline',
-    description: 'Apply pending kiosk transactions locally with durable replay protection.'
+    description: 'Reconcile pending kiosk transactions and refresh its authoritative inventory.'
   }
 }
 

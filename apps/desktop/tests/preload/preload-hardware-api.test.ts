@@ -184,6 +184,48 @@ describe('preload hardware API', () => {
     )
   })
 
+  it('exposes parameter-free offline synchronization without forwarding backend data', async () => {
+    const result = {
+      ok: true,
+      value: {
+        status: 'COMPLETE',
+        counts: {
+          appliedEvents: 2,
+          alreadyAppliedEvents: 1,
+          acknowledgedEvents: 3
+        },
+        pendingSyncItems: 0,
+        cache: {
+          generation: `v1-${'a'.repeat(64)}`,
+          itemCount: 8,
+          alreadyCurrent: false
+        }
+      }
+    } as const
+    electronMock.invoke.mockResolvedValueOnce(result)
+
+    await expect(api.hardware.synchronizeOfflineInventory()).resolves.toEqual(result)
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareSynchronizeOfflineInventory
+    )
+
+    electronMock.invoke.mockClear()
+    electronMock.invoke.mockResolvedValueOnce(result)
+    const callWithUnexpectedArguments = api.hardware.synchronizeOfflineInventory as (
+      event: unknown,
+      url: unknown,
+      stocks: unknown
+    ) => Promise<unknown>
+    await callWithUnexpectedArguments(
+      { eventId: 'off-FORGED' },
+      'http://untrusted.example/offline/events/ack',
+      [{ id: 7, currentStock: 999_999 }]
+    )
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareSynchronizeOfflineInventory
+    )
+  })
+
   it('forwards only the event ID to the fixed acknowledgement channel', async () => {
     const result = { ok: true, value: { eventId: 'device-session-1' } }
     electronMock.invoke.mockResolvedValueOnce(result)
@@ -268,7 +310,8 @@ describe('preload hardware API', () => {
       'reconcileNextOfflineEvent',
       'retryTransactionAcknowledgement',
       'retryTransactionResultDelivery',
-      'sendDesktopHeartbeat'
+      'sendDesktopHeartbeat',
+      'synchronizeOfflineInventory'
     ])
     expect(api.hardware).not.toHaveProperty('baseUrl')
     expect(api.hardware).not.toHaveProperty('fetch')

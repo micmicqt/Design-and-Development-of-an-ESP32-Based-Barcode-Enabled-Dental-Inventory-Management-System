@@ -600,6 +600,32 @@ void sendCacheError(int statusCode, const char* errorCode) {
   httpServer.send(statusCode, "application/json", response);
 }
 
+bool compactAcknowledgedJournalAfterCacheRefresh() {
+  const dental::offline::PendingJournalMetadata& metadata =
+      offlinePendingJournal.metadata();
+  if (!metadata.available || offlinePendingJournal.uncertain() ||
+      metadata.pendingCount != 0U || metadata.storedCount == 0U) {
+    return true;
+  }
+  const dental::offline::JournalCompactionResult result =
+      offlinePendingJournal.compactAcknowledgedPrefix();
+  if (result ==
+          dental::offline::JournalCompactionResult::kCompacted ||
+      result ==
+          dental::offline::JournalCompactionResult::kAlreadyCompacted) {
+    Serial.println(
+        "Pending offline journal: acknowledged prefix compacted");
+    return true;
+  }
+  if (result ==
+      dental::offline::JournalCompactionResult::kJournalUnavailable) {
+    sendCacheError(503, "pending_journal_unavailable");
+  } else {
+    sendCacheError(500, "pending_journal_compaction_failed");
+  }
+  return false;
+}
+
 void sendCacheSuccess(const CacheRequest& request, uint32_t receivedItems,
                       bool alreadyCurrent) {
   String response;
@@ -654,6 +680,13 @@ void handleOfflineCacheRequest() {
       return;
     }
     const bool alreadyCurrent = result == BeginResult::kAlreadyCurrent;
+    // An already-current begin is the complete cache-install handshake. The
+    // desktop intentionally sends no item/commit requests in this case, which
+    // also covers a drained offline batch whose net stock delta is zero.
+    if (alreadyCurrent &&
+        !compactAcknowledgedJournalAfterCacheRefresh()) {
+      return;
+    }
     sendCacheSuccess(request, offlineInventoryCache.receivedItems(),
                      alreadyCurrent);
     return;
@@ -713,6 +746,7 @@ void handleOfflineCacheRequest() {
     return;
   }
   const bool alreadyCurrent = result == CommitResult::kAlreadyCurrent;
+  if (!compactAcknowledgedJournalAfterCacheRefresh()) return;
   sendCacheSuccess(request, request.itemCount, alreadyCurrent);
   if (!alreadyCurrent) {
     Serial.print("Offline inventory cache installed: ");
@@ -766,6 +800,55 @@ void sendAcknowledgementError(int statusCode, const char* errorCode) {
   appendJsonString(response, errorCode);
   response += '}';
   httpServer.send(statusCode, "application/json", response);
+}
+
+void handleOfflineEventAcknowledgementRequest() {
+  char requestedEventId[dental::events::kEventIdCapacity] = {};
+  const String body = httpServer.arg("plain");
+  if (!dental::events::parseAcknowledgementBody(
+          body.c_str(), body.length(), requestedEventId)) {
+    sendAcknowledgementError(400, "invalid_request");
+    return;
+  }
+
+  const dental::offline::JournalAcknowledgementResult result =
+      offlinePendingJournal.acknowledgeOldest(requestedEventId);
+  if (result ==
+      dental::offline::JournalAcknowledgementResult::kEmpty) {
+    sendAcknowledgementError(404, "no_pending_event");
+    return;
+  }
+  if (result ==
+      dental::offline::JournalAcknowledgementResult::kMismatch) {
+    sendAcknowledgementError(409, "event_id_mismatch");
+    return;
+  }
+  if (result == dental::offline::JournalAcknowledgementResult::
+                    kJournalUnavailable) {
+    sendAcknowledgementError(503, "pending_journal_unavailable");
+    return;
+  }
+  if (result ==
+          dental::offline::JournalAcknowledgementResult::kInvalidJournal ||
+      result ==
+          dental::offline::JournalAcknowledgementResult::kWriteFailed) {
+    sendAcknowledgementError(500, "pending_journal_invalid");
+    return;
+  }
+
+  const bool alreadyAcknowledged =
+      result == dental::offline::JournalAcknowledgementResult::
+                    kAlreadyAcknowledged;
+  String response;
+  response.reserve(160U);
+  dental::offline::appendOfflineAcknowledgementJson(
+      response, requestedEventId,
+      offlinePendingJournal.metadata().pendingCount, alreadyAcknowledged);
+  Serial.print(alreadyAcknowledged
+                   ? "Offline transaction ACK replay accepted: "
+                   : "Offline transaction event acknowledged: ");
+  Serial.println(requestedEventId);
+  httpServer.send(200, "application/json", response);
 }
 
 void sendResultError(int statusCode, const char* errorCode) {
@@ -871,6 +954,8 @@ void configureHttpRoutes() {
   httpServer.on("/offline/cache", HTTP_POST, handleOfflineCacheRequest);
   httpServer.on("/offline/events/next", HTTP_GET,
                 handleNextOfflineEventRequest);
+  httpServer.on("/offline/events/ack", HTTP_POST,
+                handleOfflineEventAcknowledgementRequest);
   httpServer.on("/events/next", HTTP_GET, handleNextEventRequest);
   httpServer.on("/events/ack", HTTP_POST,
                 handleEventAcknowledgementRequest);

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type {
   OfflinePendingEvent,
-  OfflineReconciliationReceipt
+  OfflineSyncCounts,
+  OfflineSyncOutcome
 } from '../../../shared/ipc-contract'
 
 type PendingPreviewState =
@@ -9,13 +10,10 @@ type PendingPreviewState =
   | { state: 'loaded'; event: OfflinePendingEvent | null }
   | { state: 'unavailable' }
 
-type ReconciliationState =
+type SynchronizationState =
   | { state: 'idle' }
-  | { state: 'applying' }
-  | { state: 'applied'; receipt: OfflineReconciliationReceipt }
-  | { state: 'already-applied'; receipt: OfflineReconciliationReceipt }
-  | { state: 'conflict'; eventId: string; message: string }
-  | { state: 'no-pending' }
+  | { state: 'syncing' }
+  | { state: 'finished'; outcome: OfflineSyncOutcome }
   | { state: 'error'; message: string }
 
 function formatPendingCount(pendingCount: number | undefined): string {
@@ -31,32 +29,20 @@ function formatSignedDelta(delta: number): string {
   return delta > 0 ? `+${delta}` : String(delta)
 }
 
-function ReconciliationDetails({ receipt }: { receipt: OfflineReconciliationReceipt }) {
+function SyncCounts({ counts }: { counts: OfflineSyncCounts }) {
   return (
-    <dl className="sync-offline-result-details" aria-label="Authoritative local result">
+    <dl className="sync-offline-result-details" aria-label="Synchronization progress">
       <div>
-        <dt>Item</dt>
-        <dd>{receipt.itemName}</dd>
+        <dt>Applied now</dt>
+        <dd>{counts.appliedEvents}</dd>
       </div>
       <div>
-        <dt>Action</dt>
-        <dd>
-          {receipt.action} {formatSignedDelta(receipt.delta)}
-        </dd>
+        <dt>Already applied</dt>
+        <dd>{counts.alreadyAppliedEvents}</dd>
       </div>
       <div>
-        <dt>Event timestamp</dt>
-        <dd>{receipt.timestamp}</dd>
-      </div>
-      <div>
-        <dt>Authoritative SQLite stock</dt>
-        <dd>
-          {receipt.previousStock} → {receipt.newTotal}
-        </dd>
-      </div>
-      <div>
-        <dt>Authoritative status</dt>
-        <dd>{receipt.status}</dd>
+        <dt>Acknowledged</dt>
+        <dd>{counts.acknowledgedEvents}</dd>
       </div>
     </dl>
   )
@@ -70,8 +56,8 @@ export function SyncOfflinePage({
   offlineReady: boolean | undefined
 }) {
   const [preview, setPreview] = useState<PendingPreviewState>({ state: 'loading' })
-  const [reconciliation, setReconciliation] = useState<ReconciliationState>({ state: 'idle' })
-  const reconciliationInFlight = useRef(false)
+  const [synchronization, setSynchronization] = useState<SynchronizationState>({ state: 'idle' })
+  const synchronizationInFlight = useRef(false)
 
   useEffect(() => {
     let active = true
@@ -91,56 +77,46 @@ export function SyncOfflinePage({
     }
   }, [])
 
-  async function reconcilePendingEvent(): Promise<void> {
-    if (reconciliationInFlight.current) return
+  async function synchronizeOfflineInventory(): Promise<void> {
+    if (synchronizationInFlight.current) return
 
-    reconciliationInFlight.current = true
-    setReconciliation({ state: 'applying' })
+    synchronizationInFlight.current = true
+    setSynchronization({ state: 'syncing' })
 
     try {
-      const result = await window.desktopApi.hardware.reconcileNextOfflineEvent()
+      const result = await window.desktopApi.hardware.synchronizeOfflineInventory()
       if (!result.ok) {
-        setReconciliation({ state: 'error', message: result.error.message })
+        setSynchronization({ state: 'error', message: result.error.message })
         return
       }
 
-      switch (result.value.status) {
-        case 'APPLIED':
-          setReconciliation({ state: 'applied', receipt: result.value.receipt })
-          return
-        case 'ALREADY_APPLIED':
-          setReconciliation({
-            state: 'already-applied',
-            receipt: result.value.receipt
-          })
-          return
-        case 'CONFLICT':
-          setReconciliation({
-            state: 'conflict',
-            eventId: result.value.conflict.eventId,
-            message: result.value.conflict.message
-          })
-          return
-        case 'NO_PENDING_EVENT':
-          setPreview({ state: 'loaded', event: null })
-          setReconciliation({ state: 'no-pending' })
+      setSynchronization({ state: 'finished', outcome: result.value })
+      if (result.value.status === 'COMPLETE' || result.value.status === 'CACHE_REFRESH_FAILED') {
+        setPreview({ state: 'loaded', event: null })
       }
     } catch {
-      setReconciliation({
+      setSynchronization({
         state: 'error',
-        message: 'The local reconciliation result could not be confirmed.'
+        message: 'Offline synchronization could not be confirmed. It is safe to retry.'
       })
     } finally {
-      reconciliationInFlight.current = false
+      synchronizationInFlight.current = false
     }
   }
 
+  const finishedOutcome = synchronization.state === 'finished' ? synchronization.outcome : null
+  const displayedPendingCount =
+    finishedOutcome?.status === 'COMPLETE' || finishedOutcome?.status === 'CACHE_REFRESH_FAILED'
+      ? 0
+      : pendingCount
+  const retryingCacheOnly = finishedOutcome?.status === 'CACHE_REFRESH_FAILED'
+
   return (
-    <section className="sync-offline-page" aria-label="Offline reconciliation">
+    <section className="sync-offline-page" aria-label="Offline synchronization">
       <div className="sync-offline-summary" aria-label="Offline journal status">
         <div>
           <span>Pending records</span>
-          <strong>{formatPendingCount(pendingCount)}</strong>
+          <strong>{formatPendingCount(displayedPendingCount)}</strong>
         </div>
         <div>
           <span>Offline journal</span>
@@ -149,11 +125,10 @@ export function SyncOfflinePage({
       </div>
 
       <div className="sync-offline-notice" role="status">
-        <strong>Local application only</strong>
+        <strong>Safe, sequential synchronization</strong>
         <span>
-          Reconciliation can apply the oldest pending event to SQLite once. Device
-          acknowledgement is not available in this step, so the event remains pending on the
-          ESP32.
+          Pending kiosk transactions are applied to SQLite and acknowledged one at a time. The
+          authoritative offline cache is refreshed only after every pending record is retired.
         </span>
       </div>
 
@@ -165,15 +140,18 @@ export function SyncOfflinePage({
         <div className="sync-offline-message" role="alert">
           <strong>Pending transaction preview is unavailable.</strong>
           <span>
-            The request is safe to retry after reconnecting. No pending record was changed.
+            Reconnect the kiosk and retry. No pending record is acknowledged by this preview.
           </span>
         </div>
       )}
 
       {preview.state === 'loaded' && preview.event === null && (
         <div className="sync-offline-message">
-          <h3>No pending transaction is available.</h3>
-          <span>The ESP32 returned an empty transport response.</span>
+          <h3>No pending kiosk transaction is visible.</h3>
+          <span>
+            Synchronization will verify that the device count is zero before refreshing its
+            authoritative inventory cache.
+          </span>
         </div>
       )}
 
@@ -221,100 +199,115 @@ export function SyncOfflinePage({
             </div>
           </dl>
           <p>
-            The device-reported stock is audit context, not the authoritative SQLite total.
-            Applying or replaying this record locally does not retire it from the ESP32.
+            Device stock remains audit context. SQLite derives the authoritative result from its
+            current stock and the signed transaction delta.
           </p>
-          <div className="sync-offline-actions">
-            <button
-              className="primary-button primary-button--inline"
-              type="button"
-              disabled={reconciliation.state === 'applying'}
-              onClick={() => void reconcilePendingEvent()}
-            >
-              {reconciliation.state === 'applying'
-                ? 'Applying locally…'
-                : 'Apply pending transaction locally'}
-            </button>
-          </div>
         </article>
       )}
 
-      {reconciliation.state === 'applied' && (
+      <div className="sync-offline-actions">
+        <button
+          className="primary-button primary-button--inline"
+          type="button"
+          disabled={synchronization.state === 'syncing'}
+          onClick={() => void synchronizeOfflineInventory()}
+        >
+          {synchronization.state === 'syncing'
+            ? 'Synchronizing…'
+            : retryingCacheOnly
+              ? 'Retry cache refresh'
+              : preview.state === 'loaded' && preview.event === null
+                ? 'Verify and refresh cache'
+                : 'Synchronize offline transactions'}
+        </button>
+      </div>
+
+      {synchronization.state === 'syncing' && (
+        <div className="sync-offline-reconciliation-result" role="status">
+          <strong>Synchronization in progress</strong>
+          <span>
+            Processing one event at a time: local commit, device acknowledgement, then retirement.
+          </span>
+        </div>
+      )}
+
+      {finishedOutcome?.status === 'COMPLETE' && (
         <div
           className="sync-offline-reconciliation-result is-success"
           role="status"
-          aria-label="Local reconciliation result"
+          aria-label="Offline synchronization result"
         >
-          <strong>Applied locally</strong>
+          <strong>Sync Complete</strong>
           <span>
-            Event {reconciliation.receipt.eventId} was committed to SQLite and movement history
-            exactly once.
+            Every pending transaction was reconciled and acknowledged, the device reports zero
+            pending records, and its authoritative inventory cache is current.
           </span>
-          <ReconciliationDetails receipt={reconciliation.receipt} />
-          <b>Awaiting device acknowledgement</b>
+          <SyncCounts counts={finishedOutcome.counts} />
+          <b>Cache refreshed</b>
           <span>
-            The event remains pending on the ESP32. Applying it again verifies the durable local
-            receipt without changing stock twice.
+            {finishedOutcome.cache.itemCount} active item(s) · generation{' '}
+            {finishedOutcome.cache.generation}
           </span>
         </div>
       )}
 
-      {reconciliation.state === 'already-applied' && (
-        <div
-          className="sync-offline-reconciliation-result is-success"
-          role="status"
-          aria-label="Local reconciliation result"
-        >
-          <strong>Already applied locally</strong>
-          <span>
-            SQLite already has a matching durable receipt for event{' '}
-            {reconciliation.receipt.eventId}. No stock or movement-history row was added by this
-            replay.
-          </span>
-          <ReconciliationDetails receipt={reconciliation.receipt} />
-          <b>Awaiting device acknowledgement</b>
-          <span>The same event remains pending on the ESP32 until a later protocol step.</span>
-        </div>
-      )}
-
-      {reconciliation.state === 'conflict' && (
+      {finishedOutcome?.status === 'CONFLICT' && (
         <div
           className="sync-offline-reconciliation-result is-error"
           role="alert"
-          aria-label="Offline reconciliation problem"
+          aria-label="Offline synchronization problem"
         >
-          <strong>Conflict or error</strong>
-          <span>{reconciliation.message}</span>
+          <strong>Synchronization stopped at a conflict</strong>
+          <span>{finishedOutcome.conflict.message}</span>
           <span>
-            Event {reconciliation.eventId} remains pending on the ESP32. No local inventory
-            update was committed for this attempt.
+            Event {finishedOutcome.conflict.eventId} remains the pending FIFO head. It was not
+            acknowledged or skipped.
           </span>
+          <SyncCounts counts={finishedOutcome.counts} />
         </div>
       )}
 
-      {reconciliation.state === 'error' && (
+      {finishedOutcome?.status === 'ACKNOWLEDGEMENT_PENDING' && (
         <div
           className="sync-offline-reconciliation-result is-error"
           role="alert"
-          aria-label="Offline reconciliation problem"
+          aria-label="Offline synchronization problem"
         >
-          <strong>Conflict or error</strong>
-          <span>{reconciliation.message}</span>
+          <strong>Inventory saved; device acknowledgement pending</strong>
           <span>
-            Retry is safe because the durable event receipt prevents duplicate local application.
-            The ESP32 record has not been acknowledged.
+            Event {finishedOutcome.eventId} is durably recorded in SQLite, but retirement on the
+            kiosk could not be confirmed.
           </span>
+          <span>Retrying will acknowledge this event without applying its inventory change again.</span>
+          <SyncCounts counts={finishedOutcome.counts} />
         </div>
       )}
 
-      {reconciliation.state === 'no-pending' && (
+      {finishedOutcome?.status === 'CACHE_REFRESH_FAILED' && (
         <div
-          className="sync-offline-reconciliation-result"
-          role="status"
-          aria-label="Local reconciliation result"
+          className="sync-offline-reconciliation-result is-error"
+          role="alert"
+          aria-label="Offline synchronization problem"
         >
-          <strong>No pending event to apply</strong>
-          <span>The backend found no authoritative pending event, so no local update was attempted.</span>
+          <strong>Transactions synchronized; cache refresh pending</strong>
+          <span>
+            All journal events were safely retired and the kiosk reports zero pending records, but
+            the final authoritative cache installation did not finish.
+          </span>
+          <span>Retrying performs the cache refresh only; retired events are not replayed.</span>
+          <SyncCounts counts={finishedOutcome.counts} />
+        </div>
+      )}
+
+      {synchronization.state === 'error' && (
+        <div
+          className="sync-offline-reconciliation-result is-error"
+          role="alert"
+          aria-label="Offline synchronization problem"
+        >
+          <strong>Synchronization paused</strong>
+          <span>{synchronization.message}</span>
+          <span>No completion was assumed. Retry after checking the kiosk connection.</span>
         </div>
       )}
     </section>
