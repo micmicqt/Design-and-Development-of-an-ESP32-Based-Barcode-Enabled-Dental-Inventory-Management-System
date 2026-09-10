@@ -62,6 +62,7 @@ describe("database migrations and constraints", () => {
 
     expect(tableNames).toEqual([
       "configured_admin",
+      "offline_reconciliation_receipts",
       "processed_hardware_events",
       "products",
       "schema_migrations",
@@ -74,6 +75,7 @@ describe("database migrations and constraints", () => {
       { version: 2, name: "phase_2_inventory_crud" },
       { version: 3, name: "phase_5_step_2_hardware_transactions" },
       { version: 4, name: "phase_5_step_3_result_delivery" },
+      { version: 5, name: "phase_7_step_2_offline_reconciliation" },
     ]);
   });
 
@@ -84,7 +86,7 @@ describe("database migrations and constraints", () => {
     const result = database
       .prepare("SELECT COUNT(*) AS count FROM schema_migrations")
       .get() as { count: number };
-    expect(result.count).toBe(4);
+    expect(result.count).toBe(5);
   });
 
   it("accepts all six fixed categories and rejects any other category", () => {

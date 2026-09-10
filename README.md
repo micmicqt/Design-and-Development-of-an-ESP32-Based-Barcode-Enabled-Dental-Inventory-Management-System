@@ -1,6 +1,6 @@
 # Dental Inventory System
 
-Phase 7 bounded offline sync transport for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+Phase 7 idempotent SQLite offline reconciliation for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
 
 This repository currently provides:
 
@@ -17,16 +17,17 @@ This repository currently provides:
 - a bounded, durable MicroSD snapshot of authoritative active inventory;
 - fixed-quantity offline RESTOCK/CHECKOUT with a durable pending journal that
   has been physically verified across ESP32 reset and complete power loss; and
-- bounded, oldest-first inspection of one pending offline record without
-  applying, acknowledging, or removing it.
+- bounded, oldest-first inspection and idempotent SQLite application of one
+  pending offline record, without acknowledging or removing it from the ESP32.
 
 Committed online results drive the kiosk LCD plus SUCCESS and stock-status
 indicators before the ESP32 event is acknowledged. When the authenticated
 desktop-presence lease is unavailable, the ESP32 can instead apply one-unit
 RESTOCK/CHECKOUT operations against its last-known inventory snapshot and append
-them to a durable pending journal. Step 7.1 can retrieve the oldest record for
-inspection, while importing, reconciling, or clearing records remains deferred
-to later Phase 7 steps. Manual barcode entry remains available for
+them to a durable pending journal. Step 7.2 can apply the oldest record to
+current SQLite stock exactly once and return the same durable receipt on replay.
+Device acknowledgement and pending-record retirement remain deferred to Phase
+7 Step 3. Manual barcode entry remains available for
 item registration; physical scans use the hardware path selected when each
 transaction begins.
 
@@ -126,20 +127,22 @@ Then:
 2. Invalid credentials display exactly `Access Denied`.
 3. Use **ADD NEW ITEM** to register a product. Barcode text retains leading zeroes, the category must be one of the six fixed choices, and stock values must be non-negative integers.
 4. Use **ITEM INVENTORY** to search by name or barcode, filter by category, and edit or safely delete products. A manual stock change creates a permanent `STOCK_CORRECTION` movement.
-5. Use **MOVEMENT HISTORY** to review persisted stock corrections newest first. **SYNC OFFLINE** can inspect the oldest pending ESP32 record, but does not apply or retire it in Step 7.1.
+5. Use **MOVEMENT HISTORY** to review persisted stock corrections newest first. **SYNC OFFLINE** can inspect and apply the oldest pending ESP32 record locally. It keeps local application separate from the still-pending device acknowledgement state.
 6. Select **Logout** to return to the login screen.
 
-React communicates only through narrow authentication, inventory, hardware-status, and pending-event inspection methods exposed by the preload. It cannot access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
+React communicates only through narrow authentication, inventory, hardware-status, pending-event inspection, and parameter-free reconciliation methods exposed by the preload. It cannot provide reconciliation event data or access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
 
 ### Local ESP32 status connection
 
-Phase 7 Step 1 adds `GET /offline/events/next`, a bounded, oldest-first read of
-one durable pending transaction. A `204` means none is pending; a validated
-`200` record remains pending across repeated reads and reboot because this step
-does not apply it to SQLite or acknowledge, archive, delete, or rewrite it. The
-existing **SYNC OFFLINE** page reports this inspection-only state through a
-parameter-free frozen-preload method. See
-[the bounded offline sync transport guide](docs/phase7-step1-offline-sync-transport.md).
+Phase 7 Step 2 composes the oldest pending event's signed delta with current
+SQLite stock in one atomic transaction. A durable event-ID receipt makes exact
+replay return **Already applied locally** without changing stock or history a
+second time. The parameter-free renderer capability cannot supply an event,
+URL, or stock total. This step sends no firmware acknowledgement, so the UI
+continues to report **Pending on ESP32** and **Awaiting device acknowledgement**.
+See [the SQLite reconciliation guide](docs/phase7-step2-sqlite-reconciliation.md).
+The underlying non-destructive transport remains documented in
+[the Step 7.1 guide](docs/phase7-step1-offline-sync-transport.md).
 
 Phase 6 Step 2B freezes each accepted scan as either ONLINE or OFFLINE based on
 the desktop-presence lease. The existing online FIFO and quantity workflow are
@@ -243,6 +246,11 @@ database-level idempotency guard for online hardware transactions.
 Migration 4 adds the nullable `result_delivered_at` boundary to that receipt.
 It is set only after the ESP32 accepts the committed result, allowing a restart
 to retry result delivery when null and perform acknowledgement only when set.
+
+Migration 5 adds `offline_reconciliation_receipts`, keyed by the durable
+offline event ID and linked to its immutable `OFFLINE` movement. It retains the
+exact device audit fields for replay-conflict detection while SQLite
+`previous_stock`, `new_total`, and derived status remain authoritative.
 
 ## Desktop checks and production bundle
 

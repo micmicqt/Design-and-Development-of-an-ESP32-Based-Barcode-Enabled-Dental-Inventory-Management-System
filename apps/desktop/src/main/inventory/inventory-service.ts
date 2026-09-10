@@ -2,6 +2,9 @@ import { randomUUID } from "node:crypto";
 import type {
   HardwareTransactionEvent,
   HardwareTransactionReceipt,
+  OfflinePendingEvent,
+  OfflineReconciliationConflictCode,
+  OfflineReconciliationReceipt,
 } from "../../shared/ipc-contract";
 import { MAX_TRANSACTION_QUANTITY } from "../../shared/transaction-quantity";
 import type { SqliteDatabase } from "../database";
@@ -57,6 +60,17 @@ export class ProductNotFoundError extends InventoryServiceError {
   }
 }
 
+export class OfflineReconciliationConflictError extends Error {
+  constructor(
+    public readonly code: OfflineReconciliationConflictCode,
+    message: string,
+    public readonly eventId: string,
+  ) {
+    super(message);
+    this.name = "OfflineReconciliationConflictError";
+  }
+}
+
 export interface ProductQuery {
   search?: string;
   category?: string | null;
@@ -88,6 +102,11 @@ export interface DeleteProductInput {
 export interface ProcessHardwareTransactionServiceInput {
   event: HardwareTransactionEvent;
   quantity: number;
+}
+
+export interface OfflineReconciliationResult {
+  status: "APPLIED" | "ALREADY_APPLIED";
+  receipt: OfflineReconciliationReceipt;
 }
 
 export interface ProductRecord {
@@ -164,6 +183,24 @@ interface HardwareTransactionReceiptRow {
   result_delivered_at: string | null;
 }
 
+interface OfflineReconciliationReceiptRow {
+  event_id: string;
+  transaction_id: string;
+  product_id: number;
+  barcode: string;
+  item_name: string;
+  category: InventoryCategory;
+  action: "RESTOCK" | "CHECKOUT";
+  delta: 1 | -1;
+  previous_stock: number;
+  new_total: number;
+  occurred_at: string;
+  cached_resulting_stock: number;
+  cached_stock_status: StockStatus;
+  cache_generation: string;
+  resulting_status: StockStatus;
+}
+
 interface NormalizedProductQuery {
   searchPattern: string | null;
   category: InventoryCategory | null;
@@ -187,6 +224,18 @@ interface NormalizedUpdateProductInput {
   imagePath: string | null | undefined;
 }
 
+interface NormalizedOfflinePendingEvent {
+  eventId: string;
+  timestamp: string;
+  productId: number;
+  barcode: string;
+  action: "RESTOCK" | "CHECKOUT";
+  delta: 1 | -1;
+  resultingStock: number;
+  stockStatus: StockStatus;
+  cacheGeneration: string;
+}
+
 export interface InventoryServiceOptions {
   now?: () => Date;
   createTransactionId?: () => string;
@@ -204,11 +253,26 @@ export interface InventoryService {
     input: ProcessHardwareTransactionServiceInput,
   ): HardwareTransactionReceipt;
   markHardwareTransactionResultDelivered(eventId: string): HardwareTransactionReceipt;
+  reconcileOfflineEvent(event: OfflinePendingEvent): OfflineReconciliationResult;
 }
 
 const HARDWARE_EVENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const HARDWARE_BARCODE_PATTERN = /^[\x20-\x7E]+$/;
 const RTC_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
+const OFFLINE_EVENT_ID_PATTERN = /^off-[0-9A-F]{12}-[0-9A-F]{16}$/;
+const OFFLINE_PRODUCT_ID_PATTERN = /^[1-9]\d*$/;
+const OFFLINE_CACHE_GENERATION_PATTERN = /^v1-[0-9a-f]{64}$/;
+const OFFLINE_PENDING_EVENT_KEYS = [
+  "eventId",
+  "timestamp",
+  "productId",
+  "barcode",
+  "action",
+  "delta",
+  "resultingStock",
+  "stockStatus",
+  "cacheGeneration",
+] as const;
 
 function validateHardwareEventId(value: unknown): string {
   if (
@@ -223,15 +287,10 @@ function validateHardwareEventId(value: unknown): string {
   return value;
 }
 
-function validateHardwareTimestamp(value: unknown): string {
-  if (typeof value !== "string") {
-    throw new InventoryValidationError("The hardware transaction timestamp is invalid.");
-  }
-
+function isValidHardwareTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
   const match = RTC_TIMESTAMP_PATTERN.exec(value);
-  if (match === null) {
-    throw new InventoryValidationError("The hardware transaction timestamp is invalid.");
-  }
+  if (match === null) return false;
 
   const [year, month, day, hour, minute, second] = match.slice(1).map(Number);
   if (
@@ -250,7 +309,7 @@ function validateHardwareTimestamp(value: unknown): string {
     minute > 59 ||
     second > 59
   ) {
-    throw new InventoryValidationError("The hardware transaction timestamp is invalid.");
+    return false;
   }
 
   const parsed = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
@@ -262,9 +321,16 @@ function validateHardwareTimestamp(value: unknown): string {
     parsed.getUTCMinutes() !== minute ||
     parsed.getUTCSeconds() !== second
   ) {
-    throw new InventoryValidationError("The hardware transaction timestamp is invalid.");
+    return false;
   }
 
+  return true;
+}
+
+function validateHardwareTimestamp(value: unknown): string {
+  if (!isValidHardwareTimestamp(value)) {
+    throw new InventoryValidationError("The hardware transaction timestamp is invalid.");
+  }
   return value;
 }
 
@@ -304,6 +370,90 @@ function validateHardwareTransactionInput(
   return {
     event: { eventId, mode: event.mode, barcode, timestamp },
     quantity: input.quantity,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactlyOfflineEventKeys(value: Record<string, unknown>): boolean {
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [...OFFLINE_PENDING_EVENT_KEYS].sort();
+  return (
+    keys.length === expectedKeys.length &&
+    keys.every((key, index) => key === expectedKeys[index])
+  );
+}
+
+function conflictEventId(value: unknown): string {
+  if (
+    isRecord(value) &&
+    typeof value.eventId === "string" &&
+    value.eventId.length <= 63
+  ) {
+    return value.eventId;
+  }
+  return "";
+}
+
+function invalidOfflineEvent(value: unknown): OfflineReconciliationConflictError {
+  return new OfflineReconciliationConflictError(
+    "INVALID_EVENT",
+    "The offline transaction event is invalid.",
+    conflictEventId(value),
+  );
+}
+
+function validateOfflinePendingEvent(value: unknown): NormalizedOfflinePendingEvent {
+  if (!isRecord(value) || !hasExactlyOfflineEventKeys(value)) {
+    throw invalidOfflineEvent(value);
+  }
+
+  if (
+    typeof value.eventId !== "string" ||
+    !OFFLINE_EVENT_ID_PATTERN.test(value.eventId) ||
+    value.eventId.endsWith("0000000000000000") ||
+    !isValidHardwareTimestamp(value.timestamp) ||
+    typeof value.productId !== "string" ||
+    value.productId.length === 0 ||
+    value.productId.length > 31 ||
+    !OFFLINE_PRODUCT_ID_PATTERN.test(value.productId) ||
+    typeof value.barcode !== "string" ||
+    value.barcode.length === 0 ||
+    value.barcode.length > MAX_BARCODE_LENGTH ||
+    value.barcode.trim().length === 0 ||
+    !HARDWARE_BARCODE_PATTERN.test(value.barcode) ||
+    value.barcode.includes(",") ||
+    (value.action !== "RESTOCK" && value.action !== "CHECKOUT") ||
+    (value.action === "RESTOCK" ? value.delta !== 1 : value.delta !== -1) ||
+    !Number.isSafeInteger(value.resultingStock) ||
+    (value.resultingStock as number) < 0 ||
+    (value.stockStatus !== "HIGH" &&
+      value.stockStatus !== "LOW" &&
+      value.stockStatus !== "EMPTY") ||
+    ((value.resultingStock === 0) !== (value.stockStatus === "EMPTY")) ||
+    typeof value.cacheGeneration !== "string" ||
+    !OFFLINE_CACHE_GENERATION_PATTERN.test(value.cacheGeneration)
+  ) {
+    throw invalidOfflineEvent(value);
+  }
+
+  const productId = Number(value.productId);
+  if (!Number.isSafeInteger(productId) || productId <= 0) {
+    throw invalidOfflineEvent(value);
+  }
+
+  return {
+    eventId: value.eventId,
+    timestamp: value.timestamp,
+    productId,
+    barcode: value.barcode,
+    action: value.action,
+    delta: value.delta as 1 | -1,
+    resultingStock: value.resultingStock as number,
+    stockStatus: value.stockStatus,
+    cacheGeneration: value.cacheGeneration,
   };
 }
 
@@ -513,6 +663,28 @@ function hardwareTransactionReceiptFromRow(
   };
 }
 
+function offlineReconciliationReceiptFromRow(
+  row: OfflineReconciliationReceiptRow,
+): OfflineReconciliationReceipt {
+  return {
+    eventId: row.event_id,
+    transactionId: row.transaction_id,
+    productId: row.product_id,
+    barcode: row.barcode,
+    itemName: row.item_name,
+    category: row.category,
+    action: row.action,
+    delta: row.delta,
+    previousStock: row.previous_stock,
+    newTotal: row.new_total,
+    status: row.resulting_status,
+    offlineResultingStock: row.cached_resulting_stock,
+    offlineStockStatus: row.cached_stock_status,
+    timestamp: row.occurred_at,
+    cacheGeneration: row.cache_generation,
+  };
+}
+
 function isSameHardwareTransaction(
   receipt: HardwareTransactionReceipt,
   input: ProcessHardwareTransactionServiceInput,
@@ -523,6 +695,23 @@ function isSameHardwareTransaction(
     receipt.barcode === input.event.barcode &&
     receipt.timestamp === input.event.timestamp &&
     receipt.quantity === input.quantity
+  );
+}
+
+function isSameOfflineEvent(
+  receipt: OfflineReconciliationReceipt,
+  event: NormalizedOfflinePendingEvent,
+): boolean {
+  return (
+    receipt.eventId === event.eventId &&
+    receipt.timestamp === event.timestamp &&
+    receipt.productId === event.productId &&
+    receipt.barcode === event.barcode &&
+    receipt.action === event.action &&
+    receipt.delta === event.delta &&
+    receipt.offlineResultingStock === event.resultingStock &&
+    receipt.offlineStockStatus === event.stockStatus &&
+    receipt.cacheGeneration === event.cacheGeneration
   );
 }
 
@@ -656,7 +845,38 @@ export function createInventoryService(
       ON movements.transaction_id = processed.transaction_id
     WHERE processed.event_id = ?
   `);
+  const findOfflineReconciliationReceiptStatement = database.prepare(`
+    SELECT
+      receipts.event_id,
+      movements.transaction_id,
+      receipts.product_id,
+      receipts.barcode,
+      movements.item_name,
+      movements.category,
+      receipts.action,
+      receipts.delta,
+      movements.previous_stock,
+      movements.new_total,
+      receipts.event_timestamp AS occurred_at,
+      receipts.cached_resulting_stock,
+      receipts.cached_stock_status,
+      receipts.cache_generation,
+      receipts.resulting_status
+    FROM offline_reconciliation_receipts AS receipts
+    INNER JOIN transactions AS movements
+      ON movements.transaction_id = receipts.transaction_id
+    WHERE receipts.event_id = ?
+  `);
   const updateHardwareStockStatement = database.prepare(`
+    UPDATE products
+    SET
+      current_stock = ?,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE id = ?
+      AND deleted_at IS NULL
+      AND current_stock = ?
+  `);
+  const updateOfflineStockStatement = database.prepare(`
     UPDATE products
     SET
       current_stock = ?,
@@ -687,6 +907,36 @@ export function createInventoryService(
       resulting_status
     ) VALUES (?, ?, ?)
   `);
+  const insertOfflineMovementStatement = database.prepare(`
+    INSERT INTO transactions (
+      transaction_id,
+      product_id,
+      barcode,
+      item_name,
+      category,
+      action,
+      quantity,
+      previous_stock,
+      new_total,
+      occurred_at,
+      source
+    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'OFFLINE')
+  `);
+  const insertOfflineReconciliationReceiptStatement = database.prepare(`
+    INSERT INTO offline_reconciliation_receipts (
+      event_id,
+      transaction_id,
+      event_timestamp,
+      product_id,
+      barcode,
+      action,
+      delta,
+      cached_resulting_stock,
+      cached_stock_status,
+      cache_generation,
+      resulting_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
   const markHardwareTransactionResultDeliveredStatement = database.prepare(`
     UPDATE processed_hardware_events
     SET result_delivered_at = COALESCE(
@@ -708,6 +958,15 @@ export function createInventoryService(
       validateHardwareEventId(eventId),
     ) as HardwareTransactionReceiptRow | undefined;
     return row ? hardwareTransactionReceiptFromRow(row) : null;
+  };
+
+  const findOfflineReconciliationReceipt = (
+    eventId: string,
+  ): OfflineReconciliationReceipt | null => {
+    const row = findOfflineReconciliationReceiptStatement.get(
+      eventId,
+    ) as OfflineReconciliationReceiptRow | undefined;
+    return row ? offlineReconciliationReceiptFromRow(row) : null;
   };
 
   const markHardwareTransactionResultDelivered = (
@@ -845,6 +1104,116 @@ export function createInventoryService(
     },
   );
 
+  const reconcileOfflineEventInTransaction = database.transaction(
+    (event: NormalizedOfflinePendingEvent): OfflineReconciliationResult => {
+      const existingReceipt = findOfflineReconciliationReceipt(event.eventId);
+      if (existingReceipt !== null) {
+        if (!isSameOfflineEvent(existingReceipt, event)) {
+          throw new OfflineReconciliationConflictError(
+            "EVENT_ID_CONFLICT",
+            "This offline event ID was already reconciled with different event details.",
+            event.eventId,
+          );
+        }
+        return { status: "ALREADY_APPLIED", receipt: existingReceipt };
+      }
+
+      const productRow = getActiveProductStatement.get(
+        event.productId,
+      ) as ProductRow | undefined;
+      if (productRow === undefined) {
+        throw new OfflineReconciliationConflictError(
+          "PRODUCT_NOT_ACTIVE",
+          "The product referenced by this offline event is not active.",
+          event.eventId,
+        );
+      }
+      if (productRow.barcode !== event.barcode) {
+        throw new OfflineReconciliationConflictError(
+          "PRODUCT_IDENTITY_CONFLICT",
+          "The offline event product ID and barcode do not match the active product.",
+          event.eventId,
+        );
+      }
+
+      const previousStock = productRow.current_stock;
+      if (
+        !Number.isSafeInteger(previousStock) ||
+        previousStock < 0 ||
+        !Number.isSafeInteger(productRow.low_stock_threshold) ||
+        productRow.low_stock_threshold < 0
+      ) {
+        throw new OfflineReconciliationConflictError(
+          "STOCK_OVERFLOW",
+          "The authoritative product stock is outside the supported inventory range.",
+          event.eventId,
+        );
+      }
+      if (event.delta === -1 && previousStock === 0) {
+        throw new OfflineReconciliationConflictError(
+          "INSUFFICIENT_STOCK",
+          "The offline checkout cannot be applied because authoritative stock is empty.",
+          event.eventId,
+        );
+      }
+
+      const newTotal = previousStock + event.delta;
+      if (!Number.isSafeInteger(newTotal) || newTotal < 0) {
+        throw new OfflineReconciliationConflictError(
+          "STOCK_OVERFLOW",
+          "The offline event would exceed the supported inventory range.",
+          event.eventId,
+        );
+      }
+
+      const status = deriveStockStatus(newTotal, productRow.low_stock_threshold);
+      const stockUpdate = updateOfflineStockStatement.run(
+        newTotal,
+        productRow.id,
+        previousStock,
+      );
+      if (stockUpdate.changes !== 1) {
+        throw new OfflineReconciliationConflictError(
+          "PRODUCT_NOT_ACTIVE",
+          "The active product changed while the offline event was being reconciled.",
+          event.eventId,
+        );
+      }
+
+      const transactionId = createTransactionId();
+      insertOfflineMovementStatement.run(
+        transactionId,
+        productRow.id,
+        productRow.barcode,
+        productRow.item_name,
+        productRow.category,
+        event.action,
+        previousStock,
+        newTotal,
+        event.timestamp,
+      );
+      insertOfflineReconciliationReceiptStatement.run(
+        event.eventId,
+        transactionId,
+        event.timestamp,
+        productRow.id,
+        event.barcode,
+        event.action,
+        event.delta,
+        event.resultingStock,
+        event.stockStatus,
+        event.cacheGeneration,
+        status,
+      );
+
+      const receipt = findOfflineReconciliationReceipt(event.eventId);
+      if (receipt === null) {
+        throw new Error("The committed offline reconciliation receipt is unavailable.");
+      }
+      return { status: "APPLIED", receipt };
+    },
+  );
+
   return {
     listProducts(query) {
       const normalized = normalizeQuery(query);
@@ -906,6 +1275,10 @@ export function createInventoryService(
       return processHardwareTransactionInTransaction(
         validateHardwareTransactionInput(input),
       );
+    },
+
+    reconcileOfflineEvent(event) {
+      return reconcileOfflineEventInTransaction(validateOfflinePendingEvent(event));
     },
   };
 }

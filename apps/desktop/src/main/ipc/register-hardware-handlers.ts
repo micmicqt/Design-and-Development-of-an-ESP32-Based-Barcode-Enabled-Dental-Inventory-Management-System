@@ -9,7 +9,11 @@ import {
   HardwareTransactionCoordinatorError,
   type HardwareTransactionCoordinator
 } from '../hardware/hardware-transaction-coordinator'
-import { InventoryServiceError, type InventoryService } from '../inventory'
+import {
+  InventoryServiceError,
+  OfflineReconciliationConflictError,
+  type InventoryService
+} from '../inventory'
 import {
   IPC_CHANNELS,
   type HardwareStatusDto,
@@ -18,7 +22,8 @@ import {
   type HardwareTransactionReceipt,
   type IpcError,
   type IpcResult,
-  type OfflinePendingEvent
+  type OfflinePendingEvent,
+  type OfflineReconciliationOutcome
 } from '../../shared/ipc-contract'
 import { isTrustedMainFrame, type MainWindowProvider } from './ipc-security'
 import {
@@ -92,6 +97,30 @@ function sanitizedTransactionFailure<T>(error: unknown, fallbackMessage: string)
   // Keep those details out of renderer responses and production logs.
   console.error('Hardware transaction IPC request failed internally.')
   return failure({ code: 'INTERNAL_ERROR', message: fallbackMessage })
+}
+
+function sanitizedOfflineReconciliationFailure(
+  error: unknown
+): IpcResult<OfflineReconciliationOutcome> {
+  if (error instanceof OfflineReconciliationConflictError) {
+    return ok({
+      status: 'CONFLICT',
+      conflict: {
+        code: error.code,
+        message: error.message,
+        eventId: error.eventId
+      }
+    })
+  }
+
+  // Do not expose the configured ESP32 URL, SQLite diagnostics, or raw event
+  // data through the renderer boundary. Both reads and idempotent DB applies
+  // are safe to retry after an internal failure.
+  console.error('Offline reconciliation IPC request failed internally.')
+  return failure({
+    code: 'INTERNAL_ERROR',
+    message: 'Unable to reconcile the pending offline transaction. Check the ESP32 and retry.'
+  })
 }
 
 function offlineStatus(): HardwareStatusDto {
@@ -206,6 +235,30 @@ export function registerHardwareIpcHandlers(
           message: 'Unable to read pending offline transactions. Check the ESP32 and retry.'
         })
       }
+    }
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.hardwareReconcileNextOfflineEvent,
+    async (event): Promise<IpcResult<OfflineReconciliationOutcome>> => {
+      if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
+
+      return serializeHardwareMutation(async () => {
+        try {
+          if (gateway === null) throw new Error('Hardware is not configured.')
+
+          // Always use the currently authoritative FIFO head. The renderer has
+          // no way to supply an event body, result total, URL, or stale event ID.
+          const pendingEvent = await gateway.getNextOfflineEvent()
+          if (pendingEvent === null) return ok({ status: 'NO_PENDING_EVENT' })
+
+          // SQLite commits (or returns its durable replay receipt) before this
+          // handler returns. Firmware acknowledgement is intentionally Phase 7.3.
+          return ok(inventoryService.reconcileOfflineEvent(pendingEvent))
+        } catch (error: unknown) {
+          return sanitizedOfflineReconciliationFailure(error)
+        }
+      })
     }
   )
 
@@ -404,6 +457,7 @@ export function registerHardwareIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetStatus)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareSendDesktopHeartbeat)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetNextOfflineEvent)
+    ipcMain.removeHandler(IPC_CHANNELS.hardwareReconcileNextOfflineEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetTransactionReceipt)

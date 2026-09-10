@@ -84,6 +84,8 @@ const desktopApi: DesktopApi = Object.freeze({
       ipcRenderer.invoke(IPC_CHANNELS.hardwareSendDesktopHeartbeat),
     getNextOfflineEvent: () =>
       ipcRenderer.invoke(IPC_CHANNELS.hardwareGetNextOfflineEvent),
+    reconcileNextOfflineEvent: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareReconcileNextOfflineEvent),
     getNextTransactionEvent: () =>
       ipcRenderer.invoke(IPC_CHANNELS.hardwareGetNextTransactionEvent),
     acknowledgeTransactionEvent: (eventId: string) =>

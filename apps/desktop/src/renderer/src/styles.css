@@ -625,7 +625,8 @@ button:disabled {
 }
 
 .sync-offline-notice,
-.sync-offline-message {
+.sync-offline-message,
+.sync-offline-reconciliation-result {
   display: grid;
   gap: 4px;
   padding: 14px 16px;
@@ -639,7 +640,8 @@ button:disabled {
 }
 
 .sync-offline-notice span,
-.sync-offline-message span {
+.sync-offline-message span,
+.sync-offline-reconciliation-result span {
   font-size: 12px;
   line-height: 1.55;
 }
@@ -736,6 +738,76 @@ button:disabled {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.55;
+}
+
+.sync-offline-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.sync-offline-reconciliation-result {
+  margin-top: 16px;
+  color: var(--muted);
+  background: #f8fbfd;
+  border: 1px solid var(--line);
+}
+
+.sync-offline-reconciliation-result strong,
+.sync-offline-reconciliation-result b {
+  color: var(--ink);
+}
+
+.sync-offline-reconciliation-result.is-success {
+  color: #356852;
+  background: var(--success-soft, #e8f7f0);
+  border-color: #b9dfce;
+}
+
+.sync-offline-reconciliation-result.is-success strong,
+.sync-offline-reconciliation-result.is-success b {
+  color: var(--success, #147a55);
+}
+
+.sync-offline-result-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px 16px;
+  margin: 8px 0;
+  padding: 12px 0;
+  border-top: 1px solid #c7e5d6;
+  border-bottom: 1px solid #c7e5d6;
+}
+
+.sync-offline-result-details div {
+  min-width: 0;
+}
+
+.sync-offline-result-details dt {
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.sync-offline-result-details dd {
+  margin: 0;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.sync-offline-reconciliation-result.is-error {
+  color: #7d3a43;
+  background: var(--red-soft);
+  border-color: #efc8ce;
+}
+
+.sync-offline-reconciliation-result.is-error strong {
+  color: var(--red);
 }
 
 .inventory-page,

@@ -599,6 +599,28 @@ describe('ESP32 HTTP hardware gateway', () => {
     }
   })
 
+  it('keeps the authoritative offline-head read fixed despite unexpected call arguments', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(offlinePendingEvent))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(
+      Reflect.apply(gateway.getNextOfflineEvent, gateway, [
+        'http://untrusted.example/offline/events/delete',
+        'DELETE',
+        { eventId: offlinePendingEvent.eventId, resultingStock: 999_999 }
+      ])
+    ).resolves.toEqual(offlinePendingEvent)
+
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith(
+      'http://192.0.2.10/offline/events/next',
+      expect.objectContaining({
+        method: 'GET',
+        headers: { Accept: 'application/json' }
+      })
+    )
+    expect(fetcher.mock.calls[0]?.[1]).not.toHaveProperty('body')
+  })
+
   it.each(['0000000000000001', ' 0000001 '])(
     'preserves exact offline barcode text: %s',
     async (barcode) => {

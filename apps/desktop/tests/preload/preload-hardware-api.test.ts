@@ -133,6 +133,57 @@ describe('preload hardware API', () => {
     await expect(api.hardware.getNextOfflineEvent()).resolves.toEqual(result)
   })
 
+  it('exposes parameter-free offline reconciliation on one fixed IPC channel', async () => {
+    const result = {
+      ok: true,
+      value: {
+        status: 'APPLIED',
+        receipt: {
+          eventId: 'off-20500DE58C14-0000000000000001',
+          transactionId: 'movement-1',
+          productId: 7,
+          barcode: '0000000000000123',
+          itemName: 'Cleanser',
+          category: 'General',
+          action: 'CHECKOUT',
+          delta: -1,
+          previousStock: 3,
+          newTotal: 2,
+          status: 'LOW',
+          offlineResultingStock: 2,
+          offlineStockStatus: 'LOW',
+          timestamp: '2026-09-04 08:30:00',
+          cacheGeneration: `v1-${'a'.repeat(64)}`
+        }
+      }
+    } as const
+    electronMock.invoke.mockResolvedValueOnce(result)
+
+    await expect(api.hardware.reconcileNextOfflineEvent()).resolves.toEqual(result)
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareReconcileNextOfflineEvent
+    )
+
+    electronMock.invoke.mockClear()
+    electronMock.invoke.mockResolvedValueOnce({
+      ok: true,
+      value: { status: 'NO_PENDING_EVENT' }
+    })
+    const callWithUnexpectedArguments = api.hardware.reconcileNextOfflineEvent as (
+      event: unknown,
+      totals: unknown,
+      request: unknown
+    ) => Promise<unknown>
+    await callWithUnexpectedArguments(
+      { eventId: 'forged-offline-event' },
+      { previousStock: 900, newTotal: 901 },
+      { url: 'http://untrusted.example', method: 'DELETE', sql: 'DROP TABLE products' }
+    )
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareReconcileNextOfflineEvent
+    )
+  })
+
   it('forwards only the event ID to the fixed acknowledgement channel', async () => {
     const result = { ok: true, value: { eventId: 'device-session-1' } }
     electronMock.invoke.mockResolvedValueOnce(result)
@@ -214,6 +265,7 @@ describe('preload hardware API', () => {
       'getStatus',
       'getTransactionReceipt',
       'processTransaction',
+      'reconcileNextOfflineEvent',
       'retryTransactionAcknowledgement',
       'retryTransactionResultDelivery',
       'sendDesktopHeartbeat'

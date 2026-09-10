@@ -32,6 +32,7 @@ export const IPC_CHANNELS = {
   hardwareGetStatus: 'hardware:get-status',
   hardwareSendDesktopHeartbeat: 'hardware:send-desktop-heartbeat',
   hardwareGetNextOfflineEvent: 'hardware:get-next-offline-event',
+  hardwareReconcileNextOfflineEvent: 'hardware:reconcile-next-offline-event',
   hardwareGetNextTransactionEvent: 'hardware:get-next-transaction-event',
   hardwareAcknowledgeTransactionEvent: 'hardware:acknowledge-transaction-event',
   hardwareGetTransactionReceipt: 'hardware:get-transaction-receipt',
@@ -79,6 +80,54 @@ export interface OfflinePendingEvent {
   stockStatus: StockStatus
   cacheGeneration: string
 }
+
+export const OFFLINE_RECONCILIATION_CONFLICT_CODES = [
+  'INVALID_EVENT',
+  'EVENT_ID_CONFLICT',
+  'PRODUCT_NOT_ACTIVE',
+  'PRODUCT_IDENTITY_CONFLICT',
+  'INSUFFICIENT_STOCK',
+  'STOCK_OVERFLOW'
+] as const
+
+export type OfflineReconciliationConflictCode =
+  (typeof OFFLINE_RECONCILIATION_CONFLICT_CODES)[number]
+
+/** Durable SQLite snapshot produced while reconciling one offline journal event. */
+export interface OfflineReconciliationReceipt {
+  eventId: string
+  transactionId: string
+  productId: number
+  barcode: string
+  itemName: string
+  category: InventoryCategory
+  action: OfflinePendingAction
+  delta: 1 | -1
+  previousStock: number
+  newTotal: number
+  status: StockStatus
+  /** Firmware-computed audit value; SQLite `newTotal` remains authoritative. */
+  offlineResultingStock: number
+  /** Firmware-computed audit value; SQLite `status` remains authoritative. */
+  offlineStockStatus: StockStatus
+  timestamp: string
+  cacheGeneration: string
+}
+
+export type OfflineReconciliationOutcome =
+  | {
+      status: 'APPLIED' | 'ALREADY_APPLIED'
+      receipt: OfflineReconciliationReceipt
+    }
+  | {
+      status: 'CONFLICT'
+      conflict: {
+        code: OfflineReconciliationConflictCode
+        message: string
+        eventId: string
+      }
+    }
+  | { status: 'NO_PENDING_EVENT' }
 
 /** Durable snapshot of a committed online transaction, not live product stock. */
 export interface HardwareTransactionReceipt extends HardwareTransactionEvent {
@@ -244,6 +293,8 @@ export interface DesktopApi {
     sendDesktopHeartbeat: () => Promise<boolean>
     /** Retrieves without retiring the oldest durable offline event. */
     getNextOfflineEvent: () => Promise<IpcResult<OfflinePendingEvent | null>>
+    /** Applies the backend-retrieved oldest offline event to SQLite without acknowledging it. */
+    reconcileNextOfflineEvent: () => Promise<IpcResult<OfflineReconciliationOutcome>>
     getNextTransactionEvent: () => Promise<HardwareTransactionEvent | null>
     acknowledgeTransactionEvent: (
       eventId: string
