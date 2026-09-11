@@ -5,6 +5,7 @@ import { defineConfig, externalizeDepsPlugin, loadEnv } from 'electron-vite'
 export default defineConfig(({ mode }) => {
   const localEnvironment = loadEnv(mode, process.cwd(), ['DENTAL_'])
   const configuredBaseUrl = localEnvironment.DENTAL_ESP32_BASE_URL?.trim()
+  const configuredDeviceToken = localEnvironment.DENTAL_DEVICE_TOKEN?.trim()
   if (
     process.env.DENTAL_ESP32_BASE_URL === undefined &&
     configuredBaseUrl !== undefined &&
@@ -12,6 +13,13 @@ export default defineConfig(({ mode }) => {
   ) {
     process.env.DENTAL_ESP32_BASE_URL = configuredBaseUrl
   }
+  if (
+  process.env.DENTAL_DEVICE_TOKEN === undefined &&
+  configuredDeviceToken !== undefined &&
+  configuredDeviceToken.length > 0
+) {
+  process.env.DENTAL_DEVICE_TOKEN = configuredDeviceToken
+}
 
   return {
     main: {

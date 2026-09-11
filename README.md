@@ -195,13 +195,23 @@ For local development, copy `apps/desktop/.env.example` to `apps/desktop/.env.lo
 
 ```env
 DENTAL_ESP32_BASE_URL=http://192.168.1.100
+DENTAL_DEVICE_TOKEN=replace-with-the-same-random-token-as-firmware
 ```
 
-The local file is ignored by Git because the address can change with DHCP.
+The local file is ignored by Git because it contains deployment-local settings.
 Electron main—not React—uses this URL only through the fixed status, presence,
-event, and cache routes. Status requests time out after 2.5 seconds and appear as
-**Offline** without interrupting inventory features. No Wi-Fi credential or
-device token is stored in the desktop configuration.
+event, cache, and RTC-recovery routes. The device token must match
+`DENTAL_DEVICE_TOKEN` in the ignored `firmware/include/secrets.h`; it is used only
+by Electron main to authenticate the dedicated RTC synchronization request and
+is never exposed through preload or React. Status requests time out after 2.5
+seconds and appear as **Offline** without interrupting inventory features.
+
+When firmware detects a DS3231 oscillator-stop/lost-power condition, it reports
+`needs_sync` and blocks timestamped transactions. The next authenticated desktop
+heartbeat causes Electron main to send its system time and UTC offset. Firmware
+writes and rereads the RTC, verifies that the oscillator-stop flag cleared, and
+only then reports the RTC ready. Healthy retained time is never rewritten during
+normal heartbeats.
 
 ## Product images
 

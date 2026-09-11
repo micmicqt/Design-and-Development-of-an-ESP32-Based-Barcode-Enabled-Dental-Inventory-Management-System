@@ -10,12 +10,16 @@ import {
   registerDentalImageSchemePrivileges
 } from './images'
 import { createInventoryService } from './inventory'
-import { resolveEsp32BaseUrl } from './hardware/hardware-configuration'
+import {
+  resolveEsp32BaseUrl,
+  resolveEsp32DeviceToken
+} from './hardware/hardware-configuration'
 import { Esp32HttpGateway } from './hardware/esp32-http-gateway'
 import type { DesktopHardwareGateway } from './hardware/hardware-gateway'
 import { createOfflineInventoryCacheCoordinator } from './hardware/offline-inventory-cache'
 import { createOfflineSyncCoordinator } from './hardware/offline-sync-coordinator'
 import { createHardwareTransactionCoordinator } from './hardware/hardware-transaction-coordinator'
+import { createRtcRecoveryCoordinator } from './hardware/rtc-recovery-coordinator'
 import { registerAuthIpcHandlers } from './ipc/register-auth-handlers'
 import { registerHardwareIpcHandlers } from './ipc/register-hardware-handlers'
 import { registerInventoryIpcHandlers } from './ipc/register-inventory-handlers'
@@ -119,8 +123,19 @@ async function startDesktopApplication(): Promise<void> {
   const getMainWindow = (): BrowserWindow | null => mainWindow
   const inventoryService = createInventoryService(database)
   const esp32BaseUrl = resolveEsp32BaseUrl()
+  const esp32DeviceToken = resolveEsp32DeviceToken()
+  if (esp32BaseUrl !== null && esp32DeviceToken === null) {
+    console.warn(
+      '[RTC recovery] skipped: DEVICE_TOKEN_UNCONFIGURED; set the matching token in ignored apps/desktop/.env.local.'
+    )
+  }
   hardwareGateway =
-    esp32BaseUrl === null ? null : new Esp32HttpGateway({ baseUrl: esp32BaseUrl })
+    esp32BaseUrl === null
+      ? null
+      : new Esp32HttpGateway({
+          baseUrl: esp32BaseUrl,
+          deviceToken: esp32DeviceToken
+        })
   const transactionCoordinator = createHardwareTransactionCoordinator({
     inventoryService,
     gateway: hardwareGateway
@@ -140,6 +155,10 @@ async function startDesktopApplication(): Promise<void> {
           gateway: hardwareGateway,
           offlineInventoryCacheCoordinator
         })
+  const rtcRecoveryCoordinator =
+    hardwareGateway === null
+      ? null
+      : createRtcRecoveryCoordinator({ gateway: hardwareGateway })
 
   disposeImageProtocol = registerDentalImageProtocol(session.defaultSession, imageStore)
   mainWindow = createMainWindow()
@@ -162,6 +181,7 @@ async function startDesktopApplication(): Promise<void> {
     transactionCoordinator,
     offlineInventoryCacheCoordinator,
     offlineSyncCoordinator,
+    rtcRecoveryCoordinator,
     authSession,
     getMainWindow
   })

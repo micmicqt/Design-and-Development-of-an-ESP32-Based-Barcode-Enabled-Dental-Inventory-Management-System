@@ -6,6 +6,7 @@ import type {
 } from '../hardware/hardware-gateway'
 import type { OfflineInventoryCacheCoordinator } from '../hardware/offline-inventory-cache'
 import type { OfflineSyncCoordinator } from '../hardware/offline-sync-coordinator'
+import type { RtcRecoveryCoordinator } from '../hardware/rtc-recovery-coordinator'
 import {
   HardwareTransactionCoordinatorError,
   type HardwareTransactionCoordinator
@@ -42,6 +43,7 @@ export interface RegisterHardwareIpcHandlersOptions {
   getMainWindow: MainWindowProvider
   offlineInventoryCacheCoordinator?: OfflineInventoryCacheCoordinator | null
   offlineSyncCoordinator?: OfflineSyncCoordinator | null
+  rtcRecoveryCoordinator?: RtcRecoveryCoordinator | null
 }
 
 const unauthorizedError: IpcError = {
@@ -146,7 +148,8 @@ export function registerHardwareIpcHandlers(
     authSession,
     getMainWindow,
     offlineInventoryCacheCoordinator = null,
-    offlineSyncCoordinator = null
+    offlineSyncCoordinator = null,
+    rtcRecoveryCoordinator = null
   } = options
   let hardwareMutationTail: Promise<void> = Promise.resolve()
   let activeOfflineSynchronization: Promise<IpcResult<OfflineSyncOutcome>> | null = null
@@ -192,6 +195,9 @@ export function registerHardwareIpcHandlers(
           device: status.device,
           mode: status.mode,
           rtc: status.rtc,
+          ...(status.rtcState === undefined
+            ? {}
+            : { rtcState: status.rtcState, rtcReason: status.rtcReason }),
           sd: status.sd,
           ...(status.pendingSyncItems === undefined
             ? {}
@@ -213,6 +219,15 @@ export function registerHardwareIpcHandlers(
 
       try {
         await gateway.sendDesktopHeartbeat()
+        // The renderer supplies no clock value or firmware command. A trusted,
+        // authenticated heartbeat only permits the main process to inspect the
+        // RTC state and provision it from the host system clock when required.
+        try {
+          await rtcRecoveryCoordinator?.synchronizeIfNeeded()
+        } catch {
+          // RTC recovery is fail-closed and retries with its own backoff. It must
+          // not invalidate a heartbeat that the ESP32 already accepted.
+        }
         refreshOfflineCacheBestEffort(false)
         return true
       } catch {

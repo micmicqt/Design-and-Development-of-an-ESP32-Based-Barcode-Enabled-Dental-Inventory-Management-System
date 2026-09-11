@@ -3,12 +3,16 @@ import {
   ESP32_DEVICE_ID,
   type Esp32HardwareMode,
   type Esp32HealthResponse,
+  type Esp32RtcReason,
+  type Esp32RtcState,
   type Esp32StatusResponse,
   OFFLINE_CACHE_GENERATION_PATTERN,
   type OfflineEventAcknowledgement,
   type OfflineInventoryCacheInstallResult,
   type OfflineInventoryCacheProduct,
   type OfflineInventoryCacheSnapshot,
+  type RtcSynchronizationRequest,
+  type RtcSynchronizationResult,
   isValidHardwareTransactionEventId
 } from './hardware-gateway'
 import {
@@ -27,6 +31,16 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 2_500
 // kiosk's conservative 1 MHz SPI speed. It is intentionally allowed longer
 // than lightweight status/event reads, while remaining bounded.
 const DEFAULT_OFFLINE_ACKNOWLEDGEMENT_TIMEOUT_MS = 15_000
+const DEVICE_TOKEN_HEADER = 'X-Device-Token'
+const DEVICE_TOKEN_PLACEHOLDER = 'replace-with-a-random-shared-device-token'
+const RTC_STATES: readonly Esp32RtcState[] = ['unavailable', 'needs_sync', 'ready']
+const RTC_REASONS: readonly Esp32RtcReason[] = [
+  'none',
+  'communication_failure',
+  'lost_power',
+  'invalid_time',
+  'verification_failed'
+]
 const HARDWARE_MODES: readonly Esp32HardwareMode[] = [
   'idle',
   'restock',
@@ -57,6 +71,7 @@ const OFFLINE_ACKNOWLEDGEMENT_KEYS = [
 ] as const
 const RESULT_ACCEPTANCE_KEYS = ['accepted', 'eventId'] as const
 const DESKTOP_HEARTBEAT_KEYS = ['desktopOnline'] as const
+const RTC_SYNC_RESPONSE_KEYS = ['synchronized', 'rtcState', 'alreadyReady'] as const
 const CACHE_RESPONSE_KEYS = [
   'accepted',
   'operation',
@@ -99,11 +114,17 @@ export type HardwareGatewayErrorCode = 'UNAVAILABLE' | 'INVALID_RESPONSE' | 'REJ
 export type HardwareGatewayDiagnosticCode =
   | 'REQUEST_TIMEOUT'
   | 'NETWORK_FAILURE'
+  | 'DEVICE_TOKEN_UNCONFIGURED'
   | 'invalid_request'
   | 'no_pending_event'
   | 'event_id_mismatch'
   | 'pending_journal_unavailable'
   | 'pending_journal_invalid'
+  | 'unauthorized'
+  | 'authentication_unconfigured'
+  | 'invalid_timestamp'
+  | 'rtc_unavailable'
+  | 'verification_failed'
 
 export class HardwareGatewayError extends Error {
   readonly code: HardwareGatewayErrorCode
@@ -123,6 +144,8 @@ export class HardwareGatewayError extends Error {
 
 export interface Esp32HttpGatewayOptions {
   baseUrl: string
+  /** Local backend-only shared secret; never exposed through preload or renderer IPC. */
+  deviceToken?: string | null
   requestTimeoutMs?: number
   offlineAcknowledgementTimeoutMs?: number
   fetcher?: HardwareFetch
@@ -149,7 +172,12 @@ const SAFE_FIRMWARE_DIAGNOSTIC_CODES = new Set<HardwareGatewayDiagnosticCode>([
   'no_pending_event',
   'event_id_mismatch',
   'pending_journal_unavailable',
-  'pending_journal_invalid'
+  'pending_journal_invalid',
+  'unauthorized',
+  'authentication_unconfigured',
+  'invalid_timestamp',
+  'rtc_unavailable',
+  'verification_failed'
 ])
 
 async function readSafeFirmwareDiagnostic(
@@ -294,6 +322,18 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
       (value.pendingSyncItems as number) >= 0 &&
       (value.pendingSyncItems as number) <= MAX_OFFLINE_CACHE_ITEMS &&
       typeof value.offlineReady === 'boolean')
+  const hasAnyRtcState =
+    isRecord(value) && ('rtcState' in value || 'rtcReason' in value)
+  const hasValidRtcState =
+    !hasAnyRtcState ||
+    (isRecord(value) &&
+      typeof value.rtcState === 'string' &&
+      RTC_STATES.includes(value.rtcState as Esp32RtcState) &&
+      typeof value.rtcReason === 'string' &&
+      RTC_REASONS.includes(value.rtcReason as Esp32RtcReason) &&
+      (value.rtcState === 'ready'
+        ? value.rtc === true && value.rtcReason === 'none'
+        : value.rtc === false && value.rtcReason !== 'none'))
 
   if (
     !isRecord(value) ||
@@ -304,6 +344,7 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
     typeof value.rtc !== 'boolean' ||
     typeof value.sd !== 'boolean' ||
     (value.desktopOnline !== undefined && typeof value.desktopOnline !== 'boolean') ||
+    !hasValidRtcState ||
     !hasValidCacheMetadata ||
     !hasValidOfflineJournalMetadata
   ) {
@@ -320,6 +361,10 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
 
   if (typeof value.desktopOnline === 'boolean') {
     status.desktopOnline = value.desktopOnline
+  }
+  if (typeof value.rtcState === 'string') {
+    status.rtcState = value.rtcState as Esp32RtcState
+    status.rtcReason = value.rtcReason as Esp32RtcReason
   }
   if (typeof value.offlineCacheAvailable === 'boolean') {
     status.offlineCacheAvailable = value.offlineCacheAvailable
@@ -345,6 +390,45 @@ function validateDesktopHeartbeatResponse(value: unknown): void {
       'INVALID_RESPONSE',
       'The ESP32 desktop heartbeat response is invalid.'
     )
+  }
+}
+
+function validateRtcSynchronizationRequest(request: RtcSynchronizationRequest): void {
+  if (
+    !isRecord(request) ||
+    !hasExactlyKeys(request, ['epochSeconds', 'utcOffsetMinutes']) ||
+    !Number.isSafeInteger(request.epochSeconds) ||
+    request.epochSeconds < 1_577_836_800 ||
+    request.epochSeconds > 4_102_444_799 ||
+    !Number.isSafeInteger(request.utcOffsetMinutes) ||
+    request.utcOffsetMinutes < -840 ||
+    request.utcOffsetMinutes > 840
+  ) {
+    throw new HardwareGatewayError('INVALID_RESPONSE', 'The host RTC timestamp is invalid.')
+  }
+  const localEpochSeconds = request.epochSeconds + request.utcOffsetMinutes * 60
+  if (localEpochSeconds < 1_577_836_800 || localEpochSeconds > 4_102_444_799) {
+    throw new HardwareGatewayError('INVALID_RESPONSE', 'The host RTC timestamp is invalid.')
+  }
+}
+
+function validateRtcSynchronizationResponse(value: unknown): RtcSynchronizationResult {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, RTC_SYNC_RESPONSE_KEYS) ||
+    value.synchronized !== true ||
+    value.rtcState !== 'ready' ||
+    typeof value.alreadyReady !== 'boolean'
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The ESP32 RTC synchronization response is invalid.'
+    )
+  }
+  return {
+    synchronized: true,
+    rtcState: 'ready',
+    alreadyReady: value.alreadyReady
   }
 }
 
@@ -594,12 +678,25 @@ const defaultFetch: HardwareFetch = (url, options) => fetch(url, options)
 
 export class Esp32HttpGateway implements DesktopHardwareGateway {
   private readonly baseUrl: string
+  private readonly deviceToken: string | null
   private readonly requestTimeoutMs: number
   private readonly offlineAcknowledgementTimeoutMs: number
   private readonly fetcher: HardwareFetch
 
   constructor(options: Esp32HttpGatewayOptions) {
     this.baseUrl = normalizeBaseUrl(options.baseUrl)
+    const configuredToken = options.deviceToken?.trim() ?? ''
+    if (
+      configuredToken.length > 0 &&
+      (configuredToken === DEVICE_TOKEN_PLACEHOLDER ||
+        configuredToken.length < 32 ||
+        configuredToken.length > 128 ||
+        containsControlCharacter(configuredToken) ||
+        configuredToken.includes(' '))
+    ) {
+      throw new HardwareGatewayError('UNAVAILABLE', 'The ESP32 device token is invalid.')
+    }
+    this.deviceToken = configuredToken.length > 0 ? configuredToken : null
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
     if (!Number.isSafeInteger(this.requestTimeoutMs) || this.requestTimeoutMs <= 0) {
       throw new HardwareGatewayError('UNAVAILABLE', 'The ESP32 request timeout is invalid.')
@@ -629,6 +726,24 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
   async sendDesktopHeartbeat(): Promise<void> {
     validateDesktopHeartbeatResponse(
       await this.request('/desktop/heartbeat', { method: 'POST' })
+    )
+  }
+
+  async synchronizeRtc(request: RtcSynchronizationRequest): Promise<RtcSynchronizationResult> {
+    validateRtcSynchronizationRequest(request)
+    if (this.deviceToken === null) {
+      throw new HardwareGatewayError(
+        'UNAVAILABLE',
+        'The ESP32 device token is not configured.',
+        'DEVICE_TOKEN_UNCONFIGURED'
+      )
+    }
+    return validateRtcSynchronizationResponse(
+      await this.request('/rtc/sync', {
+        method: 'POST',
+        body: JSON.stringify(request),
+        deviceAuthenticated: true
+      })
     )
   }
 
@@ -776,6 +891,7 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
       | '/health'
       | '/status'
       | '/desktop/heartbeat'
+      | '/rtc/sync'
       | '/offline/cache'
       | '/offline/events/next'
       | '/offline/events/ack'
@@ -787,6 +903,7 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
       body?: string
       allowNoContent?: boolean
       timeoutMs?: number
+      deviceAuthenticated?: boolean
     } = {}
   ): Promise<unknown> {
     const controller = new AbortController()
@@ -801,7 +918,13 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
         method,
         headers:
           method === 'POST'
-            ? { Accept: 'application/json', 'Content-Type': 'application/json' }
+            ? {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                ...(options.deviceAuthenticated === true && this.deviceToken !== null
+                  ? { [DEVICE_TOKEN_HEADER]: this.deviceToken }
+                  : {})
+              }
             : { Accept: 'application/json' },
         signal: controller.signal,
         ...(options.body === undefined ? {} : { body: options.body })
@@ -809,13 +932,15 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
       if (options.allowNoContent === true && response.status === 204) return NO_CONTENT
       if (!response.ok) {
         const diagnosticCode =
-          path === '/offline/events/ack'
+          path === '/offline/events/ack' || path === '/rtc/sync'
             ? await readSafeFirmwareDiagnostic(response)
             : undefined
         if (method === 'POST' && response.status >= 400 && response.status < 500) {
           throw new HardwareGatewayError(
             'REJECTED',
-            path === '/events/result'
+            path === '/rtc/sync'
+              ? 'The ESP32 rejected the RTC synchronization request.'
+              : path === '/events/result'
               ? 'The ESP32 rejected the transaction result.'
               : path === '/offline/cache'
                 ? 'The ESP32 rejected the offline inventory cache.'
@@ -854,6 +979,12 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
         throw new HardwareGatewayError(
           'INVALID_RESPONSE',
           'The ESP32 returned an unexpected offline cache response status.'
+        )
+      }
+      if (path === '/rtc/sync' && response.status !== 200) {
+        throw new HardwareGatewayError(
+          'INVALID_RESPONSE',
+          'The ESP32 returned an unexpected RTC synchronization status.'
         )
       }
 

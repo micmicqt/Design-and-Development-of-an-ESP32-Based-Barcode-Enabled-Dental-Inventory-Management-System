@@ -127,6 +127,50 @@ describe('ESP32 HTTP hardware gateway', () => {
     )
   })
 
+  it('distinguishes RTC ready, needs-sync, and unavailable status from legacy rtc compatibility', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: false,
+        rtcState: 'needs_sync', rtcReason: 'lost_power', sd: true
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: false,
+        rtcState: 'unavailable', rtcReason: 'communication_failure', sd: true
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: true,
+        rtcState: 'ready', rtcReason: 'none', sd: true
+      }))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.getStatus()).resolves.toMatchObject({
+      rtc: false, rtcState: 'needs_sync', rtcReason: 'lost_power'
+    })
+    await expect(gateway.getStatus()).resolves.toMatchObject({
+      rtc: false, rtcState: 'unavailable', rtcReason: 'communication_failure'
+    })
+    await expect(gateway.getStatus()).resolves.toMatchObject({
+      rtc: true, rtcState: 'ready', rtcReason: 'none'
+    })
+  })
+
+  it.each([
+    { rtc: true, rtcState: 'needs_sync', rtcReason: 'lost_power' },
+    { rtc: false, rtcState: 'ready', rtcReason: 'none' },
+    { rtc: false, rtcState: 'needs_sync', rtcReason: 'none' },
+    { rtc: false, rtcState: 'unknown', rtcReason: 'lost_power' },
+    { rtc: false, rtcState: 'needs_sync' },
+    { rtc: false, rtcReason: 'lost_power' }
+  ])('rejects inconsistent RTC status metadata %#', async (rtcMetadata) => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse({
+      device: 'dental-inventory-esp32', online: true, mode: 'idle', sd: true,
+      ...rtcMetadata
+    }))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.getStatus()).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+  })
+
   it('accepts the optional desktop-presence field without requiring it from older firmware', async () => {
     const fetcher = vi.fn<HardwareFetch>()
       .mockResolvedValueOnce(jsonResponse({
@@ -277,6 +321,94 @@ describe('ESP32 HTTP hardware gateway', () => {
       })
     )
     expect(fetcher.mock.calls[0]?.[1]).not.toHaveProperty('body')
+  })
+
+  it('authenticates only the fixed RTC synchronization route with the backend token', async () => {
+    const deviceToken = 'a'.repeat(64)
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse({ desktopOnline: true }))
+      .mockResolvedValueOnce(jsonResponse({
+        synchronized: true,
+        rtcState: 'ready',
+        alreadyReady: false
+      }))
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://192.0.2.10',
+      deviceToken,
+      fetcher
+    })
+
+    await gateway.sendDesktopHeartbeat()
+    await expect(gateway.synchronizeRtc({
+      epochSeconds: 1_789_065_600,
+      utcOffsetMinutes: 480
+    })).resolves.toEqual({
+      synchronized: true,
+      rtcState: 'ready',
+      alreadyReady: false
+    })
+
+    expect(fetcher.mock.calls[0]?.[1].headers).not.toHaveProperty('X-Device-Token')
+    expect(fetcher.mock.calls[1]).toEqual([
+      'http://192.0.2.10/rtc/sync',
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'X-Device-Token': deviceToken
+        },
+        body: JSON.stringify({
+          epochSeconds: 1_789_065_600,
+          utcOffsetMinutes: 480
+        })
+      })
+    ])
+  })
+
+  it('fails closed without a device token and never sends an RTC request', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    await expect(gateway.synchronizeRtc({
+      epochSeconds: 1_789_065_600,
+      utcOffsetMinutes: 480
+    })).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+      diagnosticCode: 'DEVICE_TOKEN_UNCONFIGURED'
+    })
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('preserves only an allow-listed RTC firmware failure category', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+      jsonResponse({ synchronized: false, error: 'unauthorized', token: 'never-forward' }, 401)
+    )
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://esp32.local', deviceToken: 'a'.repeat(64), fetcher
+    })
+
+    await expect(gateway.synchronizeRtc({
+      epochSeconds: 1_789_065_600,
+      utcOffsetMinutes: 480
+    })).rejects.toMatchObject({ code: 'REJECTED', diagnosticCode: 'unauthorized' })
+  })
+
+  it.each([
+    { epochSeconds: 0, utcOffsetMinutes: 480 },
+    { epochSeconds: 1_789_065_600.5, utcOffsetMinutes: 480 },
+    { epochSeconds: 1_789_065_600, utcOffsetMinutes: 841 },
+    { epochSeconds: Number.NaN, utcOffsetMinutes: 480 }
+  ])('rejects an invalid host RTC request before transport %#', async (request) => {
+    const fetcher = vi.fn<HardwareFetch>()
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://esp32.local', deviceToken: 'a'.repeat(64), fetcher
+    })
+
+    await expect(gateway.synchronizeRtc(request)).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE'
+    })
+    expect(fetcher).not.toHaveBeenCalled()
   })
 
   it.each([

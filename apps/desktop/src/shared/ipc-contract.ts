@@ -45,12 +45,22 @@ export const IPC_CHANNELS = {
 export type HardwareConnectionStatus = 'CONNECTED' | 'OFFLINE'
 
 export type HardwareMode = 'idle' | 'restock' | 'checkout' | 'busy'
+export type HardwareRtcState = 'unavailable' | 'needs_sync' | 'ready'
+export type HardwareRtcReason =
+  | 'none'
+  | 'communication_failure'
+  | 'lost_power'
+  | 'invalid_time'
+  | 'verification_failed'
 
 export interface HardwareStatusDto {
   connection: HardwareConnectionStatus
   device: string | null
   mode: HardwareMode | null
   rtc: boolean | null
+  /** Omitted when connected firmware predates automatic RTC recovery. */
+  rtcState?: HardwareRtcState
+  rtcReason?: HardwareRtcReason
   sd: boolean | null
   /** Omitted when connected firmware predates durable offline journaling. */
   pendingSyncItems?: number

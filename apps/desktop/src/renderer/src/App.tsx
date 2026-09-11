@@ -47,6 +47,12 @@ function formatHardwareAvailability(value: boolean | null): string {
   return value ? 'Available' : 'Unavailable'
 }
 
+function formatRtcAvailability(status: HardwareStatusDto): string {
+  if (status.rtcState === 'needs_sync') return 'Needs synchronization'
+  if (status.rtcState === 'unavailable') return 'Hardware unavailable'
+  return formatHardwareAvailability(status.rtc)
+}
+
 const sectionMetadata: Record<
   NavigationItem,
   { eyebrow: string; title: string; description: string }
@@ -527,7 +533,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
               <dd>
                 {hardwareStatus === null
                   ? 'Checking…'
-                  : formatHardwareAvailability(hardwareStatus.rtc)}
+                  : formatRtcAvailability(hardwareStatus)}
               </dd>
             </div>
             <div>

@@ -8,8 +8,17 @@ import type {
   HardwareTransactionEventGateway,
   OfflinePendingEventGateway
 } from '../../src/main/hardware/hardware-gateway'
+import {
+  Esp32HttpGateway,
+  type HardwareFetch,
+  type HardwareHttpResponse
+} from '../../src/main/hardware/esp32-http-gateway'
 import type { OfflineInventoryCacheCoordinator } from '../../src/main/hardware/offline-inventory-cache'
 import type { OfflineSyncCoordinator } from '../../src/main/hardware/offline-sync-coordinator'
+import {
+  createRtcRecoveryCoordinator,
+  type RtcRecoveryCoordinator
+} from '../../src/main/hardware/rtc-recovery-coordinator'
 import {
   createHardwareTransactionCoordinator,
   type HardwareTransactionCoordinator
@@ -98,6 +107,14 @@ const offlineReconciliationReceipt: OfflineReconciliationReceipt = {
   cacheGeneration: offlinePendingEvent.cacheGeneration
 }
 
+function jsonResponse(value: unknown, status = 200): HardwareHttpResponse {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: vi.fn().mockResolvedValue(value)
+  }
+}
+
 describe('authenticated hardware IPC boundary', () => {
   beforeEach(() => {
     electronMock.handlers.clear()
@@ -110,7 +127,8 @@ describe('authenticated hardware IPC boundary', () => {
     inventoryService: InventoryService = createInventoryService(),
     transactionCoordinator: HardwareTransactionCoordinator = createTransactionCoordinator(),
     offlineInventoryCacheCoordinator: OfflineInventoryCacheCoordinator | null = null,
-    offlineSyncCoordinator: OfflineSyncCoordinator | null = null
+    offlineSyncCoordinator: OfflineSyncCoordinator | null = null,
+    rtcRecoveryCoordinator: RtcRecoveryCoordinator | null = null
   ) {
     const authSession = createAuthSessionController()
     const mainFrame = {}
@@ -130,7 +148,8 @@ describe('authenticated hardware IPC boundary', () => {
       authSession,
       getMainWindow: () => mainWindow,
       offlineInventoryCacheCoordinator,
-      offlineSyncCoordinator
+      offlineSyncCoordinator,
+      rtcRecoveryCoordinator
     })
     const handler = electronMock.handlers.get(IPC_CHANNELS.hardwareGetStatus)
     if (handler === undefined) throw new Error('Hardware status handler was not registered.')
@@ -180,7 +199,8 @@ describe('authenticated hardware IPC boundary', () => {
       gateway,
       inventoryService,
       transactionCoordinator,
-      offlineInventoryCacheCoordinator
+      offlineInventoryCacheCoordinator,
+      rtcRecoveryCoordinator
     }
   }
 
@@ -349,6 +369,103 @@ describe('authenticated hardware IPC boundary', () => {
     await expect(heartbeat(trustedEvent)).resolves.toBe(true)
     expect(gateway.sendDesktopHeartbeat).toHaveBeenCalledExactlyOnceWith()
     dispose()
+  })
+
+  it('permits backend-owned RTC recovery only after an authenticated heartbeat', async () => {
+    const gateway = createGateway()
+    const rtcRecoveryCoordinator: RtcRecoveryCoordinator = {
+      synchronizeIfNeeded: vi.fn().mockResolvedValue('SYNCHRONIZED')
+    }
+    const { authSession, trustedEvent, heartbeat, dispose } = setup(
+      gateway,
+      createInventoryService(),
+      createTransactionCoordinator(),
+      null,
+      null,
+      rtcRecoveryCoordinator
+    )
+
+    await expect(heartbeat(trustedEvent)).resolves.toBe(false)
+    expect(rtcRecoveryCoordinator.synchronizeIfNeeded).not.toHaveBeenCalled()
+
+    authSession.signIn('admin')
+    await expect(heartbeat(trustedEvent, { epochSeconds: 0 })).resolves.toBe(true)
+    expect(rtcRecoveryCoordinator.synchronizeIfNeeded).toHaveBeenCalledExactlyOnceWith()
+    dispose()
+  })
+
+  it('keeps an accepted heartbeat valid when RTC recovery remains fail-closed', async () => {
+    const gateway = createGateway()
+    const rtcRecoveryCoordinator: RtcRecoveryCoordinator = {
+      synchronizeIfNeeded: vi.fn().mockRejectedValue(new Error('RTC sync failed'))
+    }
+    const test = setup(
+      gateway,
+      createInventoryService(),
+      createTransactionCoordinator(),
+      null,
+      null,
+      rtcRecoveryCoordinator
+    )
+    test.authSession.signIn('admin')
+
+    await expect(test.heartbeat(test.trustedEvent)).resolves.toBe(true)
+    expect(gateway.sendDesktopHeartbeat).toHaveBeenCalledOnce()
+    test.dispose()
+  })
+
+  it('runs the real heartbeat-status-gateway RTC recovery path exactly once without renderer time', async () => {
+    const deviceToken = 'a'.repeat(64)
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse({ desktopOnline: true }))
+      .mockResolvedValueOnce(jsonResponse({
+        device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: false,
+        rtcState: 'needs_sync', rtcReason: 'lost_power', sd: true,
+        desktopOnline: true, offlineCacheAvailable: true,
+        offlineCacheGeneration: `v1-${'a'.repeat(64)}`, offlineCacheItems: 2,
+        pendingSyncItems: 2, offlineReady: false
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        synchronized: true, rtcState: 'ready', alreadyReady: false
+      }))
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://esp32.test', deviceToken, fetcher
+    })
+    const rtcRecoveryCoordinator = createRtcRecoveryCoordinator({
+      gateway,
+      now: () => Date.UTC(2026, 8, 10, 12, 30, 45),
+      logger: { info: vi.fn(), error: vi.fn() }
+    })
+    const test = setup(
+      gateway,
+      createInventoryService(),
+      createTransactionCoordinator(),
+      null,
+      null,
+      rtcRecoveryCoordinator
+    )
+    test.authSession.signIn('admin')
+
+    await expect(test.heartbeat(test.trustedEvent, {
+      epochSeconds: 0,
+      utcOffsetMinutes: -999
+    })).resolves.toBe(true)
+
+    expect(fetcher).toHaveBeenCalledTimes(3)
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      'http://esp32.test/desktop/heartbeat',
+      'http://esp32.test/status',
+      'http://esp32.test/rtc/sync'
+    ])
+    const rtcRequest = fetcher.mock.calls[2]?.[1]
+    expect(JSON.parse(rtcRequest?.body ?? '')).toEqual({
+      epochSeconds: Math.floor(Date.UTC(2026, 8, 10, 12, 30, 45) / 1_000),
+      utcOffsetMinutes: -new Date(Date.UTC(2026, 8, 10, 12, 30, 45)).getTimezoneOffset()
+    })
+    expect(rtcRequest?.headers).toMatchObject({ 'X-Device-Token': deviceToken })
+    expect(fetcher.mock.calls.some(([url]) => url.includes('/offline/events/'))).toBe(false)
+    expect(test.inventoryService.reconcileOfflineEvent).not.toHaveBeenCalled()
+    test.dispose()
   })
 
   it('does not renew desktop presence while signed out or from an untrusted frame', async () => {

@@ -16,6 +16,7 @@
 #include "offline_inventory_cache.h"
 #include "offline_pending_journal.h"
 #include "protocol_config.h"
+#include "rtc_recovery.h"
 #include "secrets.h"
 #include "transaction_event_queue.h"
 
@@ -59,6 +60,10 @@ using dental::cache::ItemResult;
 constexpr char kWiFiSsidPlaceholder[] = "replace-with-local-wifi-ssid";
 constexpr char kWiFiPasswordPlaceholder[] =
     "replace-with-local-wifi-password";
+constexpr char kDeviceTokenPlaceholder[] =
+    "replace-with-a-random-shared-device-token";
+const char* kCollectedHttpHeaders[] = {
+    dental::protocol::kDeviceTokenHeader};
 
 struct TransactionProfile {
   uint8_t buttonGpio;
@@ -141,6 +146,9 @@ WebServer httpServer(kHttpServerPort);
 bool lcdAvailable = false;
 bool rtcAvailable = false;
 bool microSdAvailable = false;
+dental::rtc_recovery::Status rtcStatus = {
+    dental::rtc_recovery::State::kUnavailable,
+    dental::rtc_recovery::Reason::kCommunicationFailure};
 
 class SdCacheStorage : public dental::cache::CacheStorage {
  public:
@@ -381,6 +389,7 @@ uint32_t lastBarcodeByteMs = 0UL;
 
 void setStockStatusIndicator(StockStatus status);
 void startNextCommittedResultFeedback(uint32_t nowMs);
+bool readDs3231StatusRegister(uint8_t& status);
 
 StockStatus toEventStockStatus(dental::cache::StockStatus status) {
   switch (status) {
@@ -417,6 +426,16 @@ void showInitializationScreen() {
 void showIdleScreen() {
   showLcdScreen("Any Time Dental", "System Ready", "Restock / Checkout",
                 "Press a button");
+}
+
+void showRtcSynchronizationRequiredScreen() {
+  showLcdScreen("Any Time Dental", "RTC needs time", "Start desktop app",
+                "to synchronize");
+}
+
+void setRtcStatus(dental::rtc_recovery::Status status) {
+  rtcStatus = status;
+  rtcAvailable = dental::rtc_recovery::timeIsTrusted(status);
 }
 
 const char* currentHttpMode() {
@@ -550,6 +569,12 @@ void handleStatusRequest() {
   response += currentHttpMode();
   response += "\",\"rtc\":";
   response += rtcAvailable ? "true" : "false";
+  response += ",\"rtcState\":";
+  appendJsonString(response,
+                   dental::rtc_recovery::stateName(rtcStatus.state));
+  response += ",\"rtcReason\":";
+  appendJsonString(response,
+                   dental::rtc_recovery::reasonName(rtcStatus.reason));
   response += ",\"sd\":";
   response += microSdAvailable ? "true" : "false";
   response += ",\"desktopOnline\":";
@@ -582,6 +607,102 @@ void handleStatusRequest() {
 void handleDesktopHeartbeatRequest() {
   desktopPresence.recordHeartbeat(millis());
   httpServer.send(200, "application/json", "{\"desktopOnline\":true}");
+}
+
+bool deviceTokenIsConfigured() {
+  return strlen(DENTAL_DEVICE_TOKEN) >= 32U &&
+         strcmp(DENTAL_DEVICE_TOKEN, kDeviceTokenPlaceholder) != 0;
+}
+
+bool rtcSyncRequestIsAuthenticated() {
+  if (!deviceTokenIsConfigured() ||
+      !httpServer.hasHeader(dental::protocol::kDeviceTokenHeader)) {
+    return false;
+  }
+  const String suppliedToken =
+      httpServer.header(dental::protocol::kDeviceTokenHeader);
+  return dental::rtc_recovery::constantTimeTokenMatches(
+      DENTAL_DEVICE_TOKEN, suppliedToken.c_str());
+}
+
+void sendRtcSyncError(int statusCode, const char* errorCode) {
+  String response = "{\"synchronized\":false,\"error\":";
+  appendJsonString(response, errorCode);
+  response += '}';
+  httpServer.send(statusCode, "application/json", response);
+}
+
+void sendRtcSyncSuccess(bool alreadyReady) {
+  String response =
+      "{\"synchronized\":true,\"rtcState\":\"ready\",\"alreadyReady\":";
+  response += alreadyReady ? "true" : "false";
+  response += '}';
+  httpServer.send(200, "application/json", response);
+}
+
+void handleRtcSyncRequest() {
+  if (!deviceTokenIsConfigured()) {
+    sendRtcSyncError(503, "authentication_unconfigured");
+    return;
+  }
+  if (!rtcSyncRequestIsAuthenticated()) {
+    sendRtcSyncError(401, "unauthorized");
+    return;
+  }
+
+  dental::rtc_recovery::SyncRequest request = {};
+  const String body = httpServer.arg("plain");
+  if (!dental::rtc_recovery::parseSyncRequest(body.c_str(), body.length(),
+                                               request)) {
+    sendRtcSyncError(400, "invalid_timestamp");
+    return;
+  }
+
+  if (rtcStatus.state == dental::rtc_recovery::State::kUnavailable) {
+    sendRtcSyncError(503, "rtc_unavailable");
+    return;
+  }
+  if (rtcStatus.state == dental::rtc_recovery::State::kReady) {
+    // A lost response can be retried safely without rewriting a healthy RTC.
+    sendRtcSyncSuccess(true);
+    return;
+  }
+
+  rtc.adjust(DateTime(request.localEpochSeconds));
+
+  uint8_t statusRegister = 0U;
+  const bool statusReadable = readDs3231StatusRegister(statusRegister);
+  if (!statusReadable) {
+    setRtcStatus({dental::rtc_recovery::State::kUnavailable,
+                  dental::rtc_recovery::Reason::kCommunicationFailure});
+    Serial.println("RTC synchronization: FAILED - status reread failed");
+    sendRtcSyncError(503, "rtc_unavailable");
+    return;
+  }
+
+  const DateTime observed = rtc.now();
+  const bool oscillatorStopped =
+      (statusRegister & kDs3231OscillatorStopFlag) != 0U;
+  if (!dental::rtc_recovery::synchronizationVerified(
+          request.localEpochSeconds, true, oscillatorStopped,
+          observed.isValid(), observed.unixtime())) {
+    setRtcStatus(
+        {dental::rtc_recovery::State::kNeedsSync,
+         oscillatorStopped
+             ? dental::rtc_recovery::Reason::kLostPower
+             : dental::rtc_recovery::Reason::kVerificationFailed});
+    Serial.println("RTC synchronization: FAILED - verification failed");
+    sendRtcSyncError(500, "verification_failed");
+    return;
+  }
+
+  setRtcStatus({dental::rtc_recovery::State::kReady,
+                dental::rtc_recovery::Reason::kNone});
+  Serial.println("RTC synchronization: SUCCESS - desktop time verified");
+  if (workflowState == WorkflowState::kIdle && lcdAvailable) {
+    showIdleScreen();
+  }
+  sendRtcSyncSuccess(false);
 }
 
 const char* cacheOperationName(CacheOperation operation) {
@@ -951,6 +1072,7 @@ void configureHttpRoutes() {
   httpServer.on("/status", HTTP_GET, handleStatusRequest);
   httpServer.on("/desktop/heartbeat", HTTP_POST,
                 handleDesktopHeartbeatRequest);
+  httpServer.on("/rtc/sync", HTTP_POST, handleRtcSyncRequest);
   httpServer.on("/offline/cache", HTTP_POST, handleOfflineCacheRequest);
   httpServer.on("/offline/events/next", HTTP_GET,
                 handleNextOfflineEventRequest);
@@ -989,6 +1111,9 @@ void handleWiFiConnected() {
 
 void initializeWiFi() {
   configureHttpRoutes();
+  httpServer.collectHeaders(kCollectedHttpHeaders,
+                            sizeof(kCollectedHttpHeaders) /
+                                sizeof(kCollectedHttpHeaders[0]));
 
   if (!wiFiCredentialsAreConfigured()) {
     wiFiConnectionState = WiFiConnectionState::kDisabled;
@@ -1341,13 +1466,31 @@ CsvAppendResult appendTransactionEvent(const char* timestamp,
 }
 
 bool readRtcTimestamp(char* destination, size_t destinationSize) {
-  if (!rtcAvailable ||
-      !i2cAddressResponds(dental::hardware::kDs3231I2cAddress)) {
+  if (!rtcAvailable) {
+    return false;
+  }
+  if (!i2cAddressResponds(dental::hardware::kDs3231I2cAddress)) {
+    setRtcStatus({dental::rtc_recovery::State::kUnavailable,
+                  dental::rtc_recovery::Reason::kCommunicationFailure});
+    return false;
+  }
+
+  uint8_t statusRegister = 0U;
+  if (!readDs3231StatusRegister(statusRegister)) {
+    setRtcStatus({dental::rtc_recovery::State::kUnavailable,
+                  dental::rtc_recovery::Reason::kCommunicationFailure});
+    return false;
+  }
+  if ((statusRegister & kDs3231OscillatorStopFlag) != 0U) {
+    setRtcStatus({dental::rtc_recovery::State::kNeedsSync,
+                  dental::rtc_recovery::Reason::kLostPower});
     return false;
   }
 
   const DateTime now = rtc.now();
   if (!now.isValid()) {
+    setRtcStatus({dental::rtc_recovery::State::kNeedsSync,
+                  dental::rtc_recovery::Reason::kInvalidTime});
     return false;
   }
 
@@ -1619,8 +1762,13 @@ void beginTransactionWorkflow(const TransactionProfile& transaction) {
     return;
   }
   if (!rtcAvailable) {
-    beginErrorFeedback("RTC is unavailable; event was not started",
-                       "RTC unavailable");
+    if (rtcStatus.state == dental::rtc_recovery::State::kNeedsSync) {
+      beginErrorFeedback("RTC time is untrusted; event was not started",
+                         "RTC needs sync");
+    } else {
+      beginErrorFeedback("RTC is unavailable; event was not started",
+                         "RTC unavailable");
+    }
     return;
   }
   if (!microSdAvailable) {
@@ -1841,20 +1989,30 @@ void setup() {
   }
 
   if (wireInitialized && rtc.begin(&Wire)) {
-    uint8_t rtcStatus = 0U;
-    if (!readDs3231StatusRegister(rtcStatus)) {
+    uint8_t statusRegister = 0U;
+    if (!readDs3231StatusRegister(statusRegister)) {
+      setRtcStatus({dental::rtc_recovery::State::kUnavailable,
+                    dental::rtc_recovery::Reason::kCommunicationFailure});
       Serial.println(
           "RTC initialization: FAILED - status register read failed");
-    } else if ((rtcStatus & kDs3231OscillatorStopFlag) != 0U) {
+    } else if ((statusRegister & kDs3231OscillatorStopFlag) != 0U) {
+      setRtcStatus({dental::rtc_recovery::State::kNeedsSync,
+                    dental::rtc_recovery::Reason::kLostPower});
       Serial.println(
-          "RTC initialization: FAILED - lost-power flag set; time not modified");
+          "RTC initialization: NEEDS SYNCHRONIZATION - lost-power flag set");
     } else if (!rtc.now().isValid()) {
-      Serial.println("RTC initialization: FAILED - retained time is invalid");
+      setRtcStatus({dental::rtc_recovery::State::kNeedsSync,
+                    dental::rtc_recovery::Reason::kInvalidTime});
+      Serial.println(
+          "RTC initialization: NEEDS SYNCHRONIZATION - retained time is invalid");
     } else {
-      rtcAvailable = true;
+      setRtcStatus({dental::rtc_recovery::State::kReady,
+                    dental::rtc_recovery::Reason::kNone});
       Serial.println("RTC initialization: SUCCESS - retained time preserved");
     }
   } else {
+    setRtcStatus({dental::rtc_recovery::State::kUnavailable,
+                  dental::rtc_recovery::Reason::kCommunicationFailure});
     Serial.println("RTC initialization: FAILED - DS3231 not responding");
   }
 
@@ -1910,12 +2068,18 @@ void setup() {
   if (!lcdAvailable) {
     beginErrorFeedback("Initialization failed: LCD unavailable",
                        "LCD unavailable");
-  } else if (!rtcAvailable) {
+  } else if (rtcStatus.state ==
+             dental::rtc_recovery::State::kUnavailable) {
     beginErrorFeedback("Initialization failed: RTC unavailable",
                        "RTC unavailable");
   } else if (!microSdAvailable) {
     beginErrorFeedback("Initialization failed: MicroSD unavailable",
                        "SD unavailable");
+  } else if (rtcStatus.state ==
+             dental::rtc_recovery::State::kNeedsSync) {
+    Serial.println(
+        "Integrated workflow waiting for trusted desktop RTC synchronization");
+    showRtcSynchronizationRequiredScreen();
   } else {
     Serial.println("Integrated dual-mode workflow initialization: SUCCESS");
     showIdleScreen();

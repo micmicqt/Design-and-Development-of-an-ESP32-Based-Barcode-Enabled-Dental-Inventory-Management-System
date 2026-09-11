@@ -1,6 +1,7 @@
 #include "desktop_presence_lease.h"
 #include "offline_inventory_cache.h"
 #include "offline_pending_journal.h"
+#include "rtc_recovery.h"
 #include "transaction_event_queue.h"
 
 #include <assert.h>
@@ -2267,6 +2268,111 @@ void offlineJournalDoesNotAlterOnlineQueueOrIntegrationCsv() {
   assert(queue.oldestAppliedResult() == nullptr);
 }
 
+void healthyRtcBootIsReadyWithoutSynchronization() {
+  const dental::rtc_recovery::Status status =
+      dental::rtc_recovery::classifyInitialState(true, true, false, true);
+  assert(status.state == dental::rtc_recovery::State::kReady);
+  assert(status.reason == dental::rtc_recovery::Reason::kNone);
+  assert(dental::rtc_recovery::timeIsTrusted(status));
+  assert(strcmp(dental::rtc_recovery::stateName(status.state), "ready") == 0);
+}
+
+void lostPowerRtcNeedsSynchronizationWithoutBecomingUnavailable() {
+  const dental::rtc_recovery::Status status =
+      dental::rtc_recovery::classifyInitialState(true, true, true, true);
+  assert(status.state == dental::rtc_recovery::State::kNeedsSync);
+  assert(status.reason == dental::rtc_recovery::Reason::kLostPower);
+  assert(!dental::rtc_recovery::timeIsTrusted(status));
+  assert(strcmp(dental::rtc_recovery::stateName(status.state), "needs_sync") ==
+         0);
+  assert(strcmp(dental::rtc_recovery::reasonName(status.reason), "lost_power") ==
+         0);
+}
+
+void invalidRtcTimeNeedsSynchronization() {
+  const dental::rtc_recovery::Status status =
+      dental::rtc_recovery::classifyInitialState(true, true, false, false);
+  assert(status.state == dental::rtc_recovery::State::kNeedsSync);
+  assert(status.reason == dental::rtc_recovery::Reason::kInvalidTime);
+}
+
+void rtcCommunicationFailuresRemainUnavailable() {
+  const dental::rtc_recovery::Status undetected =
+      dental::rtc_recovery::classifyInitialState(false, false, false, false);
+  const dental::rtc_recovery::Status unreadable =
+      dental::rtc_recovery::classifyInitialState(true, false, false, true);
+  assert(undetected.state == dental::rtc_recovery::State::kUnavailable);
+  assert(unreadable.state == dental::rtc_recovery::State::kUnavailable);
+  assert(undetected.reason ==
+         dental::rtc_recovery::Reason::kCommunicationFailure);
+  assert(unreadable.reason ==
+         dental::rtc_recovery::Reason::kCommunicationFailure);
+}
+
+void rtcSyncRequestParserAcceptsTypedHostTimeAndOffset() {
+  dental::rtc_recovery::SyncRequest request = {};
+  const char body[] =
+      "{\"epochSeconds\":1789065600,\"utcOffsetMinutes\":480}";
+  assert(dental::rtc_recovery::parseSyncRequest(body, strlen(body), request));
+  assert(request.epochSeconds == 1789065600UL);
+  assert(request.utcOffsetMinutes == 480);
+  assert(request.localEpochSeconds == 1789094400UL);
+
+  const char reversed[] =
+      " { \"utcOffsetMinutes\" : -300, \"epochSeconds\" : 1789065600 } ";
+  assert(dental::rtc_recovery::parseSyncRequest(
+      reversed, strlen(reversed), request));
+  assert(request.utcOffsetMinutes == -300);
+  assert(request.localEpochSeconds == 1789047600UL);
+}
+
+void rtcSyncRequestParserRejectsMalformedOrUnreasonableTime() {
+  const char* invalid[] = {
+      "", "{}", "{\"epochSeconds\":1789065600}",
+      "{\"epochSeconds\":1789065600,\"utcOffsetMinutes\":480,\"extra\":1}",
+      "{\"epochSeconds\":\"1789065600\",\"utcOffsetMinutes\":480}",
+      "{\"epochSeconds\":1789065600.5,\"utcOffsetMinutes\":480}",
+      "{\"epochSeconds\":0,\"utcOffsetMinutes\":480}",
+      "{\"epochSeconds\":4102444800,\"utcOffsetMinutes\":0}",
+      "{\"epochSeconds\":1789065600,\"utcOffsetMinutes\":841}",
+      "{\"epochSeconds\":1789065600,\"utcOffsetMinutes\":480} trailing"};
+  for (size_t index = 0U; index < sizeof(invalid) / sizeof(invalid[0]);
+       ++index) {
+    dental::rtc_recovery::SyncRequest request = {};
+    assert(!dental::rtc_recovery::parseSyncRequest(
+        invalid[index], strlen(invalid[index]), request));
+  }
+}
+
+void rtcSynchronizationRequiresVerifiedWriteAndReread() {
+  const uint32_t requested = 1789094400UL;
+  assert(dental::rtc_recovery::synchronizationVerified(
+      requested, true, false, true, requested));
+  assert(dental::rtc_recovery::synchronizationVerified(
+      requested, true, false, true, requested + 2U));
+  assert(!dental::rtc_recovery::synchronizationVerified(
+      requested, false, false, true, requested));
+  assert(!dental::rtc_recovery::synchronizationVerified(
+      requested, true, true, true, requested));
+  assert(!dental::rtc_recovery::synchronizationVerified(
+      requested, true, false, false, requested));
+  assert(!dental::rtc_recovery::synchronizationVerified(
+      requested, true, false, true, requested + 3U));
+  assert(!dental::rtc_recovery::synchronizationVerified(
+      requested, true, false, true, requested - 1U));
+}
+
+void rtcSynchronizationRequiresExactDeviceToken() {
+  const char token[] =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  assert(dental::rtc_recovery::constantTimeTokenMatches(token, token));
+  assert(!dental::rtc_recovery::constantTimeTokenMatches(token, ""));
+  assert(!dental::rtc_recovery::constantTimeTokenMatches(
+      token,
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+  assert(!dental::rtc_recovery::constantTimeTokenMatches(nullptr, token));
+}
+
 }  // namespace
 
 int main() {
@@ -2348,6 +2454,14 @@ int main() {
   invalidOfflineRecordFieldsCannotReachStorage();
   unavailableJournalAndCacheAreSafeFailures();
   offlineJournalDoesNotAlterOnlineQueueOrIntegrationCsv();
-  puts("Firmware event queue/protocol/presence/cache/offline journal: 78 host test scenarios PASSED");
+  healthyRtcBootIsReadyWithoutSynchronization();
+  lostPowerRtcNeedsSynchronizationWithoutBecomingUnavailable();
+  invalidRtcTimeNeedsSynchronization();
+  rtcCommunicationFailuresRemainUnavailable();
+  rtcSyncRequestParserAcceptsTypedHostTimeAndOffset();
+  rtcSyncRequestParserRejectsMalformedOrUnreasonableTime();
+  rtcSynchronizationRequiresVerifiedWriteAndReread();
+  rtcSynchronizationRequiresExactDeviceToken();
+  puts("Firmware event queue/protocol/presence/cache/offline journal/RTC: 86 host test scenarios PASSED");
   return 0;
 }

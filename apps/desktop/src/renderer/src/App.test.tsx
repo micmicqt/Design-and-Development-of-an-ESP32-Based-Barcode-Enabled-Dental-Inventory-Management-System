@@ -1532,6 +1532,29 @@ describe('Phase 2 desktop application', () => {
     expect(within(status).getAllByText('Available')).toHaveLength(2)
   })
 
+  it('surfaces an RTC that needs synchronization without exposing a clock control', async () => {
+    installDesktopApi(
+      createDesktopApi({
+        hardware: {
+          getStatus: vi.fn().mockResolvedValue({
+            connection: 'CONNECTED',
+            device: 'dental-inventory-esp32',
+            mode: 'idle',
+            rtc: false,
+            rtcState: 'needs_sync',
+            rtcReason: 'lost_power',
+            sd: true
+          })
+        }
+      })
+    )
+
+    render(<App />)
+    const status = await screen.findByRole('status', { name: 'ESP32 hardware status' })
+    expect(await within(status).findByText('Needs synchronization')).toBeVisible()
+    expect(screen.queryByRole('button', { name: /sync rtc|set time/i })).not.toBeInTheDocument()
+  })
+
   it('shows a clean offline state when hardware polling fails', async () => {
     installDesktopApi(
       createDesktopApi({

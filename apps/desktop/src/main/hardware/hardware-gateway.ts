@@ -15,6 +15,13 @@ export type HardwareConnectionState = 'CONNECTED' | 'DISCONNECTED'
 export const ESP32_DEVICE_ID = 'dental-inventory-esp32' as const
 
 export type Esp32HardwareMode = 'idle' | 'restock' | 'checkout' | 'busy'
+export type Esp32RtcState = 'unavailable' | 'needs_sync' | 'ready'
+export type Esp32RtcReason =
+  | 'none'
+  | 'communication_failure'
+  | 'lost_power'
+  | 'invalid_time'
+  | 'verification_failed'
 
 export interface Esp32HealthResponse {
   status: 'ok'
@@ -27,6 +34,9 @@ export interface Esp32StatusResponse {
   online: boolean
   mode: Esp32HardwareMode
   rtc: boolean
+  /** Optional for compatibility with firmware predating automatic RTC recovery. */
+  rtcState?: Esp32RtcState
+  rtcReason?: Esp32RtcReason
   sd: boolean
   /** Optional for compatibility with Phase 5 firmware. */
   desktopOnline?: boolean
@@ -44,6 +54,23 @@ export interface HardwareStatusGateway {
   healthCheck(): Promise<Esp32HealthResponse>
   getStatus(): Promise<Esp32StatusResponse>
   sendDesktopHeartbeat(): Promise<void>
+}
+
+export interface RtcSynchronizationRequest {
+  epochSeconds: number
+  /** Current host offset east of UTC, preserving the DS3231 local wall clock. */
+  utcOffsetMinutes: number
+}
+
+export interface RtcSynchronizationResult {
+  synchronized: true
+  rtcState: 'ready'
+  alreadyReady: boolean
+}
+
+/** Backend-only, device-authenticated RTC provisioning boundary. */
+export interface RtcSynchronizationGateway {
+  synchronizeRtc(request: RtcSynchronizationRequest): Promise<RtcSynchronizationResult>
 }
 
 /** Polling/acknowledgement boundary for Phase 4 hardware scan delivery. */
@@ -107,7 +134,8 @@ export interface DesktopHardwareGateway
   extends HardwareTransactionEventGateway,
     OfflineInventoryCacheGateway,
     OfflinePendingEventGateway,
-    OfflineEventAcknowledgementGateway {}
+    OfflineEventAcknowledgementGateway,
+    RtcSynchronizationGateway {}
 
 export function isValidHardwareTransactionEventId(value: unknown): value is string {
   return (
