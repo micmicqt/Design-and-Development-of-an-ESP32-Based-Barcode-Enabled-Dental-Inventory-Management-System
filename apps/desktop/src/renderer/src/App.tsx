@@ -83,6 +83,7 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [passwordVisible, setPasswordVisible] = useState(false)
+  const [passwordToggleRevision, setPasswordToggleRevision] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
@@ -166,10 +167,31 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
                 aria-label={passwordVisible ? 'Hide password' : 'Show password'}
                 title={passwordVisible ? 'Hide password' : 'Show password'}
                 aria-pressed={passwordVisible}
-                onClick={() => setPasswordVisible((current) => !current)}
+                onClick={() => {
+                  setPasswordVisible((current) => !current)
+                  setPasswordToggleRevision((current) => current + 1)
+                }}
                 disabled={submitting}
               >
-                <span aria-hidden="true">{passwordVisible ? '◉' : '◎'}</span>
+                <span
+                  key={passwordToggleRevision}
+                  className={`password-visibility-button__icon${passwordToggleRevision > 0 ? ' is-toggling' : ''}`}
+                  data-icon={passwordVisible ? 'eye' : 'eye-off'}
+                  aria-hidden="true"
+                >
+                  {passwordVisible ? (
+                    <svg viewBox="0 0 24 24" focusable="false">
+                      <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" />
+                      <circle cx="12" cy="12" r="2.7" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 24 24" focusable="false">
+                      <path d="M3 4.5 21 19.5" />
+                      <path d="M10.5 6.15A10.3 10.3 0 0 1 12 6c6 0 9.5 6 9.5 6a15 15 0 0 1-3.2 3.65M6.35 7.25A15.8 15.8 0 0 0 2.5 12s3.5 6 9.5 6a10 10 0 0 0 2.05-.2" />
+                      <path d="M9.8 9.8a3.1 3.1 0 0 0 4.4 4.4" />
+                    </svg>
+                  )}
+                </span>
               </button>
             </div>
 

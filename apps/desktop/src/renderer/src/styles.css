@@ -199,6 +199,46 @@ button:disabled {
   background: var(--blue-soft);
 }
 
+.password-visibility-button__icon {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+}
+
+.password-visibility-button__icon svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  fill: none;
+  stroke: currentcolor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.password-visibility-button__icon.is-toggling {
+  animation: password-icon-toggle 150ms ease-out;
+}
+
+@keyframes password-icon-toggle {
+  0% {
+    opacity: 0.35;
+    transform: scale(0.82);
+  }
+
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .password-visibility-button__icon.is-toggling {
+    animation: none;
+  }
+}
+
 .primary-button {
   height: 49px;
   margin-top: 17px;

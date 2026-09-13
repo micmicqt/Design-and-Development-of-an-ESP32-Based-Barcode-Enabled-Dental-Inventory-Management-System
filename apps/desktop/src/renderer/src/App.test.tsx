@@ -1478,11 +1478,22 @@ describe('Phase 2 desktop application', () => {
     render(<App />)
 
     const password = await screen.findByLabelText('Password')
+    const showPassword = screen.getByRole('button', { name: 'Show password' })
     expect(password).toHaveAttribute('type', 'password')
-    await user.click(screen.getByRole('button', { name: 'Show password' }))
+    expect(showPassword).toHaveAttribute('title', 'Show password')
+    expect(showPassword.querySelector('[data-icon="eye-off"]')).toBeInTheDocument()
+
+    await user.click(showPassword)
     expect(password).toHaveAttribute('type', 'text')
-    await user.click(screen.getByRole('button', { name: 'Hide password' }))
+    const hidePassword = screen.getByRole('button', { name: 'Hide password' })
+    expect(hidePassword).toHaveAttribute('title', 'Hide password')
+    expect(hidePassword.querySelector('[data-icon="eye"]')).toBeInTheDocument()
+    expect(hidePassword.querySelector('.is-toggling')).toBeInTheDocument()
+
+    await user.click(hidePassword)
     expect(password).toHaveAttribute('type', 'password')
+    expect(screen.getByRole('button', { name: 'Show password' })
+      .querySelector('[data-icon="eye-off"]')).toBeInTheDocument()
   })
 
   it('opens the shell, changes sections, and logs out', async () => {
