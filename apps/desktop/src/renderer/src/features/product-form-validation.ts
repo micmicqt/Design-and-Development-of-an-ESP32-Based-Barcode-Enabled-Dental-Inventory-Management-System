@@ -1,6 +1,8 @@
 import {
   INVENTORY_CATEGORIES,
-  type InventoryCategory
+  PRODUCT_UNIT_TYPES,
+  type InventoryCategory,
+  type ProductUnitType
 } from '../../../shared/ipc-contract'
 
 const MAX_BARCODE_LENGTH = 128
@@ -10,6 +12,7 @@ export interface ProductFormDraft {
   barcode?: string
   itemName: string
   category: InventoryCategory | ''
+  unitType: ProductUnitType | ''
   currentStock: string
   lowStockThreshold: string
 }
@@ -18,6 +21,7 @@ export type ProductFormField =
   | 'barcode'
   | 'itemName'
   | 'category'
+  | 'unitType'
   | 'currentStock'
   | 'lowStockThreshold'
 
@@ -27,6 +31,7 @@ export interface ValidatedProductForm {
   barcode?: string
   itemName: string
   category: InventoryCategory
+  unitType: ProductUnitType
   currentStock: number
   lowStockThreshold: number
 }
@@ -68,6 +73,13 @@ export function validateProductForm(
     errors.category = 'Select one of the approved categories.'
   }
 
+  if (
+    draft.unitType === '' ||
+    !(PRODUCT_UNIT_TYPES as readonly string[]).includes(draft.unitType)
+  ) {
+    errors.unitType = 'Select a supported unit type.'
+  }
+
   if (currentStock === null) {
     errors.currentStock = 'Stock must be a whole number greater than or equal to zero.'
   }
@@ -87,6 +99,7 @@ export function validateProductForm(
       ...(barcode === undefined ? {} : { barcode }),
       itemName,
       category: draft.category as InventoryCategory,
+      unitType: draft.unitType as ProductUnitType,
       currentStock,
       lowStockThreshold
     }

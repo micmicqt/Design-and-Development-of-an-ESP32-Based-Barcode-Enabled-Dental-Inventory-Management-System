@@ -44,6 +44,25 @@ describe('preload hardware API', () => {
     expect(electronMock.invoke).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetStatus)
   })
 
+  it('exposes registration capture only through its fixed parameter-free channel', async () => {
+    const result = { ok: true, value: { barcode: '000012340056' } }
+    electronMock.invoke.mockResolvedValueOnce(result)
+
+    await expect(api.hardware.captureRegistrationBarcode()).resolves.toEqual(result)
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareCaptureRegistrationBarcode
+    )
+
+    electronMock.invoke.mockClear()
+    const callWithUnexpectedArgument = api.hardware.captureRegistrationBarcode as (
+      unexpected: unknown
+    ) => Promise<unknown>
+    await callWithUnexpectedArgument({ url: 'http://untrusted.example', mode: 'checkout' })
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.hardwareCaptureRegistrationBarcode
+    )
+  })
+
   it('exposes a parameter-free desktop heartbeat on one fixed IPC channel', async () => {
     electronMock.invoke.mockResolvedValueOnce(true)
 
@@ -302,6 +321,7 @@ describe('preload hardware API', () => {
     expect(Object.isFrozen(api.hardware)).toBe(true)
     expect(Object.keys(api.hardware).sort()).toEqual([
       'acknowledgeTransactionEvent',
+      'captureRegistrationBarcode',
       'getNextOfflineEvent',
       'getNextTransactionEvent',
       'getStatus',

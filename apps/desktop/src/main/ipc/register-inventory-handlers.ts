@@ -58,6 +58,7 @@ function toProductDto(product: ProductRecord, imageStore: ProductImageStore): Pr
     barcode: product.barcode,
     itemName: product.itemName,
     category: product.category,
+    unitType: product.unitType,
     imageUrl: imageStore.toRendererUrl(product.imagePath),
     currentStock: product.currentStock,
     lowStockThreshold: product.lowStockThreshold,
@@ -218,6 +219,7 @@ export function registerInventoryIpcHandlers(
           barcode: input.barcode,
           itemName: input.itemName,
           category: input.category,
+          unitType: input.unitType,
           initialStock: input.initialStock,
           lowStockThreshold: input.lowStockThreshold,
           managedImagePath: storedImagePath
@@ -252,6 +254,7 @@ export function registerInventoryIpcHandlers(
           id: input.id,
           itemName: input.itemName,
           category: input.category,
+          unitType: input.unitType,
           currentStock: input.currentStock,
           lowStockThreshold: input.lowStockThreshold,
           managedImagePath: input.removeImage === true ? null : storedImagePath

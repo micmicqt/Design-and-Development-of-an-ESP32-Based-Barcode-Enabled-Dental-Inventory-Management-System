@@ -2,7 +2,8 @@ import { ipcMain, type IpcMainInvokeEvent } from 'electron'
 import type { AuthSessionController } from '../application/auth-session'
 import type {
   HardwareTransactionEventGateway,
-  OfflinePendingEventGateway
+  OfflinePendingEventGateway,
+  RegistrationBarcodeCaptureGateway
 } from '../hardware/hardware-gateway'
 import type { OfflineInventoryCacheCoordinator } from '../hardware/offline-inventory-cache'
 import type { OfflineSyncCoordinator } from '../hardware/offline-sync-coordinator'
@@ -36,7 +37,9 @@ import {
 } from './payload-validation'
 
 export interface RegisterHardwareIpcHandlersOptions {
-  gateway: (HardwareTransactionEventGateway & OfflinePendingEventGateway) | null
+  gateway: (HardwareTransactionEventGateway &
+    OfflinePendingEventGateway &
+    Partial<RegistrationBarcodeCaptureGateway>) | null
   inventoryService: InventoryService
   transactionCoordinator: HardwareTransactionCoordinator
   authSession: AuthSessionController
@@ -322,6 +325,26 @@ export function registerHardwareIpcHandlers(
   )
 
   ipcMain.handle(
+    IPC_CHANNELS.hardwareCaptureRegistrationBarcode,
+    async (event): Promise<IpcResult<{ barcode: string }>> => {
+      if (!isAuthorized(event, authSession, getMainWindow)) return failure(unauthorizedError)
+
+      try {
+        if (gateway?.captureRegistrationBarcode === undefined) {
+          throw new Error('Barcode capture is not configured.')
+        }
+        const barcode = await gateway.captureRegistrationBarcode()
+        return ok({ barcode })
+      } catch {
+        return failure({
+          code: 'INTERNAL_ERROR',
+          message: 'Unable to capture a barcode. Check the scanner connection and try again.'
+        })
+      }
+    }
+  )
+
+  ipcMain.handle(
     IPC_CHANNELS.hardwareGetNextTransactionEvent,
     async (event): Promise<HardwareTransactionEvent | null> => {
       if (
@@ -518,6 +541,7 @@ export function registerHardwareIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetNextOfflineEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareReconcileNextOfflineEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareSynchronizeOfflineInventory)
+    ipcMain.removeHandler(IPC_CHANNELS.hardwareCaptureRegistrationBarcode)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     ipcMain.removeHandler(IPC_CHANNELS.hardwareGetTransactionReceipt)

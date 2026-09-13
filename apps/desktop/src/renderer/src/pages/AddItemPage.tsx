@@ -1,7 +1,9 @@
 import { useState, type FormEvent } from 'react'
 import {
   INVENTORY_CATEGORIES,
+  PRODUCT_UNIT_TYPES,
   type InventoryCategory,
+  type ProductUnitType,
   type SelectedImageDto
 } from '../../../shared/ipc-contract'
 import {
@@ -15,6 +17,7 @@ const INITIAL_FORM: ProductFormDraft = {
   barcode: '',
   itemName: '',
   category: '',
+  unitType: 'Piece',
   currentStock: '0',
   lowStockThreshold: '0'
 }
@@ -35,6 +38,8 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
   const [submissionError, setSubmissionError] = useState<string | null>(null)
   const [imageProcessing, setImageProcessing] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [barcodeMode, setBarcodeMode] = useState<'scan' | 'manual'>('scan')
+  const [captureState, setCaptureState] = useState<'idle' | 'waiting' | 'captured' | 'error'>('idle')
 
   function setField<Key extends keyof ProductFormDraft>(
     field: Key,
@@ -43,6 +48,38 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
     setForm((current) => ({ ...current, [field]: value }))
     setErrors((current) => ({ ...current, [field]: undefined }))
     setSubmissionError(null)
+  }
+
+  async function captureBarcode(): Promise<void> {
+    if (submitting || captureState === 'waiting') return
+    setCaptureState('waiting')
+    setSubmissionError(null)
+    setErrors((current) => ({ ...current, barcode: undefined }))
+
+    try {
+      const result = await window.desktopApi.hardware.captureRegistrationBarcode()
+      if (!result.ok) {
+        setCaptureState('error')
+        setSubmissionError(result.error.message)
+        return
+      }
+
+      const barcode = result.value.barcode
+      setField('barcode', barcode)
+      const existing = await window.desktopApi.inventory.findProductByBarcode(barcode)
+      if (!existing.ok) {
+        setCaptureState('error')
+        setSubmissionError(existing.error.message)
+      } else if (existing.value !== null) {
+        setCaptureState('error')
+        setErrors((current) => ({ ...current, barcode: 'This barcode is already registered.' }))
+      } else {
+        setCaptureState('captured')
+      }
+    } catch {
+      setCaptureState('error')
+      setSubmissionError('Unable to capture a barcode. Check the scanner connection and try again.')
+    }
   }
 
   async function submit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -60,6 +97,7 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
         barcode: validation.value.barcode,
         itemName: validation.value.itemName,
         category: validation.value.category,
+        unitType: validation.value.unitType,
         initialStock: validation.value.currentStock,
         lowStockThreshold: validation.value.lowStockThreshold,
         imageSelectionToken: selectedImage?.selectionToken ?? null
@@ -74,6 +112,7 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
       setForm(INITIAL_FORM)
       setErrors({})
       setSelectedImage(null)
+      setCaptureState('idle')
       onCreated(registeredName)
     } catch {
       setSubmissionError('The item could not be saved. Please try again.')
@@ -84,9 +123,31 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
 
   return (
     <form className="product-form" onSubmit={submit} noValidate>
-      <div className="manual-entry-note" role="note">
-        <strong>Manual barcode entry</strong>
-        <span>Enter or paste the barcode printed on the item or package.</span>
+      <div className="barcode-entry-panel" aria-labelledby="barcode-entry-title">
+        <div>
+          <strong id="barcode-entry-title">Barcode registration</strong>
+          <span>Scan with the clinic kiosk or enter the code manually.</span>
+        </div>
+        <div className="barcode-mode-switch" role="group" aria-label="Barcode entry method">
+          <button
+            type="button"
+            className={barcodeMode === 'scan' ? 'is-active' : ''}
+            aria-pressed={barcodeMode === 'scan'}
+            onClick={() => setBarcodeMode('scan')}
+            disabled={submitting || captureState === 'waiting'}
+          >
+            Scan Barcode
+          </button>
+          <button
+            type="button"
+            className={barcodeMode === 'manual' ? 'is-active' : ''}
+            aria-pressed={barcodeMode === 'manual'}
+            onClick={() => setBarcodeMode('manual')}
+            disabled={submitting || captureState === 'waiting'}
+          >
+            Enter Manually
+          </button>
+        </div>
       </div>
 
       {submissionError !== null && (
@@ -99,19 +160,55 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
         <section className="product-form__fields" aria-label="Item details">
           <div className="form-field form-field--wide">
             <label htmlFor="new-barcode">Barcode / SKU</label>
-            <input
-              id="new-barcode"
-              type="text"
-              autoComplete="off"
-              maxLength={128}
-              value={form.barcode ?? ''}
-              onChange={(event) => setField('barcode', event.target.value)}
-              aria-invalid={Boolean(errors.barcode)}
-              aria-describedby={errors.barcode ? 'new-barcode-error' : undefined}
-              disabled={submitting}
-            />
+            {barcodeMode === 'scan' ? (
+              <div className="barcode-capture">
+                <input
+                  id="new-barcode"
+                  type="text"
+                  value={form.barcode ?? ''}
+                  placeholder="Barcode will appear after scanning"
+                  readOnly
+                  aria-invalid={Boolean(errors.barcode)}
+                  aria-describedby={errors.barcode ? 'new-barcode-error' : 'barcode-capture-status'}
+                />
+                <button
+                  className="secondary-button barcode-capture__button"
+                  type="button"
+                  aria-label={form.barcode ? 'Rescan barcode' : 'Start barcode scan'}
+                  onClick={() => void captureBarcode()}
+                  disabled={submitting || captureState === 'waiting'}
+                >
+                  {captureState === 'waiting'
+                    ? 'Waiting for scan…'
+                    : form.barcode
+                      ? 'Rescan'
+                      : 'Scan Barcode'}
+                </button>
+              </div>
+            ) : (
+              <input
+                id="new-barcode"
+                type="text"
+                autoComplete="off"
+                maxLength={128}
+                value={form.barcode ?? ''}
+                onChange={(event) => {
+                  setField('barcode', event.target.value)
+                  setCaptureState('idle')
+                }}
+                aria-invalid={Boolean(errors.barcode)}
+                aria-describedby={errors.barcode ? 'new-barcode-error' : undefined}
+                disabled={submitting}
+              />
+            )}
             <FieldError id="new-barcode-error" message={errors.barcode} />
-            <small>Leading zeroes are preserved.</small>
+            <small id="barcode-capture-status" role="status" aria-live="polite">
+              {barcodeMode === 'scan' && captureState === 'waiting'
+                ? 'Waiting for barcode scan…'
+                : barcodeMode === 'scan' && captureState === 'captured'
+                  ? `Captured barcode: ${form.barcode}`
+                  : 'Leading zeroes are preserved.'}
+            </small>
           </div>
 
           <div className="form-field form-field--wide">
@@ -147,6 +244,23 @@ export function AddItemPage({ onCreated }: { onCreated: (itemName: string) => vo
               ))}
             </select>
             <FieldError id="new-category-error" message={errors.category} />
+          </div>
+
+          <div className="form-field form-field--wide">
+            <label htmlFor="new-unit-type">Unit Type</label>
+            <select
+              id="new-unit-type"
+              value={form.unitType}
+              onChange={(event) => setField('unitType', event.target.value as ProductUnitType)}
+              aria-invalid={Boolean(errors.unitType)}
+              aria-describedby={errors.unitType ? 'new-unit-type-error' : undefined}
+              disabled={submitting}
+            >
+              {PRODUCT_UNIT_TYPES.map((unitType) => (
+                <option key={unitType} value={unitType}>{unitType}</option>
+              ))}
+            </select>
+            <FieldError id="new-unit-type-error" message={errors.unitType} />
           </div>
 
           <div className="form-field">

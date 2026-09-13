@@ -16,6 +16,7 @@
 #include "offline_inventory_cache.h"
 #include "offline_pending_journal.h"
 #include "protocol_config.h"
+#include "registration_barcode_capture.h"
 #include "rtc_recovery.h"
 #include "secrets.h"
 #include "transaction_event_queue.h"
@@ -386,10 +387,13 @@ size_t acknowledgementMatchIndex = 0U;
 String barcodeBuffer;
 bool barcodeIsInvalid = false;
 uint32_t lastBarcodeByteMs = 0UL;
+dental::registration::BarcodeCapture registrationBarcodeCapture;
+bool registrationCaptureOutcomeReported = false;
 
 void setStockStatusIndicator(StockStatus status);
 void startNextCommittedResultFeedback(uint32_t nowMs);
 bool readDs3231StatusRegister(uint8_t& status);
+void drainScannerInput();
 
 StockStatus toEventStockStatus(dental::cache::StockStatus status) {
   switch (status) {
@@ -439,6 +443,9 @@ void setRtcStatus(dental::rtc_recovery::Status status) {
 }
 
 const char* currentHttpMode() {
+  if (registrationBarcodeCapture.active()) {
+    return "busy";
+  }
   if (workflowState == WorkflowState::kIdle) {
     return "idle";
   }
@@ -614,7 +621,7 @@ bool deviceTokenIsConfigured() {
          strcmp(DENTAL_DEVICE_TOKEN, kDeviceTokenPlaceholder) != 0;
 }
 
-bool rtcSyncRequestIsAuthenticated() {
+bool deviceRequestIsAuthenticated() {
   if (!deviceTokenIsConfigured() ||
       !httpServer.hasHeader(dental::protocol::kDeviceTokenHeader)) {
     return false;
@@ -645,7 +652,7 @@ void handleRtcSyncRequest() {
     sendRtcSyncError(503, "authentication_unconfigured");
     return;
   }
-  if (!rtcSyncRequestIsAuthenticated()) {
+  if (!deviceRequestIsAuthenticated()) {
     sendRtcSyncError(401, "unauthorized");
     return;
   }
@@ -703,6 +710,71 @@ void handleRtcSyncRequest() {
     showIdleScreen();
   }
   sendRtcSyncSuccess(false);
+}
+
+void sendBarcodeCaptureError(int statusCode, const char* errorCode) {
+  String response = "{\"captured\":false,\"error\":";
+  appendJsonString(response, errorCode);
+  response += '}';
+  httpServer.send(statusCode, "application/json", response);
+}
+
+void handleStartBarcodeCaptureRequest() {
+  if (!deviceTokenIsConfigured()) {
+    sendBarcodeCaptureError(503, "authentication_unconfigured");
+    return;
+  }
+  if (!deviceRequestIsAuthenticated()) {
+    sendBarcodeCaptureError(401, "unauthorized");
+    return;
+  }
+  if (workflowState != WorkflowState::kIdle ||
+      registrationBarcodeCapture.active()) {
+    sendBarcodeCaptureError(409, "scanner_busy");
+    return;
+  }
+
+  drainScannerInput();
+  if (!registrationBarcodeCapture.start(millis())) {
+    sendBarcodeCaptureError(409, "scanner_busy");
+    return;
+  }
+  registrationCaptureOutcomeReported = false;
+  showLcdScreen("REGISTER PRODUCT", "Scanner starting...", "Scan barcode",
+                "Please wait");
+  scannerSerial.write(kGm65TriggerCommand, sizeof(kGm65TriggerCommand));
+  scannerSerial.flush();
+  Serial.println("Registration barcode capture started");
+  httpServer.send(200, "application/json", "{\"started\":true}");
+}
+
+void handleReadBarcodeCaptureRequest() {
+  if (!deviceTokenIsConfigured()) {
+    sendBarcodeCaptureError(503, "authentication_unconfigured");
+    return;
+  }
+  if (!deviceRequestIsAuthenticated()) {
+    sendBarcodeCaptureError(401, "unauthorized");
+    return;
+  }
+
+  using dental::registration::CaptureState;
+  const CaptureState state = registrationBarcodeCapture.state();
+  if (state == CaptureState::kIdle || registrationBarcodeCapture.active()) {
+    httpServer.send(204);
+    return;
+  }
+  if (state == CaptureState::kFailed) {
+    sendBarcodeCaptureError(
+        409, dental::registration::failureCode(
+                 registrationBarcodeCapture.failure()));
+    return;
+  }
+
+  String response = "{\"captured\":true,\"barcode\":";
+  appendJsonString(response, registrationBarcodeCapture.barcode());
+  response += '}';
+  httpServer.send(200, "application/json", response);
 }
 
 const char* cacheOperationName(CacheOperation operation) {
@@ -1073,6 +1145,10 @@ void configureHttpRoutes() {
   httpServer.on("/desktop/heartbeat", HTTP_POST,
                 handleDesktopHeartbeatRequest);
   httpServer.on("/rtc/sync", HTTP_POST, handleRtcSyncRequest);
+  httpServer.on("/barcode/capture", HTTP_POST,
+                handleStartBarcodeCaptureRequest);
+  httpServer.on("/barcode/capture", HTTP_GET,
+                handleReadBarcodeCaptureRequest);
   httpServer.on("/offline/cache", HTTP_POST, handleOfflineCacheRequest);
   httpServer.on("/offline/events/next", HTTP_GET,
                 handleNextOfflineEventRequest);
@@ -1307,6 +1383,29 @@ void resetScannerWorkflowBuffers() {
 void drainScannerInput() {
   while (scannerSerial.available() > 0) {
     scannerSerial.read();
+  }
+}
+
+void reportRegistrationCaptureOutcome() {
+  if (registrationCaptureOutcomeReported ||
+      registrationBarcodeCapture.active()) {
+    return;
+  }
+
+  using dental::registration::CaptureState;
+  if (registrationBarcodeCapture.state() == CaptureState::kComplete) {
+    Serial.print("REGISTRATION BARCODE RECEIVED: ");
+    Serial.println(registrationBarcodeCapture.barcode());
+    showLcdScreen("BARCODE CAPTURED", registrationBarcodeCapture.barcode(),
+                  "Review on desktop", "No stock changed");
+    registrationCaptureOutcomeReported = true;
+  } else if (registrationBarcodeCapture.state() == CaptureState::kFailed) {
+    const char* failure = dental::registration::failureCode(
+        registrationBarcodeCapture.failure());
+    Serial.print("Registration barcode capture failed: ");
+    Serial.println(failure);
+    showLcdScreen("SCAN ERROR", failure, "Try scan again", "No stock changed");
+    registrationCaptureOutcomeReported = true;
   }
 }
 
@@ -1710,6 +1809,17 @@ void processAcknowledgementByte(uint8_t receivedByte, uint32_t nowMs) {
 }
 
 void serviceScanner(uint32_t nowMs) {
+  if (registrationBarcodeCapture.active()) {
+    while (scannerSerial.available() > 0 &&
+           registrationBarcodeCapture.active()) {
+      registrationBarcodeCapture.receive(
+          static_cast<uint8_t>(scannerSerial.read()), nowMs);
+    }
+    registrationBarcodeCapture.service(nowMs);
+    reportRegistrationCaptureOutcome();
+    return;
+  }
+
   while (scannerSerial.available() > 0) {
     const uint8_t receivedByte =
         static_cast<uint8_t>(scannerSerial.read());
@@ -1848,7 +1958,8 @@ void serviceButtons(uint32_t nowMs) {
     return;
   }
 
-  if (workflowState != WorkflowState::kIdle || buttonsMustBeReleased) {
+  if (workflowState != WorkflowState::kIdle ||
+      registrationBarcodeCapture.active() || buttonsMustBeReleased) {
     if (restockPressed) {
       Serial.println("RESTOCK button press ignored - system busy");
     }

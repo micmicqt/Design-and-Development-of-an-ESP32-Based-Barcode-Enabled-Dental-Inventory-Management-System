@@ -170,6 +170,35 @@ button:disabled {
   box-shadow: 0 0 0 3px rgb(22 99 73 / 12%);
 }
 
+.password-field {
+  position: relative;
+}
+
+.password-field input {
+  padding-right: 52px;
+}
+
+.password-visibility-button {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  display: grid;
+  width: 37px;
+  height: 37px;
+  padding: 0;
+  color: #496581;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  transform: translateY(-50%);
+}
+
+.password-visibility-button:hover:not(:disabled),
+.password-visibility-button:focus-visible {
+  color: var(--blue-dark);
+  background: var(--blue-soft);
+}
+
 .primary-button {
   height: 49px;
   margin-top: 17px;
@@ -907,7 +936,7 @@ button:disabled {
 
 .data-table {
   width: 100%;
-  min-width: 730px;
+  min-width: 820px;
   border-collapse: collapse;
 }
 
@@ -2368,6 +2397,84 @@ button:focus-visible {
   border-radius: 10px;
 }
 
+.barcode-entry-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 14px 16px;
+  color: #35516e;
+  background: #f0f7ff;
+  border: 1px solid #d4e7fb;
+  border-radius: 10px;
+}
+
+.barcode-entry-panel > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.barcode-entry-panel strong {
+  color: var(--blue-dark);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+
+.barcode-entry-panel span {
+  color: #60758a;
+  font-size: 12px;
+}
+
+.barcode-mode-switch {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  padding: 4px;
+  background: #dfeefd;
+  border-radius: 9px;
+}
+
+.barcode-mode-switch button {
+  min-height: 35px;
+  padding: 0 13px;
+  color: #42617e;
+  font-size: 11px;
+  font-weight: 750;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+}
+
+.barcode-mode-switch button.is-active {
+  color: var(--blue-dark);
+  background: #fff;
+  box-shadow: 0 2px 8px rgb(10 67 122 / 12%);
+}
+
+.barcode-capture {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px;
+}
+
+.barcode-capture__button {
+  min-width: 126px;
+  min-height: 45px;
+  white-space: nowrap;
+}
+
+.unit-type-value {
+  display: inline-flex;
+  min-width: 58px;
+  padding: 5px 9px;
+  color: #315a82;
+  font-size: 11px;
+  font-weight: 700;
+  background: #edf6ff;
+  border: 1px solid #d7e8f9;
+  border-radius: 999px;
+}
+
 .manual-entry-note strong {
   flex: 0 0 auto;
   color: var(--blue-dark);
@@ -2838,6 +2945,19 @@ button:focus-visible {
     align-items: flex-start;
     flex-direction: column;
     gap: 5px;
+  }
+
+  .barcode-entry-panel {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .barcode-mode-switch {
+    align-self: flex-start;
+  }
+
+  .barcode-capture {
+    grid-template-columns: 1fr;
   }
 }
 

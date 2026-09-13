@@ -42,6 +42,7 @@ const desktopApi: DesktopApi = Object.freeze({
         barcode: input.barcode,
         itemName: input.itemName,
         category: input.category,
+        unitType: input.unitType,
         initialStock: input.initialStock,
         lowStockThreshold: input.lowStockThreshold,
         imageSelectionToken: input.imageSelectionToken
@@ -51,6 +52,7 @@ const desktopApi: DesktopApi = Object.freeze({
         id: input.id,
         itemName: input.itemName,
         category: input.category,
+        unitType: input.unitType,
         currentStock: input.currentStock,
         lowStockThreshold: input.lowStockThreshold
       }
@@ -102,7 +104,9 @@ const desktopApi: DesktopApi = Object.freeze({
     retryTransactionResultDelivery: (eventId: string) =>
       ipcRenderer.invoke(IPC_CHANNELS.hardwareRetryTransactionResultDelivery, eventId),
     retryTransactionAcknowledgement: (eventId: string) =>
-      ipcRenderer.invoke(IPC_CHANNELS.hardwareRetryTransactionAcknowledgement, eventId)
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareRetryTransactionAcknowledgement, eventId),
+    captureRegistrationBarcode: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.hardwareCaptureRegistrationBarcode)
   })
 })
 

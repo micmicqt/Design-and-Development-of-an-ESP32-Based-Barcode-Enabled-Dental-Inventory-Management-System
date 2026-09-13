@@ -47,6 +47,7 @@ describe("InventoryService", () => {
       barcode: "0000123456",
       itemName: "Composite Resin",
       category: "Restorative & Esthetic",
+      unitType: "Piece",
       initialStock: 10,
       lowStockThreshold: 4,
       ...overrides,
@@ -188,6 +189,7 @@ describe("InventoryService", () => {
       barcode: "0000123456",
       itemName: "Composite Resin",
       category: "Restorative & Esthetic",
+      unitType: "Piece",
       imagePath: FIRST_IMAGE,
       currentStock: 10,
       lowStockThreshold: 4,
@@ -196,8 +198,25 @@ describe("InventoryService", () => {
     expect(inventory.listProducts()).toEqual([created]);
 
     expect(
-      database.prepare("SELECT barcode, image_path FROM products").get(),
-    ).toEqual({ barcode: "0000123456", image_path: FIRST_IMAGE });
+      database.prepare("SELECT barcode, image_path, unit_type FROM products").get(),
+    ).toEqual({ barcode: "0000123456", image_path: FIRST_IMAGE, unit_type: "Piece" });
+  });
+
+  it("creates and edits a supported unit type without changing stock arithmetic", () => {
+    const original = createProduct({ unitType: "Bottle" });
+    const updated = inventory.updateProduct({
+      id: original.id,
+      itemName: original.itemName,
+      category: original.category,
+      unitType: "Pack",
+      currentStock: original.currentStock,
+      lowStockThreshold: original.lowStockThreshold,
+    });
+
+    expect(updated).toMatchObject({ unitType: "Pack", currentStock: 10, status: "HIGH" });
+    expect(database.prepare("SELECT unit_type FROM products WHERE id = ?").pluck().get(original.id))
+      .toBe("Pack");
+    expect(inventory.listMovementHistory()).toEqual([]);
   });
 
   it("allows an omitted optional reference image", () => {

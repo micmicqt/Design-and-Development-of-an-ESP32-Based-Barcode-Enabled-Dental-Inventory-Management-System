@@ -7,7 +7,8 @@ This repository currently provides:
 - a secure Electron + React + TypeScript desktop inventory application;
 - SQLite-backed product inventory, stock corrections, and movement history;
 - application-managed product images stored as files beside the database;
-- search, fixed-category filtering, derived stock status, safe editing, and soft deletion;
+- search, fixed-category filtering, fixed product unit types, derived stock status,
+  safe editing, and soft deletion;
 - SQLite migrations and one preconfigured-administrator credential slot;
 - shared, versioned TypeScript protocol types and JSON Schema validation;
 - a local-network ESP32 `HardwareGateway` with status, FIFO scan delivery, result feedback, and acknowledgement;
@@ -26,9 +27,11 @@ desktop-presence lease is unavailable, the ESP32 can instead apply one-unit
 RESTOCK/CHECKOUT operations against its last-known inventory snapshot and append
 them to a durable pending journal. Phase 7 applies each oldest record to current
 SQLite stock exactly once, acknowledges and retires it power-safely, then
-refreshes the kiosk from final authoritative inventory. Manual barcode entry
-remains available for item registration; physical scans use the hardware path
-selected when each transaction begins.
+refreshes the kiosk from final authoritative inventory. Item registration now
+supports a dedicated scan-first barcode capture flow with manual fallback. That
+authenticated capture path only returns exact barcode text (including leading
+zeroes); it cannot select RESTOCK/CHECKOUT, change stock, write movement history,
+or create an offline pending event.
 
 ## Repository layout
 

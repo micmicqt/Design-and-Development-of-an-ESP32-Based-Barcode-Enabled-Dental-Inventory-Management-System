@@ -73,6 +73,11 @@ export interface RtcSynchronizationGateway {
   synchronizeRtc(request: RtcSynchronizationRequest): Promise<RtcSynchronizationResult>
 }
 
+/** Isolated scanner capture for product registration; never carries a stock action. */
+export interface RegistrationBarcodeCaptureGateway {
+  captureRegistrationBarcode(): Promise<string>
+}
+
 /** Polling/acknowledgement boundary for Phase 4 hardware scan delivery. */
 export interface HardwareTransactionEventGateway extends HardwareStatusGateway {
   getNextTransactionEvent(): Promise<HardwareTransactionEvent | null>
@@ -135,7 +140,8 @@ export interface DesktopHardwareGateway
     OfflineInventoryCacheGateway,
     OfflinePendingEventGateway,
     OfflineEventAcknowledgementGateway,
-    RtcSynchronizationGateway {}
+    RtcSynchronizationGateway,
+    RegistrationBarcodeCaptureGateway {}
 
 export function isValidHardwareTransactionEventId(value: unknown): value is string {
   return (

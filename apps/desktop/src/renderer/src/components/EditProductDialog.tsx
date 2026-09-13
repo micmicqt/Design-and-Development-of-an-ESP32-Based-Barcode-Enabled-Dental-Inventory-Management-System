@@ -1,7 +1,9 @@
 import { useState, type FormEvent, type KeyboardEvent } from 'react'
 import {
   INVENTORY_CATEGORIES,
+  PRODUCT_UNIT_TYPES,
   type InventoryCategory,
+  type ProductUnitType,
   type ProductDto,
   type SelectedImageDto
 } from '../../../shared/ipc-contract'
@@ -35,6 +37,7 @@ export function EditProductDialog({
   const [form, setForm] = useState<ProductFormDraft>({
     itemName: product.itemName,
     category: product.category,
+    unitType: product.unitType,
     currentStock: String(product.currentStock),
     lowStockThreshold: String(product.lowStockThreshold)
   })
@@ -82,6 +85,7 @@ export function EditProductDialog({
         id: product.id,
         itemName: validation.value.itemName,
         category: validation.value.category,
+        unitType: validation.value.unitType,
         currentStock: validation.value.currentStock,
         lowStockThreshold: validation.value.lowStockThreshold,
         ...(replacementImage !== null
@@ -246,6 +250,25 @@ export function EditProductDialog({
                   ))}
                 </select>
                 <FieldError id="edit-category-error" message={errors.category} />
+              </div>
+
+              <div className="form-field form-field--wide">
+                <label htmlFor="edit-unit-type">Unit Type</label>
+                <select
+                  id="edit-unit-type"
+                  value={form.unitType}
+                  onChange={(event) =>
+                    setField('unitType', event.target.value as ProductUnitType)
+                  }
+                  aria-invalid={Boolean(errors.unitType)}
+                  aria-describedby={errors.unitType ? 'edit-unit-type-error' : undefined}
+                  disabled={busy}
+                >
+                  {PRODUCT_UNIT_TYPES.map((unitType) => (
+                    <option key={unitType} value={unitType}>{unitType}</option>
+                  ))}
+                </select>
+                <FieldError id="edit-unit-type-error" message={errors.unitType} />
               </div>
 
               <div className="form-field">

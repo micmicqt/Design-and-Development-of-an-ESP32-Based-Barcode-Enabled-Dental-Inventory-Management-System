@@ -26,6 +26,7 @@ function product(overrides: Partial<ProductDto> = {}): ProductDto {
     barcode: '00012345',
     itemName: 'Composite Resin',
     category: 'Restorative & Esthetic',
+    unitType: 'Piece',
     imageUrl: null,
     currentStock: 12,
     lowStockThreshold: 5,
@@ -130,6 +131,10 @@ function createDesktopApi({
         error: { code: 'INTERNAL_ERROR', message: 'Not configured for this test.' }
       }),
       retryTransactionAcknowledgement: vi.fn().mockResolvedValue({
+        ok: false,
+        error: { code: 'INTERNAL_ERROR', message: 'Not configured for this test.' }
+      }),
+      captureRegistrationBarcode: vi.fn().mockResolvedValue({
         ok: false,
         error: { code: 'INTERNAL_ERROR', message: 'Not configured for this test.' }
       }),
@@ -281,6 +286,8 @@ async function completeRequiredAddFields(
     threshold?: string
   } = {}
 ): Promise<void> {
+  const manualEntry = screen.queryByRole('button', { name: 'Enter Manually' })
+  if (manualEntry !== null) await user.click(manualEntry)
   await user.type(screen.getByLabelText('Barcode / SKU'), values.barcode ?? '00012345')
   await user.type(screen.getByLabelText('Item Name'), values.itemName ?? 'Composite Resin')
   await user.selectOptions(
@@ -1455,6 +1462,8 @@ describe('Phase 2 desktop application', () => {
     await user.tab()
     expect(password).toHaveFocus()
     await user.tab()
+    expect(screen.getByRole('button', { name: 'Show password' })).toHaveFocus()
+    await user.tab()
     expect(signIn).toHaveFocus()
 
     await user.type(username, 'admin')
@@ -1462,6 +1471,18 @@ describe('Phase 2 desktop application', () => {
     await user.click(signIn)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Access Denied')
+  })
+
+  it('keeps the password masked by default and supports accessible reveal and hide controls', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    const password = await screen.findByLabelText('Password')
+    expect(password).toHaveAttribute('type', 'password')
+    await user.click(screen.getByRole('button', { name: 'Show password' }))
+    expect(password).toHaveAttribute('type', 'text')
+    await user.click(screen.getByRole('button', { name: 'Hide password' }))
+    expect(password).toHaveAttribute('type', 'password')
   })
 
   it('opens the shell, changes sections, and logs out', async () => {
@@ -2090,7 +2111,7 @@ describe('Phase 2 desktop application', () => {
 
     render(<App />)
     await openAddItem(user)
-    expect(screen.getByText('Manual barcode entry')).toBeVisible()
+    expect(screen.getByText('Barcode registration')).toBeVisible()
     expect(screen.queryByText('Development entry only')).not.toBeInTheDocument()
     expect(screen.queryByText(/Hardware scanner integration/i)).not.toBeInTheDocument()
 
@@ -2149,10 +2170,65 @@ describe('Phase 2 desktop application', () => {
       barcode: '00012345',
       itemName: 'Composite Resin',
       category: 'Restorative & Esthetic',
+      unitType: 'Piece',
       initialStock: 12,
       lowStockThreshold: 5,
       imageSelectionToken: 'opaque-selection-token'
     })
+  })
+
+  it('captures an exact leading-zero barcode without invoking transaction APIs', async () => {
+    const user = userEvent.setup()
+    const captureRegistrationBarcode = vi.fn().mockResolvedValue({
+      ok: true,
+      value: { barcode: '000012340056' }
+    })
+    const findProductByBarcode = vi.fn().mockResolvedValue({ ok: true, value: null })
+    const processTransaction = vi.fn()
+    const acknowledgeTransactionEvent = vi.fn()
+    installDesktopApi(createDesktopApi({
+      inventory: { findProductByBarcode },
+      hardware: {
+        captureRegistrationBarcode,
+        processTransaction,
+        acknowledgeTransactionEvent
+      }
+    }))
+
+    render(<App />)
+    await openAddItem(user)
+    await user.click(screen.getByRole('button', { name: 'Start barcode scan' }))
+
+    expect(await screen.findByDisplayValue('000012340056')).toBeVisible()
+    expect(screen.getByText('Captured barcode: 000012340056')).toBeVisible()
+    expect(findProductByBarcode).toHaveBeenCalledWith('000012340056')
+    expect(processTransaction).not.toHaveBeenCalled()
+    expect(acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  })
+
+  it('flags an already registered scanned barcode and still permits manual fallback', async () => {
+    const user = userEvent.setup()
+    const captureRegistrationBarcode = vi.fn().mockResolvedValue({
+      ok: true,
+      value: { barcode: '00012345' }
+    })
+    installDesktopApi(createDesktopApi({
+      inventory: {
+        findProductByBarcode: vi.fn().mockResolvedValue({ ok: true, value: product() })
+      },
+      hardware: { captureRegistrationBarcode }
+    }))
+
+    render(<App />)
+    await openAddItem(user)
+    await user.click(screen.getByRole('button', { name: 'Start barcode scan' }))
+    expect(await screen.findByText('This barcode is already registered.')).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Enter Manually' }))
+    const barcode = screen.getByLabelText('Barcode / SKU')
+    await user.clear(barcode)
+    await user.type(barcode, '009900')
+    expect(barcode).toHaveValue('009900')
   })
 
   it('accepts a supported dropped image, shows drag feedback, and can remove it before saving', async () => {
@@ -2279,6 +2355,7 @@ describe('Phase 2 desktop application', () => {
       const updated = product({
         itemName: input.itemName,
         category: input.category,
+        unitType: input.unitType,
         currentStock: input.currentStock,
         lowStockThreshold: input.lowStockThreshold,
         status: 'HIGH'
@@ -2305,6 +2382,7 @@ describe('Phase 2 desktop application', () => {
     await user.clear(name)
     await user.type(name, 'Composite Resin Plus')
     await user.selectOptions(screen.getByLabelText('Category'), 'General')
+    await user.selectOptions(screen.getByLabelText('Unit Type'), 'Pack')
     const stock = screen.getByLabelText('Current Stock — administrative correction')
     await user.clear(stock)
     await user.type(stock, '8')
@@ -2315,6 +2393,7 @@ describe('Phase 2 desktop application', () => {
       id: 1,
       itemName: 'Composite Resin Plus',
       category: 'General',
+      unitType: 'Pack',
       currentStock: 8,
       lowStockThreshold: 5
     })
@@ -2362,6 +2441,7 @@ describe('Phase 2 desktop application', () => {
       id: 1,
       itemName: 'Composite Resin',
       category: 'Restorative & Esthetic',
+      unitType: 'Piece',
       currentStock: 12,
       lowStockThreshold: 5,
       removeImage: true
@@ -2402,6 +2482,7 @@ describe('Phase 2 desktop application', () => {
       id: 1,
       itemName: 'Composite Resin',
       category: 'Restorative & Esthetic',
+      unitType: 'Piece',
       currentStock: 12,
       lowStockThreshold: 5,
       replacementImageSelectionToken: 'replacement-token'

@@ -139,6 +139,7 @@ export function InventoryPage({
                 <th scope="col">Image</th>
                 <th scope="col">Item Name</th>
                 <th scope="col">Category</th>
+                <th scope="col">Unit Type</th>
                 <th scope="col">Stock</th>
                 <th scope="col">Status</th>
                 <th scope="col">Edit</th>
@@ -155,6 +156,7 @@ export function InventoryPage({
                     <small className="item-barcode">SKU {product.barcode}</small>
                   </td>
                   <td>{product.category}</td>
+                  <td><span className="unit-type-value">{product.unitType}</span></td>
                   <td>
                     <strong className="stock-value">{product.currentStock}</strong>
                   </td>

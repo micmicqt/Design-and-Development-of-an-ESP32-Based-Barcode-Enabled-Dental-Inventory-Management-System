@@ -27,6 +27,8 @@ import {
 } from '../../shared/ipc-contract'
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_500
+const REGISTRATION_CAPTURE_TIMEOUT_MS = 13_000
+const REGISTRATION_CAPTURE_POLL_INTERVAL_MS = 125
 // Offline acknowledgement advances a CRC-protected MicroSD journal at the
 // kiosk's conservative 1 MHz SPI speed. It is intentionally allowed longer
 // than lightweight status/event reads, while remaining bounded.
@@ -72,6 +74,8 @@ const OFFLINE_ACKNOWLEDGEMENT_KEYS = [
 const RESULT_ACCEPTANCE_KEYS = ['accepted', 'eventId'] as const
 const DESKTOP_HEARTBEAT_KEYS = ['desktopOnline'] as const
 const RTC_SYNC_RESPONSE_KEYS = ['synchronized', 'rtcState', 'alreadyReady'] as const
+const BARCODE_CAPTURE_START_KEYS = ['started'] as const
+const BARCODE_CAPTURE_RESULT_KEYS = ['captured', 'barcode'] as const
 const CACHE_RESPONSE_KEYS = [
   'accepted',
   'operation',
@@ -125,6 +129,10 @@ export type HardwareGatewayDiagnosticCode =
   | 'invalid_timestamp'
   | 'rtc_unavailable'
   | 'verification_failed'
+  | 'scanner_busy'
+  | 'scanner_acknowledgement_timeout'
+  | 'barcode_timeout'
+  | 'invalid_barcode'
 
 export class HardwareGatewayError extends Error {
   readonly code: HardwareGatewayErrorCode
@@ -177,7 +185,11 @@ const SAFE_FIRMWARE_DIAGNOSTIC_CODES = new Set<HardwareGatewayDiagnosticCode>([
   'authentication_unconfigured',
   'invalid_timestamp',
   'rtc_unavailable',
-  'verification_failed'
+  'verification_failed',
+  'scanner_busy',
+  'scanner_acknowledgement_timeout',
+  'barcode_timeout',
+  'invalid_barcode'
 ])
 
 async function readSafeFirmwareDiagnostic(
@@ -208,6 +220,30 @@ function isValidBarcode(value: unknown): value is string {
     /^[\x20-\x7E]+$/.test(value) &&
     !value.includes(',')
   )
+}
+
+function validateBarcodeCaptureStart(value: unknown): void {
+  if (!isRecord(value) || !hasExactlyKeys(value, BARCODE_CAPTURE_START_KEYS) || value.started !== true) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The ESP32 barcode capture response is invalid.'
+    )
+  }
+}
+
+function validateBarcodeCaptureResult(value: unknown): string {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, BARCODE_CAPTURE_RESULT_KEYS) ||
+    value.captured !== true ||
+    !isValidBarcode(value.barcode)
+  ) {
+    throw new HardwareGatewayError(
+      'INVALID_RESPONSE',
+      'The ESP32 barcode capture result is invalid.'
+    )
+  }
+  return value.barcode
 }
 
 function isValidOfflineEventId(value: unknown): value is string {
@@ -747,6 +783,36 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
     )
   }
 
+  async captureRegistrationBarcode(): Promise<string> {
+    if (this.deviceToken === null) {
+      throw new HardwareGatewayError(
+        'UNAVAILABLE',
+        'The ESP32 device token is not configured.',
+        'DEVICE_TOKEN_UNCONFIGURED'
+      )
+    }
+
+    validateBarcodeCaptureStart(
+      await this.request('/barcode/capture', {
+        method: 'POST',
+        body: '{}',
+        deviceAuthenticated: true
+      })
+    )
+
+    const deadline = Date.now() + REGISTRATION_CAPTURE_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      const response = await this.request('/barcode/capture', {
+        allowNoContent: true,
+        deviceAuthenticated: true
+      })
+      if (response !== NO_CONTENT) return validateBarcodeCaptureResult(response)
+      await new Promise<void>((resolve) => setTimeout(resolve, REGISTRATION_CAPTURE_POLL_INTERVAL_MS))
+    }
+
+    throw new HardwareGatewayError('UNAVAILABLE', 'The barcode scan timed out.')
+  }
+
   async installOfflineInventoryCache(
     snapshot: OfflineInventoryCacheSnapshot
   ): Promise<OfflineInventoryCacheInstallResult> {
@@ -892,6 +958,7 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
       | '/status'
       | '/desktop/heartbeat'
       | '/rtc/sync'
+      | '/barcode/capture'
       | '/offline/cache'
       | '/offline/events/next'
       | '/offline/events/ack'
@@ -916,23 +983,20 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
     try {
       const response = await this.fetcher(`${this.baseUrl}${path}`, {
         method,
-        headers:
-          method === 'POST'
-            ? {
-                Accept: 'application/json',
-                'Content-Type': 'application/json',
-                ...(options.deviceAuthenticated === true && this.deviceToken !== null
-                  ? { [DEVICE_TOKEN_HEADER]: this.deviceToken }
-                  : {})
-              }
-            : { Accept: 'application/json' },
+        headers: {
+          Accept: 'application/json',
+          ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
+          ...(options.deviceAuthenticated === true && this.deviceToken !== null
+            ? { [DEVICE_TOKEN_HEADER]: this.deviceToken }
+            : {})
+        },
         signal: controller.signal,
         ...(options.body === undefined ? {} : { body: options.body })
       })
       if (options.allowNoContent === true && response.status === 204) return NO_CONTENT
       if (!response.ok) {
         const diagnosticCode =
-          path === '/offline/events/ack' || path === '/rtc/sync'
+          path === '/offline/events/ack' || path === '/rtc/sync' || path === '/barcode/capture'
             ? await readSafeFirmwareDiagnostic(response)
             : undefined
         if (method === 'POST' && response.status >= 400 && response.status < 500) {
@@ -940,13 +1004,15 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
             'REJECTED',
             path === '/rtc/sync'
               ? 'The ESP32 rejected the RTC synchronization request.'
-              : path === '/events/result'
-              ? 'The ESP32 rejected the transaction result.'
-              : path === '/offline/cache'
-                ? 'The ESP32 rejected the offline inventory cache.'
-                : path === '/offline/events/ack'
-                  ? 'The ESP32 rejected the offline event acknowledgement.'
-                : 'The ESP32 rejected the transaction acknowledgement.',
+              : path === '/barcode/capture'
+                ? 'The ESP32 rejected the barcode capture request.'
+                : path === '/events/result'
+                  ? 'The ESP32 rejected the transaction result.'
+                  : path === '/offline/cache'
+                    ? 'The ESP32 rejected the offline inventory cache.'
+                    : path === '/offline/events/ack'
+                      ? 'The ESP32 rejected the offline event acknowledgement.'
+                      : 'The ESP32 rejected the transaction acknowledgement.',
             diagnosticCode
           )
         }
@@ -985,6 +1051,12 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
         throw new HardwareGatewayError(
           'INVALID_RESPONSE',
           'The ESP32 returned an unexpected RTC synchronization status.'
+        )
+      }
+      if (path === '/barcode/capture' && response.status !== 200) {
+        throw new HardwareGatewayError(
+          'INVALID_RESPONSE',
+          'The ESP32 returned an unexpected barcode capture status.'
         )
       }
 

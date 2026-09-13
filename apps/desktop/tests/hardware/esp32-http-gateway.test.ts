@@ -380,6 +380,56 @@ describe('ESP32 HTTP hardware gateway', () => {
     expect(fetcher).not.toHaveBeenCalled()
   })
 
+  it('captures an exact registration barcode through only the authenticated capture route', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse({ started: true }))
+      .mockResolvedValueOnce(jsonResponse({ captured: true, barcode: '000012340056' }))
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://192.0.2.10',
+      deviceToken: 'a'.repeat(32),
+      fetcher
+    })
+
+    await expect(gateway.captureRegistrationBarcode()).resolves.toBe('000012340056')
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      'http://192.0.2.10/barcode/capture',
+      'http://192.0.2.10/barcode/capture'
+    ])
+    expect(fetcher.mock.calls[0]?.[1]).toMatchObject({
+      method: 'POST',
+      headers: expect.objectContaining({ 'X-Device-Token': 'a'.repeat(32) })
+    })
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({
+      method: 'GET',
+      headers: expect.objectContaining({ 'X-Device-Token': 'a'.repeat(32) })
+    })
+  })
+
+  it('rejects malformed registration capture data and never starts without a device token', async () => {
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse({ started: true }))
+      .mockResolvedValueOnce(jsonResponse({ captured: true, barcode: 12345 }))
+    const configuredGateway = new Esp32HttpGateway({
+      baseUrl: 'http://192.0.2.10',
+      deviceToken: 'b'.repeat(32),
+      fetcher
+    })
+    await expect(configuredGateway.captureRegistrationBarcode()).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE'
+    })
+
+    const unusedFetcher = vi.fn<HardwareFetch>()
+    const unconfiguredGateway = new Esp32HttpGateway({
+      baseUrl: 'http://192.0.2.10',
+      fetcher: unusedFetcher
+    })
+    await expect(unconfiguredGateway.captureRegistrationBarcode()).rejects.toMatchObject({
+      diagnosticCode: 'DEVICE_TOKEN_UNCONFIGURED'
+    })
+    expect(unusedFetcher).not.toHaveBeenCalled()
+  })
+
   it('preserves only an allow-listed RTC firmware failure category', async () => {
     const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
       jsonResponse({ synchronized: false, error: 'unauthorized', token: 'never-forward' }, 401)

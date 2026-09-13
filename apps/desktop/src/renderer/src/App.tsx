@@ -82,6 +82,7 @@ const sectionMetadata: Record<
 function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [passwordVisible, setPasswordVisible] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
@@ -96,14 +97,17 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
       const result = await window.desktopApi.auth.login({ username, password })
       if (!result.ok) {
         setPassword('')
+        setPasswordVisible(false)
         setError('Access Denied')
         return
       }
 
       setPassword('')
+      setPasswordVisible(false)
       onAuthenticated(result.session)
     } catch {
       setPassword('')
+      setPasswordVisible(false)
       setError('Access Denied')
     } finally {
       setSubmitting(false)
@@ -144,17 +148,30 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
             />
 
             <label htmlFor="password">Password</label>
-            <input
-              id="password"
-              name="password"
-              type="password"
-              autoComplete="current-password"
-              maxLength={1024}
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              disabled={submitting}
-              required
-            />
+            <div className="password-field">
+              <input
+                id="password"
+                name="password"
+                type={passwordVisible ? 'text' : 'password'}
+                autoComplete="current-password"
+                maxLength={1024}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                disabled={submitting}
+                required
+              />
+              <button
+                type="button"
+                className="password-visibility-button"
+                aria-label={passwordVisible ? 'Hide password' : 'Show password'}
+                title={passwordVisible ? 'Hide password' : 'Show password'}
+                aria-pressed={passwordVisible}
+                onClick={() => setPasswordVisible((current) => !current)}
+                disabled={submitting}
+              >
+                <span aria-hidden="true">{passwordVisible ? '◉' : '◎'}</span>
+              </button>
+            </div>
 
             {error !== null && (
               <div className="access-denied" role="alert">

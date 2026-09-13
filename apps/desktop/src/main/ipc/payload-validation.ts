@@ -1,8 +1,10 @@
 import {
   INVENTORY_CATEGORIES,
+  PRODUCT_UNIT_TYPES,
   type CreateProductInput,
   type DeleteProductInput,
   type InventoryCategory,
+  type ProductUnitType,
   type ProcessHardwareTransactionInput,
   type ProductListQuery,
   type UpdateProductInput
@@ -66,6 +68,20 @@ function categoryValue(
     return INVENTORY_CATEGORIES[0]
   }
   return value as InventoryCategory
+}
+
+function unitTypeValue(
+  value: unknown,
+  fieldErrors: Record<string, string>
+): ProductUnitType {
+  if (
+    typeof value !== 'string' ||
+    !(PRODUCT_UNIT_TYPES as readonly string[]).includes(value)
+  ) {
+    fieldErrors.unitType = 'Select one of the supported unit types.'
+    return PRODUCT_UNIT_TYPES[0]
+  }
+  return value as ProductUnitType
 }
 
 function nonNegativeSafeInteger(
@@ -206,6 +222,7 @@ export function validateCreateProductInput(value: unknown): CreateProductInput {
     fieldErrors
   )
   const category = categoryValue(candidate.category, fieldErrors)
+  const unitType = unitTypeValue(candidate.unitType, fieldErrors)
   const initialStock = nonNegativeSafeInteger(
     candidate.initialStock,
     'initialStock',
@@ -229,6 +246,7 @@ export function validateCreateProductInput(value: unknown): CreateProductInput {
     barcode,
     itemName,
     category,
+    unitType,
     initialStock,
     lowStockThreshold,
     imageSelectionToken: imageSelectionToken ?? null
@@ -247,6 +265,7 @@ export function validateUpdateProductInput(value: unknown): UpdateProductInput {
     fieldErrors
   )
   const category = categoryValue(candidate.category, fieldErrors)
+  const unitType = unitTypeValue(candidate.unitType, fieldErrors)
   const currentStock = nonNegativeSafeInteger(
     candidate.currentStock,
     'currentStock',
@@ -281,6 +300,7 @@ export function validateUpdateProductInput(value: unknown): UpdateProductInput {
     id,
     itemName,
     category,
+    unitType,
     currentStock,
     lowStockThreshold,
     ...(replacementImageSelectionToken === undefined ? {} : { replacementImageSelectionToken }),

@@ -6,7 +6,8 @@ import { createAuthSessionController } from '../../src/main/application/auth-ses
 import { initializeDatabase } from '../../src/main/database'
 import type {
   HardwareTransactionEventGateway,
-  OfflinePendingEventGateway
+  OfflinePendingEventGateway,
+  RegistrationBarcodeCaptureGateway
 } from '../../src/main/hardware/hardware-gateway'
 import {
   Esp32HttpGateway,
@@ -123,7 +124,9 @@ describe('authenticated hardware IPC boundary', () => {
   })
 
   function setup(
-    gateway: (HardwareTransactionEventGateway & OfflinePendingEventGateway) | null = createGateway(),
+    gateway: (HardwareTransactionEventGateway &
+      OfflinePendingEventGateway &
+      Partial<RegistrationBarcodeCaptureGateway>) | null = createGateway(),
     inventoryService: InventoryService = createInventoryService(),
     transactionCoordinator: HardwareTransactionCoordinator = createTransactionCoordinator(),
     offlineInventoryCacheCoordinator: OfflineInventoryCacheCoordinator | null = null,
@@ -162,6 +165,9 @@ describe('authenticated hardware IPC boundary', () => {
       IPC_CHANNELS.hardwareSynchronizeOfflineInventory
     )
     const next = electronMock.handlers.get(IPC_CHANNELS.hardwareGetNextTransactionEvent)
+    const captureBarcode = electronMock.handlers.get(
+      IPC_CHANNELS.hardwareCaptureRegistrationBarcode
+    )
     const acknowledge = electronMock.handlers.get(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)
     const getReceipt = electronMock.handlers.get(IPC_CHANNELS.hardwareGetTransactionReceipt)
     const process = electronMock.handlers.get(IPC_CHANNELS.hardwareProcessTransaction)
@@ -172,6 +178,7 @@ describe('authenticated hardware IPC boundary', () => {
       offlineNext === undefined ||
       reconcileOffline === undefined ||
       synchronizeOffline === undefined ||
+      captureBarcode === undefined ||
       next === undefined ||
       acknowledge === undefined ||
       getReceipt === undefined ||
@@ -189,6 +196,7 @@ describe('authenticated hardware IPC boundary', () => {
       offlineNext,
       reconcileOffline,
       synchronizeOffline,
+      captureBarcode,
       next,
       acknowledge,
       getReceipt,
@@ -204,7 +212,9 @@ describe('authenticated hardware IPC boundary', () => {
     }
   }
 
-  function createGateway(): HardwareTransactionEventGateway & OfflinePendingEventGateway {
+  function createGateway(): HardwareTransactionEventGateway &
+    OfflinePendingEventGateway &
+    RegistrationBarcodeCaptureGateway {
     return {
       healthCheck: vi.fn().mockResolvedValue({
         status: 'ok',
@@ -221,12 +231,31 @@ describe('authenticated hardware IPC boundary', () => {
         offlineReady: true
       }),
       sendDesktopHeartbeat: vi.fn().mockResolvedValue(undefined),
+      captureRegistrationBarcode: vi.fn().mockResolvedValue('000012340056'),
       getNextOfflineEvent: vi.fn().mockResolvedValue(offlinePendingEvent),
       getNextTransactionEvent: vi.fn().mockResolvedValue(hardwareEvent),
       deliverTransactionResult: vi.fn().mockResolvedValue(undefined),
       acknowledgeTransactionEvent: vi.fn().mockResolvedValue(undefined)
     }
   }
+
+  it('allows only an authenticated trusted renderer to request isolated barcode capture', async () => {
+    const gateway = createGateway()
+    const { authSession, trustedEvent, captureBarcode } = setup(gateway)
+
+    await expect(captureBarcode(trustedEvent)).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'UNAUTHORIZED' }
+    })
+    authSession.signIn('admin')
+    await expect(captureBarcode(trustedEvent)).resolves.toEqual({
+      ok: true,
+      value: { barcode: '000012340056' }
+    })
+    expect(gateway.captureRegistrationBarcode).toHaveBeenCalledOnce()
+    expect(gateway.deliverTransactionResult).not.toHaveBeenCalled()
+    expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  })
 
   function createInventoryService(): InventoryService {
     return {
@@ -1693,6 +1722,9 @@ describe('authenticated hardware IPC boundary', () => {
     )
     expect(electronMock.removeHandler).toHaveBeenCalledWith(
       IPC_CHANNELS.hardwareSynchronizeOfflineInventory
+    )
+    expect(electronMock.removeHandler).toHaveBeenCalledWith(
+      IPC_CHANNELS.hardwareCaptureRegistrationBarcode
     )
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareGetNextTransactionEvent)
     expect(electronMock.removeHandler).toHaveBeenCalledWith(IPC_CHANNELS.hardwareAcknowledgeTransactionEvent)

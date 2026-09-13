@@ -9,6 +9,20 @@ export const INVENTORY_CATEGORIES = [
 
 export type InventoryCategory = (typeof INVENTORY_CATEGORIES)[number]
 
+export const PRODUCT_UNIT_TYPES = [
+  'Piece',
+  'Box',
+  'Pack',
+  'Set',
+  'Bottle',
+  'Vial',
+  'Cartridge',
+  'Gram',
+  'mL'
+] as const
+
+export type ProductUnitType = (typeof PRODUCT_UNIT_TYPES)[number]
+
 export const STOCK_STATUSES = ['HIGH', 'LOW', 'EMPTY'] as const
 
 export type StockStatus = (typeof STOCK_STATUSES)[number]
@@ -39,7 +53,8 @@ export const IPC_CHANNELS = {
   hardwareGetTransactionReceipt: 'hardware:get-transaction-receipt',
   hardwareProcessTransaction: 'hardware:process-transaction',
   hardwareRetryTransactionResultDelivery: 'hardware:retry-transaction-result-delivery',
-  hardwareRetryTransactionAcknowledgement: 'hardware:retry-transaction-acknowledgement'
+  hardwareRetryTransactionAcknowledgement: 'hardware:retry-transaction-acknowledgement',
+  hardwareCaptureRegistrationBarcode: 'hardware:capture-registration-barcode'
 } as const
 
 export type HardwareConnectionStatus = 'CONNECTED' | 'OFFLINE'
@@ -266,6 +281,7 @@ export interface ProductDto {
   barcode: string
   itemName: string
   category: InventoryCategory
+  unitType: ProductUnitType
   imageUrl: string | null
   currentStock: number
   lowStockThreshold: number
@@ -278,6 +294,7 @@ export interface CreateProductInput {
   barcode: string
   itemName: string
   category: InventoryCategory
+  unitType: ProductUnitType
   initialStock: number
   lowStockThreshold: number
   imageSelectionToken: string | null
@@ -287,6 +304,7 @@ export interface UpdateProductInput {
   id: number
   itemName: string
   category: InventoryCategory
+  unitType: ProductUnitType
   currentStock: number
   lowStockThreshold: number
   /** Omit (or pass null) to retain the current image. */
@@ -356,5 +374,7 @@ export interface DesktopApi {
     processTransaction: (input: ProcessHardwareTransactionInput) => Promise<IpcResult<HardwareTransactionOutcome>>
     retryTransactionResultDelivery: (eventId: string) => Promise<IpcResult<HardwareTransactionOutcome>>
     retryTransactionAcknowledgement: (eventId: string) => Promise<IpcResult<HardwareTransactionOutcome>>
+    /** Triggers one isolated scanner capture that cannot create a stock transaction. */
+    captureRegistrationBarcode: () => Promise<IpcResult<{ barcode: string }>>
   }
 }

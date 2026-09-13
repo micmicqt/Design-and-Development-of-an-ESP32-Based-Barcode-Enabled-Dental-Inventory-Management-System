@@ -74,6 +74,7 @@ describe('Phase 2 IPC payload validation', () => {
       barcode: ' 001234567890 ',
       itemName: 'Composite Resin',
       category: 'Restorative & Esthetic',
+      unitType: 'Piece',
       initialStock: 4,
       lowStockThreshold: 2,
       imageSelectionToken: null
@@ -84,6 +85,7 @@ describe('Phase 2 IPC payload validation', () => {
 
   it.each([
     [{ category: 'Custom category' }, 'category'],
+    [{ unitType: 'Case' }, 'unitType'],
     [{ initialStock: -1 }, 'initialStock'],
     [{ lowStockThreshold: -1 }, 'lowStockThreshold']
   ])('rejects invalid create input for %s', (override, expectedField) => {
@@ -92,6 +94,7 @@ describe('Phase 2 IPC payload validation', () => {
         barcode: '0001',
         itemName: 'Dental item',
         category: 'General',
+        unitType: 'Piece',
         initialStock: 0,
         lowStockThreshold: 0,
         imageSelectionToken: null,
@@ -104,6 +107,7 @@ describe('Phase 2 IPC payload validation', () => {
         barcode: '0001',
         itemName: 'Dental item',
         category: 'General',
+        unitType: 'Piece',
         initialStock: 0,
         lowStockThreshold: 0,
         imageSelectionToken: null,
@@ -120,6 +124,7 @@ describe('Phase 2 IPC payload validation', () => {
       id: 8,
       itemName: 'Etchant',
       category: 'General',
+      unitType: 'Piece',
       currentStock: 2,
       lowStockThreshold: 1,
       replacementImageSelectionToken: null
@@ -133,6 +138,7 @@ describe('Phase 2 IPC payload validation', () => {
       id: 8,
       itemName: 'Etchant',
       category: 'General',
+      unitType: 'Piece',
       currentStock: 2,
       lowStockThreshold: 1
     }

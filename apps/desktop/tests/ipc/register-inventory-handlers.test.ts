@@ -45,6 +45,7 @@ const PRODUCT: ProductRecord = {
   barcode: '00123',
   itemName: 'Dental item',
   category: 'General',
+  unitType: 'Piece',
   imagePath: '',
   currentStock: 2,
   lowStockThreshold: 1,
@@ -171,6 +172,7 @@ describe('authenticated inventory IPC boundary', () => {
           barcode: '00123',
           itemName: 'Dental item',
           category: 'General',
+          unitType: 'Piece',
           imageUrl: null,
           currentStock: 2,
           lowStockThreshold: 1,
@@ -337,6 +339,7 @@ describe('authenticated inventory IPC boundary', () => {
       id: 1,
       itemName: PRODUCT.itemName,
       category: PRODUCT.category,
+      unitType: PRODUCT.unitType,
       currentStock: PRODUCT.currentStock,
       lowStockThreshold: PRODUCT.lowStockThreshold,
       removeImage: true
@@ -370,6 +373,7 @@ describe('authenticated inventory IPC boundary', () => {
       id: 1,
       itemName: PRODUCT.itemName,
       category: PRODUCT.category,
+      unitType: PRODUCT.unitType,
       currentStock: PRODUCT.currentStock,
       lowStockThreshold: PRODUCT.lowStockThreshold,
       removeImage: true
@@ -389,6 +393,7 @@ describe('authenticated inventory IPC boundary', () => {
       barcode: '00123',
       itemName: 'Dental item',
       category: 'General',
+      unitType: 'Piece',
       initialStock: 0,
       lowStockThreshold: 0,
       imageSelectionToken: null
@@ -412,6 +417,7 @@ describe('authenticated inventory IPC boundary', () => {
       barcode: PRODUCT.barcode,
       itemName: PRODUCT.itemName,
       category: PRODUCT.category,
+      unitType: PRODUCT.unitType,
       initialStock: PRODUCT.currentStock,
       lowStockThreshold: PRODUCT.lowStockThreshold,
       imageSelectionToken: null,
@@ -428,6 +434,7 @@ describe('authenticated inventory IPC boundary', () => {
       id: PRODUCT.id,
       itemName: PRODUCT.itemName,
       category: PRODUCT.category,
+      unitType: PRODUCT.unitType,
       currentStock: PRODUCT.currentStock,
       lowStockThreshold: PRODUCT.lowStockThreshold
     })).resolves.toMatchObject({ ok: true, value: { id: PRODUCT.id } })
@@ -458,6 +465,7 @@ describe('authenticated inventory IPC boundary', () => {
       barcode: PRODUCT.barcode,
       itemName: PRODUCT.itemName,
       category: PRODUCT.category,
+      unitType: PRODUCT.unitType,
       initialStock: PRODUCT.currentStock,
       lowStockThreshold: PRODUCT.lowStockThreshold,
       imageSelectionToken: null
@@ -472,6 +480,7 @@ describe('authenticated inventory IPC boundary', () => {
       barcode: PRODUCT.barcode,
       itemName: PRODUCT.itemName,
       category: PRODUCT.category,
+      unitType: PRODUCT.unitType,
       initialStock: PRODUCT.currentStock,
       lowStockThreshold: PRODUCT.lowStockThreshold,
       imageSelectionToken: null
@@ -489,6 +498,7 @@ describe('authenticated inventory IPC boundary', () => {
       barcode: PRODUCT.barcode,
       itemName: PRODUCT.itemName,
       category: PRODUCT.category,
+      unitType: PRODUCT.unitType,
       initialStock: PRODUCT.currentStock,
       lowStockThreshold: PRODUCT.lowStockThreshold,
       imageSelectionToken: null

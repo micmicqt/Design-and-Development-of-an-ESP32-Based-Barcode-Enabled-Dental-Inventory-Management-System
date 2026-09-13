@@ -11,7 +11,9 @@ import type { SqliteDatabase } from "../database";
 import {
   deriveStockStatus,
   isInventoryCategory,
+  isProductUnitType,
   type InventoryCategory,
+  type ProductUnitType,
   type StockStatus,
 } from "../domain";
 
@@ -80,6 +82,7 @@ export interface CreateProductInput {
   barcode: string;
   itemName: string;
   category: string;
+  unitType?: string;
   initialStock: number;
   lowStockThreshold: number;
   managedImagePath?: string | null;
@@ -89,6 +92,7 @@ export interface UpdateProductInput {
   id: number;
   itemName: string;
   category: string;
+  unitType?: string;
   currentStock: number;
   lowStockThreshold: number;
   /** Undefined retains the existing image; null removes it. */
@@ -114,6 +118,7 @@ export interface ProductRecord {
   barcode: string;
   itemName: string;
   category: InventoryCategory;
+  unitType: ProductUnitType;
   imagePath: string;
   currentStock: number;
   lowStockThreshold: number;
@@ -145,6 +150,7 @@ interface ProductRow {
   barcode: string;
   item_name: string;
   category: InventoryCategory;
+  unit_type: ProductUnitType;
   image_path: string;
   current_stock: number;
   low_stock_threshold: number;
@@ -210,6 +216,7 @@ interface NormalizedCreateProductInput {
   barcode: string;
   itemName: string;
   category: InventoryCategory;
+  unitType: ProductUnitType;
   initialStock: number;
   lowStockThreshold: number;
   imagePath: string;
@@ -219,6 +226,7 @@ interface NormalizedUpdateProductInput {
   id: number;
   itemName: string;
   category: InventoryCategory;
+  unitType?: ProductUnitType;
   currentStock: number;
   lowStockThreshold: number;
   imagePath: string | null | undefined;
@@ -515,6 +523,13 @@ function normalizeCategory(value: unknown): InventoryCategory {
   return value;
 }
 
+function normalizeUnitType(value: unknown): ProductUnitType {
+  if (!isProductUnitType(value)) {
+    throw new InventoryValidationError("Select one of the supported unit types.");
+  }
+  return value;
+}
+
 function normalizeNonNegativeInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new InventoryValidationError(
@@ -584,6 +599,7 @@ function normalizeCreateInput(input: CreateProductInput): NormalizedCreateProduc
     barcode: normalizeRequiredText(input.barcode, "Barcode / SKU", MAX_BARCODE_LENGTH),
     itemName: normalizeRequiredText(input.itemName, "Item name", MAX_ITEM_NAME_LENGTH),
     category: normalizeCategory(input.category),
+    unitType: input.unitType === undefined ? "Piece" : normalizeUnitType(input.unitType),
     initialStock: normalizeNonNegativeInteger(input.initialStock, "Initial stock"),
     lowStockThreshold: normalizeNonNegativeInteger(
       input.lowStockThreshold,
@@ -599,6 +615,7 @@ function normalizeUpdateInput(input: UpdateProductInput): NormalizedUpdateProduc
     id: normalizeProductId(input.id),
     itemName: normalizeRequiredText(input.itemName, "Item name", MAX_ITEM_NAME_LENGTH),
     category: normalizeCategory(input.category),
+    unitType: input.unitType === undefined ? undefined : normalizeUnitType(input.unitType),
     currentStock: normalizeNonNegativeInteger(input.currentStock, "Current stock"),
     lowStockThreshold: normalizeNonNegativeInteger(
       input.lowStockThreshold,
@@ -614,6 +631,7 @@ function productFromRow(row: ProductRow): ProductRecord {
     barcode: row.barcode,
     itemName: row.item_name,
     category: row.category,
+    unitType: row.unit_type,
     imagePath: row.image_path,
     currentStock: row.current_stock,
     lowStockThreshold: row.low_stock_threshold,
@@ -736,6 +754,7 @@ export function createInventoryService(
     barcode,
     item_name,
     category,
+    unit_type,
     image_path,
     current_stock,
     low_stock_threshold,
@@ -770,16 +789,18 @@ export function createInventoryService(
       barcode,
       item_name,
       category,
+      unit_type,
       image_path,
       current_stock,
       low_stock_threshold
-    ) VALUES (?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
   const updateProductStatement = database.prepare(`
     UPDATE products
     SET
       item_name = ?,
       category = ?,
+      unit_type = ?,
       image_path = ?,
       current_stock = ?,
       low_stock_threshold = ?,
@@ -998,6 +1019,7 @@ export function createInventoryService(
       updateProductStatement.run(
         input.itemName,
         input.category,
+        input.unitType ?? previousProduct.unitType,
         imagePath,
         input.currentStock,
         input.lowStockThreshold,
@@ -1236,6 +1258,7 @@ export function createInventoryService(
           normalized.barcode,
           normalized.itemName,
           normalized.category,
+          normalized.unitType,
           normalized.imagePath,
           normalized.initialStock,
           normalized.lowStockThreshold,

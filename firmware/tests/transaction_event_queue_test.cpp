@@ -1,6 +1,7 @@
 #include "desktop_presence_lease.h"
 #include "offline_inventory_cache.h"
 #include "offline_pending_journal.h"
+#include "registration_barcode_capture.h"
 #include "rtc_recovery.h"
 #include "transaction_event_queue.h"
 
@@ -127,6 +128,51 @@ void barcodeTextPreserved() {
   assert(queue.enqueue(event));
   assert(strlen(queue.oldest()->barcode) == kMaximumBarcodeLength);
   assert(barcode == queue.oldest()->barcode);
+}
+
+void registrationCapturePreservesExactBarcodeWithoutCreatingAnEvent() {
+  dental::registration::BarcodeCapture capture;
+  PendingEventQueue transactionQueue;
+  assert(capture.start(100U));
+
+  const uint8_t acknowledgement[] = {0x02, 0x00, 0x00, 0x01,
+                                     0x00, 0x33, 0x31};
+  for (const uint8_t byte : acknowledgement) capture.receive(byte, 101U);
+  assert(capture.state() ==
+         dental::registration::CaptureState::kWaitingForBarcode);
+
+  const char barcode[] = "000012340056";
+  for (size_t index = 0U; index < strlen(barcode); ++index) {
+    capture.receive(static_cast<uint8_t>(barcode[index]), 102U);
+  }
+  capture.receive('\r', 103U);
+
+  assert(capture.state() == dental::registration::CaptureState::kComplete);
+  assert(strcmp(capture.barcode(), barcode) == 0);
+  assert(transactionQueue.size() == 0U);
+}
+
+void registrationCaptureIsBoundedAndTimesOutSafely() {
+  dental::registration::BarcodeCapture capture;
+  assert(capture.start(UINT32_MAX - 1000U));
+  capture.service(1001U);
+  assert(capture.state() == dental::registration::CaptureState::kFailed);
+  assert(capture.failure() ==
+         dental::registration::CaptureFailure::kAcknowledgementTimeout);
+
+  assert(capture.start(2000U));
+  const uint8_t acknowledgement[] = {0x02, 0x00, 0x00, 0x01,
+                                     0x00, 0x33, 0x31};
+  for (const uint8_t byte : acknowledgement) capture.receive(byte, 2001U);
+  capture.receive('\r', 2002U);
+  capture.receive('\n', 2002U);
+  assert(capture.state() ==
+         dental::registration::CaptureState::kWaitingForBarcode);
+  capture.receive(',', 2003U);
+  capture.service(2103U);
+  assert(capture.state() == dental::registration::CaptureState::kFailed);
+  assert(capture.failure() ==
+         dental::registration::CaptureFailure::kInvalidBarcode);
 }
 
 void eventIdentifiersPreserveUniquenessAndBounds() {
@@ -2385,6 +2431,8 @@ int main() {
   lostResponseRetryNeverConsumesNextHead();
   receiptsAreBoundedAndVolatile();
   barcodeTextPreserved();
+  registrationCapturePreservesExactBarcodeWithoutCreatingAnEvent();
+  registrationCaptureIsBoundedAndTimesOutSafely();
   eventIdentifiersPreserveUniquenessAndBounds();
   acknowledgementParser();
   transactionResultParserAcceptsValidPayloads();
@@ -2462,6 +2510,6 @@ int main() {
   rtcSyncRequestParserRejectsMalformedOrUnreasonableTime();
   rtcSynchronizationRequiresVerifiedWriteAndReread();
   rtcSynchronizationRequiresExactDeviceToken();
-  puts("Firmware event queue/protocol/presence/cache/offline journal/RTC: 86 host test scenarios PASSED");
+  puts("Firmware event queue/protocol/presence/cache/offline journal/RTC/registration capture: 88 host test scenarios PASSED");
   return 0;
 }
