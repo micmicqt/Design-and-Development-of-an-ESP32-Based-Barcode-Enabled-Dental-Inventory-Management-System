@@ -58,27 +58,27 @@ USART framing/parity/overrun errors quarantine the current frame. Partial frames
 expire with their attempt; responses outside a waiting state are ignored. This
 is a bring-up protocol, not authenticated or transaction-grade transport.
 
-### ESP32 mapping remains unconfirmed
+### Confirmed ESP32 mapping
 
-ESP32 uses **UART1**; scanner UART2 and debug UART0 remain unchanged. No updated
-ESP32 RX/TX GPIO mapping was supplied. `kAtmegaLinkRxGpio` and `kAtmegaLinkTxGpio`
-in `../firmware/include/hardware_config.h` default to `-1`: no link UART/GPIO is
-initialized. After the revised mapping/interface is confirmed, set BOTH macros
-`DENTAL_ATMEGA_LINK_RX_GPIO` and `DENTAL_ATMEGA_LINK_TX_GPIO` with PlatformIO build
-flags, preserving other flags. Compile-time checks reject incomplete, identical,
+ESP32 uses **UART1 RX GPIO34 / TX GPIO25**, enabled by default in Step 2.1;
+scanner UART2 GPIO16/17 and debug UART0 remain unchanged. GPIO34 is input-only
+and has no internal pull-up: the interface must maintain an idle-HIGH RX level.
+`DENTAL_ATMEGA_LINK_RX_GPIO` and `DENTAL_ATMEGA_LINK_TX_GPIO` can be overridden
+with PlatformIO build flags; setting BOTH to `-1` disables the link.
+Compile-time checks reject incomplete, identical,
 invalid or existing peripheral/flash pin assignments. Do not reuse GM65 GPIO16/17.
 
 Required direction through the confirmed voltage/interface path:
 
-- ESP32 confirmed TX → ATmega D0/PD0 RX.
-- ATmega D1/PD1 TX → **5V-to-3.3V conversion** → ESP32 confirmed RX.
+- ESP32 GPIO25 TX → interface path → ATmega D0/PD0 RX.
+- ATmega D1/PD1 TX → **5V-to-3.3V conversion** → ESP32 GPIO34 RX.
 - Common GND. Never connect ATmega's 5V TX directly to ESP32 RX.
 
 Uno D0/D1 are shared with its USB interface. Isolate the external link during
 Uno USB uploads, and verify that the interface prevents simultaneous USB/ESP32
 TX driving D0; voltage conversion alone does not solve driver contention.
-Physical enablement and testing remain pending mapping/interface confirmation.
-Step 2 performs no upload, fuse programming or external-target programming.
+Physical UART verification remains pending; Step 2.1 performs no upload,
+fuse programming or external-target programming.
 
 ESP32 processes at most 16 RX bytes per loop and checks TX capacity before
 writing. Only PING produces PONG. At most one five-byte reply is buffered; extra

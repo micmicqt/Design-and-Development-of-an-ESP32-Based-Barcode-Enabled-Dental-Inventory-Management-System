@@ -67,10 +67,16 @@ void exchange() {
   for (unsigned i = 0; i < response.size; ++i) c.receive(2001UL, response.bytes[i]);
   assert(c.verifiedCount() == 1U);
 }
-void safeDefaultPins() {
-  assert(!dental::hardware::kAtmegaLinkEnabled);
-  assert(dental::hardware::kAtmegaLinkRxGpio == -1);
-  assert(dental::hardware::kAtmegaLinkTxGpio == -1);
+void confirmedPins() {
+  assert(dental::hardware::kAtmegaLinkEnabled);
+  assert(dental::hardware::kAtmegaLinkRxGpio == 34);
+  assert(dental::hardware::kAtmegaLinkTxGpio == 25);
+  assert(dental::hardware::isControllerLinkGpio(34));
+  assert(dental::hardware::isControllerLinkGpio(25));
+  assert(!dental::hardware::isExistingPeripheralGpio(34));
+  assert(!dental::hardware::isExistingPeripheralGpio(25));
+  assert(dental::hardware::kScannerTestUartRxGpio == 16);
+  assert(dental::hardware::kScannerTestUartTxGpio == 17);
   assert(dental::hardware::isExistingPeripheralGpio(16));
   assert(dental::hardware::isExistingPeripheralGpio(17));
   assert(dental::hardware::isExistingPeripheralGpio(21));
@@ -83,6 +89,6 @@ void safeDefaultPins() {
 }
 int main() {
   pingPong(); malformed(); oversized(); busyTx(); fragmentedAndRepeated();
-  noTransactionSideEffects(); exchange(); safeDefaultPins();
+  noTransactionSideEffects(); exchange(); confirmedPins();
   puts("ESP32 ATmega responder: 8 focused scenarios PASSED");
 }

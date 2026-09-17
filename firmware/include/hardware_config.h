@@ -55,14 +55,14 @@ static constexpr uint8_t kScannerTestUartTxGpio = 17;
 static constexpr uint8_t kRestockTestButtonGpio = 13;
 static constexpr uint8_t kCheckoutTestButtonGpio = 14;
 
-// Migration Step 2: UART1 link GPIOs are not established by the revised design.
-// Set BOTH through build flags only after confirming the voltage interface and
-// pin mapping. -1 disables the link; never invoke begin() with default pins.
+// Confirmed Step 2.1 UART1 mapping, through the voltage-level interface.
+// GPIO34 is RX-only; GPIO25 supports TX. GM65 retains UART2 GPIO16/17.
+// Build overrides must pass the conflict guard below; BOTH -1 disable the link.
 #ifndef DENTAL_ATMEGA_LINK_RX_GPIO
-#define DENTAL_ATMEGA_LINK_RX_GPIO -1
+#define DENTAL_ATMEGA_LINK_RX_GPIO 34
 #endif
 #ifndef DENTAL_ATMEGA_LINK_TX_GPIO
-#define DENTAL_ATMEGA_LINK_TX_GPIO -1
+#define DENTAL_ATMEGA_LINK_TX_GPIO 25
 #endif
 static constexpr int kAtmegaLinkRxGpio = DENTAL_ATMEGA_LINK_RX_GPIO;
 static constexpr int kAtmegaLinkTxGpio = DENTAL_ATMEGA_LINK_TX_GPIO;
