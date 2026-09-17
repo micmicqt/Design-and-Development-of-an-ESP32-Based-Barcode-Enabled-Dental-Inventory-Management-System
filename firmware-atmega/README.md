@@ -1,25 +1,29 @@
-# ATmega migration Step 1
+# ATmega migration: Uno main-controller foundation and UART link
 
 Separate primary-controller foundation. The working ESP32 project remains in
-`../firmware/` and is intentionally unchanged. No desktop changes are required.
+`../firmware/` and retains all existing functionality during migration. Step 2
+adds only a configurable UART responder. No desktop changes are required.
 
 ## Build and startup
 
 PlatformIO Atmel AVR 5.1.0, AVR-GCC/avr-libc, bare-metal C++11 (no Arduino runtime
-or third-party libraries). Target `ATmega328P`, explicitly `F_CPU = 16000000UL`.
+or third-party libraries). Target Arduino Uno R3's **onboard ATmega328P**,
+explicitly `F_CPU = 16000000UL`.
 The AVR runtime supplies reset/startup and calls `main()`. Startup drives only
-the four status pins OFF; all other GPIOs and peripherals are left unconfigured.
+the four status pins OFF. Step 2 additionally initializes USART0 and Timer0.
 The status APIs write both bits of each group together, preserving other bits.
-No dynamic allocation, periodic cycling, Serial, or ATmega/ESP32 transport exists.
+No dynamic allocation, periodic LED cycling or inventory functionality is added.
 
 ```powershell
-pio run --project-dir firmware-atmega --environment atmega328p
+pio run --project-dir firmware-atmega --environment uno
+# Only when a physical upload is explicitly requested:
+pio run --project-dir firmware-atmega --environment uno --target upload
 ```
 
 Setting `F_CPU` describes the expected clock to the compiler; it does **not**
-select the oscillator or program fuses. The standalone hardware requires its
-16 MHz external crystal circuit and separately verified fuse configuration.
-No bootloader is assumed. Do not run upload, fuse, or bootloader targets for Step 1.
+select the oscillator or program fuses. The Uno already runs at 16 MHz.
+The normal Uno USB/bootloader upload protocol is `arduino`, on COM10. No Arduino
+framework is linked, and no fuse/bootloader programming is required.
 
 ## Status pins and authoritative encoding
 
@@ -34,14 +38,53 @@ labels. Big 01 is reserved/unused and never emitted by the normal API. Invalid
 enum values fail to OFF. No HIGH/LOW/EMPTY or SUCCESS/error semantic assignments
 are introduced in this foundation step.
 
-## Future programmer (not used in this step)
+## Step 2: controller UART
 
-Arduino Uno R3 running ArduinoISP is the development programmer only. Conceptual
-connections: Uno D10 to target RESET; D11 to PB3/MOSI; D12 to PB4/MISO; D13 to
-PB5/SCK; 5V to target VCC; GND to common GND. The Uno is not the final controller.
-This is not a complete standalone-chip wiring checklist; power, AVCC, crystal,
-reset, decoupling, fuse settings, and ISP procedure must be verified at bring-up.
-No COM port or physical upload is configured/performed by this step.
+ATmega USART0: D0/PD0 RX, D1/PD1 TX, **9600 baud, 8N1**. Normal-speed divider
+103 yields approximately 9615 baud at 16 MHz. Timer0 CTC interrupt provides a
+1 kHz millisecond clock without PWM outputs or Arduino runtime. Main polls at
+most eight received bytes and attempts one nonblocking TX byte per iteration.
+
+ATmega initiates `PING\n` after two seconds and verifies only `PONG\n` while
+awaiting a response. It retries two seconds after completion/failure. Sending
+and response waiting each have a one-second timeout; neither can block forever.
+Internal outcome and counters record verification/timeout; the link does not
+depend on USB Serial Monitor or change either status LED group.
+
+Case-sensitive lines contain at most eight printable ASCII characters excluding
+terminators. Optional CRLF is accepted; empty lines are ignored. Binary, malformed
+or oversized frames are discarded through LF, with fixed nine-byte storage.
+USART framing/parity/overrun errors quarantine the current frame. Partial frames
+expire with their attempt; responses outside a waiting state are ignored. This
+is a bring-up protocol, not authenticated or transaction-grade transport.
+
+### ESP32 mapping remains unconfirmed
+
+ESP32 uses **UART1**; scanner UART2 and debug UART0 remain unchanged. No updated
+ESP32 RX/TX GPIO mapping was supplied. `kAtmegaLinkRxGpio` and `kAtmegaLinkTxGpio`
+in `../firmware/include/hardware_config.h` default to `-1`: no link UART/GPIO is
+initialized. After the revised mapping/interface is confirmed, set BOTH macros
+`DENTAL_ATMEGA_LINK_RX_GPIO` and `DENTAL_ATMEGA_LINK_TX_GPIO` with PlatformIO build
+flags, preserving other flags. Compile-time checks reject incomplete, identical,
+invalid or existing peripheral/flash pin assignments. Do not reuse GM65 GPIO16/17.
+
+Required direction through the confirmed voltage/interface path:
+
+- ESP32 confirmed TX → ATmega D0/PD0 RX.
+- ATmega D1/PD1 TX → **5V-to-3.3V conversion** → ESP32 confirmed RX.
+- Common GND. Never connect ATmega's 5V TX directly to ESP32 RX.
+
+Uno D0/D1 are shared with its USB interface. Isolate the external link during
+Uno USB uploads, and verify that the interface prevents simultaneous USB/ESP32
+TX driving D0; voltage conversion alone does not solve driver contention.
+Physical enablement and testing remain pending mapping/interface confirmation.
+Step 2 performs no upload, fuse programming or external-target programming.
+
+ESP32 processes at most 16 RX bytes per loop and checks TX capacity before
+writing. Only PING produces PONG. At most one five-byte reply is buffered; extra
+PINGs arriving while TX is busy are ignored rather than queued without bound.
+The responder has no inventory, FIFO, offline journal, RTC, MicroSD, HTTP or
+Electron callback. All existing ESP32 workflows continue to coexist unchanged.
 
 ## Focused host tests
 
@@ -53,6 +96,13 @@ Use an existing host C++ compiler, for example the workspace's ignored Zig setup
 ```powershell
 & .\.runtime\ziglang\ziglang\zig.exe c++ -std=c++11 -Ifirmware-atmega/include firmware-atmega/tests/status_encoding_test.cpp -o .runtime/firmware-tests/atmega_status_encoding_test.exe
 & .\.runtime\firmware-tests\atmega_status_encoding_test.exe
+& .\.runtime\ziglang\ziglang\zig.exe c++ -std=c++11 -Wall -Wextra -Werror -Ifirmware-atmega/include firmware-atmega/tests/ping_client_test.cpp -o .runtime/firmware-tests/atmega_ping_client_test.exe
+& .\.runtime\firmware-tests\atmega_ping_client_test.exe
+& .\.runtime\ziglang\ziglang\zig.exe c++ -std=c++11 -Wall -Wextra -Werror -Ifirmware/include firmware/tests/atmega_link_test.cpp -o .runtime/firmware-tests/esp32_atmega_link_test.exe
+& .\.runtime\firmware-tests\esp32_atmega_link_test.exe
 ```
 
-Generated `.pio/` and `.runtime/` files are already ignored by the root rules.
+Step 2 adds eight requester and eight responder/integration scenarios, including
+bounded parsing, UART error rejection, timeout/retry, timer wrap and a software
+end-to-end exchange. Host tests do not prove physical levels, task timing or Uno
+USB contention. Generated `.pio/`, `.vscode/` and `.runtime/` files remain ignored.

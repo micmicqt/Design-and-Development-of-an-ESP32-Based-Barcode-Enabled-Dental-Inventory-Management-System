@@ -12,6 +12,7 @@
 #include <esp_system.h>
 
 #include "desktop_presence_lease.h"
+#include "atmega_link.h"
 #include "hardware_config.h"
 #include "offline_inventory_cache.h"
 #include "offline_pending_journal.h"
@@ -142,6 +143,24 @@ LiquidCrystal_I2C lcd(dental::hardware::kLcdI2cAddress,
                       dental::hardware::kLcdRowCount);
 RTC_DS3231 rtc;
 HardwareSerial scannerSerial(2);
+HardwareSerial atmegaSerial(1);
+dental::controller_link::PingResponder atmegaResponder;
+struct AtmegaTransmitter {
+  bool tryWrite(uint8_t byte) {
+    if (atmegaSerial.availableForWrite() < 1) return false;
+    return atmegaSerial.write(byte) == 1U;
+  }
+} atmegaTransmitter;
+
+void serviceAtmegaLink() {
+  if (!dental::hardware::kAtmegaLinkEnabled) return;
+  for (uint8_t processed = 0U; processed < 16U && atmegaSerial.available();
+       ++processed) {
+    atmegaResponder.receive(static_cast<uint8_t>(atmegaSerial.read()),
+                            atmegaTransmitter);
+  }
+  atmegaResponder.service(atmegaTransmitter);
+}
 WebServer httpServer(kHttpServerPort);
 
 bool lcdAvailable = false;
@@ -2197,6 +2216,14 @@ void setup() {
   }
 
   initializeWiFi();
+  if (dental::hardware::kAtmegaLinkEnabled) {
+    atmegaSerial.begin(dental_link::kBaud, SERIAL_8N1,
+                      dental::hardware::kAtmegaLinkRxGpio,
+                      dental::hardware::kAtmegaLinkTxGpio);
+    Serial.println("ATmega link: UART1 ready / 9600 8N1");
+  } else {
+    Serial.println("ATmega link: DISABLED - confirm ESP32 RX/TX GPIO mapping");
+  }
 }
 
 void loop() {
@@ -2207,5 +2234,6 @@ void loop() {
   serviceScanner(millis());
   serviceWorkflowTimeouts(millis());
   serviceWiFi(millis());
+  serviceAtmegaLink();
   delay(1UL);
 }

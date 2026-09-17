@@ -55,6 +55,43 @@ static constexpr uint8_t kScannerTestUartTxGpio = 17;
 static constexpr uint8_t kRestockTestButtonGpio = 13;
 static constexpr uint8_t kCheckoutTestButtonGpio = 14;
 
+// Migration Step 2: UART1 link GPIOs are not established by the revised design.
+// Set BOTH through build flags only after confirming the voltage interface and
+// pin mapping. -1 disables the link; never invoke begin() with default pins.
+#ifndef DENTAL_ATMEGA_LINK_RX_GPIO
+#define DENTAL_ATMEGA_LINK_RX_GPIO -1
+#endif
+#ifndef DENTAL_ATMEGA_LINK_TX_GPIO
+#define DENTAL_ATMEGA_LINK_TX_GPIO -1
+#endif
+static constexpr int kAtmegaLinkRxGpio = DENTAL_ATMEGA_LINK_RX_GPIO;
+static constexpr int kAtmegaLinkTxGpio = DENTAL_ATMEGA_LINK_TX_GPIO;
+static constexpr bool kAtmegaLinkEnabled = kAtmegaLinkRxGpio >= 0 &&
+                                         kAtmegaLinkTxGpio >= 0;
+constexpr bool isControllerLinkGpio(int pin) {
+  return (pin >= 0 && pin <= 19) || (pin >= 21 && pin <= 23) ||
+      (pin >= 25 && pin <= 27) || (pin >= 32 && pin <= 36) || pin == 39;
+}
+constexpr bool isExistingPeripheralGpio(int pin) {
+  return pin == 0 || pin == 1 || pin == 3 || (pin >= 6 && pin <= 11) ||
+      pin == 12 || pin == kRestockTestButtonGpio ||
+      pin == kCheckoutTestButtonGpio || pin == kScannerTestUartRxGpio ||
+      pin == kScannerTestUartTxGpio || pin == kI2cSdaGpio ||
+      pin == kI2cSclGpio || pin == kMicroSdChipSelectGpio ||
+      pin == kMicroSdClockGpio || pin == kMicroSdMosiGpio ||
+      pin == kMicroSdMisoGpio || pin == kTwoIndicatorControlAGpio ||
+      pin == kTwoIndicatorControlBGpio || pin == kThreeIndicatorControlAGpio ||
+      pin == kThreeIndicatorControlBGpio;
+}
+static_assert((kAtmegaLinkRxGpio == -1 && kAtmegaLinkTxGpio == -1) ||
+              (kAtmegaLinkEnabled && isControllerLinkGpio(kAtmegaLinkRxGpio) &&
+               isControllerLinkGpio(kAtmegaLinkTxGpio) &&
+               kAtmegaLinkTxGpio <= 33 &&
+               kAtmegaLinkRxGpio != kAtmegaLinkTxGpio &&
+               !isExistingPeripheralGpio(kAtmegaLinkRxGpio) &&
+               !isExistingPeripheralGpio(kAtmegaLinkTxGpio)),
+              "Confirm two distinct usable controller-link pins, not existing nets");
+
 // This hard compile-time gate prevents Phase 1 from being mistaken for an
 // electrically approved hardware build.
 static constexpr bool kPhase1HardwareActivationEnabled = false;
