@@ -747,6 +747,10 @@ void handleStartBarcodeCaptureRequest() {
     sendBarcodeCaptureError(401, "unauthorized");
     return;
   }
+  if (!dental::hardware::kScannerUartEnabled) {
+    sendBarcodeCaptureError(503, "scanner_unavailable");
+    return;
+  }
   if (workflowState != WorkflowState::kIdle ||
       registrationBarcodeCapture.active()) {
     sendBarcodeCaptureError(409, "scanner_busy");
@@ -1400,6 +1404,7 @@ void resetScannerWorkflowBuffers() {
 }
 
 void drainScannerInput() {
+  if (!dental::hardware::kScannerUartEnabled) return;
   while (scannerSerial.available() > 0) {
     scannerSerial.read();
   }
@@ -1828,6 +1833,7 @@ void processAcknowledgementByte(uint8_t receivedByte, uint32_t nowMs) {
 }
 
 void serviceScanner(uint32_t nowMs) {
+  if (!dental::hardware::kScannerUartEnabled) return;
   if (registrationBarcodeCapture.active()) {
     while (scannerSerial.available() > 0 &&
            registrationBarcodeCapture.active()) {
@@ -1878,6 +1884,11 @@ void beginTransactionWorkflow(const TransactionProfile& transaction) {
   }
   Serial.print(activeTransaction->action);
   Serial.println(" button pressed");
+  if (!dental::hardware::kScannerUartEnabled) {
+    beginErrorFeedback("GM65 unavailable: scanner migration pending",
+                       "Scanner unavailable");
+    return;
+  }
   Serial.print("Transaction route captured: ");
   Serial.println(activeTransactionRoute ==
                          dental::offline::TransactionRoute::kOnline
@@ -2188,12 +2199,11 @@ void setup() {
     }
   }
 
-  scannerSerial.begin(kScannerBaud, SERIAL_8N1,
-                      dental::hardware::kScannerTestUartRxGpio,
-                      dental::hardware::kScannerTestUartTxGpio);
+  // No scanner UART initialization: GPIO16/17 belong exclusively to UART1.
+  // TODO: migrate GM65 to ATmega in a later verified step.
   barcodeBuffer.reserve(kMaximumBarcodeLength);
   Serial.println(
-      "GM65 initialization: READY - UART2 RX GPIO16 / TX GPIO17 / 9600 8N1");
+      "GM65 initialization: DISABLED - scanner migration pending");
 
   if (!lcdAvailable) {
     beginErrorFeedback("Initialization failed: LCD unavailable",

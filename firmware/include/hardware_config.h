@@ -44,25 +44,23 @@ static constexpr uint8_t kThreeIndicatorControlBGpio = 27;
 static constexpr uint8_t kScannerSchematicU0TxdNetGpio = 1;
 static constexpr uint8_t kScannerSchematicU0RxdNetGpio = 3;
 
-// Temporary Phase 3 breadboard mapping for the GM65 hardware test. This keeps
-// the scanner off UART0 so GPIO1/GPIO3 remain available for USB flashing and
-// debug Serial. It does not replace the final PCB schematic mapping above.
-static constexpr uint8_t kScannerTestUartRxGpio = 16;
-static constexpr uint8_t kScannerTestUartTxGpio = 17;
+// GM65 migration pending: no ESP32 scanner UART/GPIO assignment is active.
+// Legacy GPIO16/17 ownership is removed; these belong to the ATmega link only.
+static constexpr bool kScannerUartEnabled = false;
 
 // Verified Phase 3 breadboard transaction-button assignments. These diagnostic
 // mappings remain separate from the unresolved final-PCB switch-net semantics.
 static constexpr uint8_t kRestockTestButtonGpio = 13;
 static constexpr uint8_t kCheckoutTestButtonGpio = 14;
 
-// Confirmed Step 2.1 UART1 mapping, through the voltage-level interface.
-// GPIO34 is RX-only; GPIO25 supports TX. GM65 retains UART2 GPIO16/17.
+// FINAL UART1 ownership: RX GPIO16 / TX GPIO17, through the level interface.
+// GPIO34/25 are no longer used for this link; GM65 migration is pending.
 // Build overrides must pass the conflict guard below; BOTH -1 disable the link.
 #ifndef DENTAL_ATMEGA_LINK_RX_GPIO
-#define DENTAL_ATMEGA_LINK_RX_GPIO 34
+#define DENTAL_ATMEGA_LINK_RX_GPIO 16
 #endif
 #ifndef DENTAL_ATMEGA_LINK_TX_GPIO
-#define DENTAL_ATMEGA_LINK_TX_GPIO 25
+#define DENTAL_ATMEGA_LINK_TX_GPIO 17
 #endif
 static constexpr int kAtmegaLinkRxGpio = DENTAL_ATMEGA_LINK_RX_GPIO;
 static constexpr int kAtmegaLinkTxGpio = DENTAL_ATMEGA_LINK_TX_GPIO;
@@ -75,8 +73,7 @@ constexpr bool isControllerLinkGpio(int pin) {
 constexpr bool isExistingPeripheralGpio(int pin) {
   return pin == 0 || pin == 1 || pin == 3 || (pin >= 6 && pin <= 11) ||
       pin == 12 || pin == kRestockTestButtonGpio ||
-      pin == kCheckoutTestButtonGpio || pin == kScannerTestUartRxGpio ||
-      pin == kScannerTestUartTxGpio || pin == kI2cSdaGpio ||
+      pin == kCheckoutTestButtonGpio || pin == kI2cSdaGpio ||
       pin == kI2cSclGpio || pin == kMicroSdChipSelectGpio ||
       pin == kMicroSdClockGpio || pin == kMicroSdMosiGpio ||
       pin == kMicroSdMisoGpio || pin == kTwoIndicatorControlAGpio ||

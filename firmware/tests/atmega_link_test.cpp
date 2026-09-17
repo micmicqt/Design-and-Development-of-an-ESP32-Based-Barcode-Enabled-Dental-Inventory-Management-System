@@ -69,16 +69,13 @@ void exchange() {
 }
 void confirmedPins() {
   assert(dental::hardware::kAtmegaLinkEnabled);
-  assert(dental::hardware::kAtmegaLinkRxGpio == 34);
-  assert(dental::hardware::kAtmegaLinkTxGpio == 25);
-  assert(dental::hardware::isControllerLinkGpio(34));
-  assert(dental::hardware::isControllerLinkGpio(25));
-  assert(!dental::hardware::isExistingPeripheralGpio(34));
-  assert(!dental::hardware::isExistingPeripheralGpio(25));
-  assert(dental::hardware::kScannerTestUartRxGpio == 16);
-  assert(dental::hardware::kScannerTestUartTxGpio == 17);
-  assert(dental::hardware::isExistingPeripheralGpio(16));
-  assert(dental::hardware::isExistingPeripheralGpio(17));
+  assert(dental::hardware::kAtmegaLinkRxGpio == 16);
+  assert(dental::hardware::kAtmegaLinkTxGpio == 17);
+  assert(dental::hardware::isControllerLinkGpio(16));
+  assert(dental::hardware::isControllerLinkGpio(17));
+  assert(!dental::hardware::isExistingPeripheralGpio(16));
+  assert(!dental::hardware::isExistingPeripheralGpio(17));
+  assert(!dental::hardware::kScannerUartEnabled);
   assert(dental::hardware::isExistingPeripheralGpio(21));
   assert(dental::hardware::isExistingPeripheralGpio(22));
   assert(!dental::hardware::isControllerLinkGpio(20));
