@@ -10,7 +10,9 @@ constexpr char kPing[] = "PING\n";
 constexpr char kPong[] = "PONG\n";
 constexpr uint8_t kMaximumBarcodeLength = 64U;
 constexpr char kScanPrefix[] = "SCAN:";
-constexpr uint8_t kMaximumLineLength = 5U + kMaximumBarcodeLength;
+constexpr char kRestockPrefix[] = "RESTOCK:";
+constexpr char kCheckoutPrefix[] = "CHECKOUT:";
+constexpr uint8_t kMaximumLineLength = 9U + kMaximumBarcodeLength;
 
 inline bool validBarcode(const char* text, uint8_t length) {
   if (length == 0U || length > kMaximumBarcodeLength) return false;
@@ -23,7 +25,13 @@ inline bool validBarcode(const char* text, uint8_t length) {
   return visible;
 }
 
-enum class Frame : uint8_t { kNone, kPing, kPong, kScan, kRejected };
+enum class Frame : uint8_t { kNone, kPing, kPong, kScan, kRestock, kCheckout, kRejected };
+
+inline const char* barcodePrefix(Frame frame) {
+  return frame == Frame::kScan ? kScanPrefix :
+      frame == Frame::kRestock ? kRestockPrefix :
+      frame == Frame::kCheckout ? kCheckoutPrefix : nullptr;
+}
 
 // Fixed storage; a bad/oversized frame is discarded through its next LF.
 class LineParser {
@@ -31,7 +39,7 @@ class LineParser {
   void reset() { length_ = 0U; rejected_ = false; carriageReturn_ = false; }
   void rejectUntilNewline() { rejected_ = true; }
   // Read immediately after kScan; next receive may overwrite this storage.
-  const char* barcode() const { return buffer_ + 5U; }
+  const char* barcode() const { return buffer_ + barcodeOffset_; }
 
   Frame receive(uint8_t byte) {
     if (byte == '\n') {
@@ -41,8 +49,9 @@ class LineParser {
         if (length_ == 0U) frame = Frame::kNone;
         else if (strcmp(buffer_, "PING") == 0) frame = Frame::kPing;
         else if (strcmp(buffer_, "PONG") == 0) frame = Frame::kPong;
-        else if (length_ > 5U && memcmp(buffer_, kScanPrefix, 5U) == 0 &&
-                 validBarcode(buffer_ + 5U, length_ - 5U)) frame = Frame::kScan;
+        else if (matchesBarcodePrefix(kScanPrefix, 5U)) frame = Frame::kScan;
+        else if (matchesBarcodePrefix(kRestockPrefix, 8U)) frame = Frame::kRestock;
+        else if (matchesBarcodePrefix(kCheckoutPrefix, 9U)) frame = Frame::kCheckout;
       }
       reset();
       return frame;
@@ -62,7 +71,14 @@ class LineParser {
   }
 
  private:
+  bool matchesBarcodePrefix(const char* prefix, uint8_t offset) {
+    if (length_ <= offset || memcmp(buffer_, prefix, offset) != 0 ||
+        !validBarcode(buffer_ + offset, length_ - offset)) return false;
+    barcodeOffset_ = offset;
+    return true;
+  }
   char buffer_[kMaximumLineLength + 1U] = {};
+  uint8_t barcodeOffset_ = 0U;
   uint8_t length_ = 0U;
   bool rejected_ = false;
   bool carriageReturn_ = false;

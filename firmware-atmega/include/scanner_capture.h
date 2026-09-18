@@ -31,6 +31,7 @@ class ScannerCapture {
     return ScanOutcome::kNone;
   }
   void receiveError() { rejected_ = true; }
+  void rejectPartialInput() { if (length_ || rejected_) rejected_ = true; }
   void service(uint32_t now) {
     if (length_ && static_cast<uint32_t>(now - lastByte_) >= kTimeoutMs)
       rejected_ = true;
@@ -47,10 +48,17 @@ class ScannerCapture {
 // while busy, not merged. No scan/PING byte interleaving is permitted.
 class ScannerTransport {
  public:
-  void receive(uint32_t now, uint8_t byte, bool error = false) {
-    if (error) { capture_.receiveError(); return; }
-    if (capture_.receive(now, byte) != ScanOutcome::kBarcode) return;
-    if (active_) { ++dropped_; return; }
+  ScanOutcome receive(uint32_t now, uint8_t byte, bool error = false,
+                      dental_link::Frame frame = dental_link::Frame::kScan) {
+    if (error) { capture_.receiveError(); return ScanOutcome::kRejected; }
+    const ScanOutcome outcome = capture_.receive(now, byte);
+    if (outcome != ScanOutcome::kBarcode) return outcome;
+    if (frame == dental_link::Frame::kNone) return ScanOutcome::kNone;
+    const char* prefix = dental_link::barcodePrefix(frame);
+    if (!prefix) return ScanOutcome::kRejected;
+    if (active_) { ++dropped_; return ScanOutcome::kRejected; }
+    frame_ = frame;
+    prefixLength_ = static_cast<uint8_t>(strlen(prefix));
     const size_t length = strlen(capture_.barcode());
     memcpy(barcode_, capture_.barcode(), length + 1U);
     length_ = static_cast<uint8_t>(length);
@@ -58,7 +66,9 @@ class ScannerTransport {
     active_ = true;
     started_ = false;
     recoveryMarkerSent_ = false;
+    return ScanOutcome::kBarcode;
   }
+  void rejectPartialScan() { capture_.rejectPartialInput(); }
   template <typename Transmitter>
   void service(uint32_t now, PingClient& ping, Transmitter& tx) {
     capture_.service(now);
@@ -75,11 +85,11 @@ class ScannerTransport {
       return;
     }
     // Leading LF resynchronizes after any earlier incomplete PING/frame.
-    const uint8_t byte = position_ == 0U ? '\n' : position_ <= 5U ?
-        static_cast<uint8_t>(dental_link::kScanPrefix[position_ - 1U]) :
-        position_ <= 5U + length_ ?
-        static_cast<uint8_t>(barcode_[position_ - 6U]) : '\n';
-    if (tx.tryWrite(byte) && ++position_ == length_ + 7U) active_ = false;
+    const uint8_t byte = position_ == 0U ? '\n' : position_ <= prefixLength_ ?
+        static_cast<uint8_t>(dental_link::barcodePrefix(frame_)[position_ - 1U]) :
+        position_ <= prefixLength_ + length_ ?
+        static_cast<uint8_t>(barcode_[position_ - prefixLength_ - 1U]) : '\n';
+    if (tx.tryWrite(byte) && ++position_ == length_ + prefixLength_ + 2U) active_ = false;
   }
   bool active() const { return active_; }
   uint16_t droppedCount() const { return dropped_; }
@@ -93,6 +103,8 @@ class ScannerTransport {
   bool active_ = false;
   bool started_ = false;
   bool recoveryMarkerSent_ = false;
+  uint8_t prefixLength_ = 5U;
+  dental_link::Frame frame_ = dental_link::Frame::kScan;
 };
 
 }  // namespace dental_atmega

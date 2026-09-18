@@ -35,8 +35,10 @@ void initialize() {
   UCSR0C = _BV(UCSZ01) | _BV(UCSZ00);  // 8N1.
   head = tail = 0U;
   overflow = false;
+  // Preserve TX capability for later scanner command support. Physical runtime
+  // interface is receive-only: GM65 TX -> D0; D1 -> scanner RX disconnected.
   UCSR0B = _BV(RXEN0) | _BV(TXEN0) | _BV(RXCIE0);
-  // No commands/triggers are transmitted during Step 3A.
+  // No commands/triggers are transmitted during current Step 3A/3B operation.
 }
 bool tryRead(uint8_t& byte, bool& error) {
   bool available = false;

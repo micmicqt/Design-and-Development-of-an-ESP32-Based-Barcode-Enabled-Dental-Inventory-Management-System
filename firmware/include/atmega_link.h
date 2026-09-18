@@ -10,6 +10,7 @@ class PingResponder {
  public:
   template <typename Transmitter>
   dental_link::Frame receive(uint8_t byte, Transmitter& transmitter) {
+    atBoundary_ = byte == '\n';
     const dental_link::Frame frame = parser_.receive(byte);
     if (frame == dental_link::Frame::kPing && remaining_ == 0U) {
       remaining_ = sizeof(dental_link::kPong) - 1U;
@@ -20,6 +21,9 @@ class PingResponder {
   }
 
   const char* barcode() const { return parser_.barcode(); }
+  void rejectPartialInput() {
+    if (!atBoundary_) parser_.rejectUntilNewline();
+  }
 
   template <typename Transmitter>
   void service(Transmitter& transmitter) {
@@ -35,6 +39,7 @@ class PingResponder {
   dental_link::LineParser parser_;
   uint8_t position_ = 0U;
   uint8_t remaining_ = 0U;
+  bool atBoundary_ = true;
 };
 
 }  // namespace controller_link

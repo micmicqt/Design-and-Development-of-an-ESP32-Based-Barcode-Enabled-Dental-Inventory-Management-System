@@ -13,6 +13,7 @@
 
 #include "desktop_presence_lease.h"
 #include "atmega_link.h"
+#include "forwarded_scan_routing.h"
 #include "hardware_config.h"
 #include "offline_inventory_cache.h"
 #include "offline_pending_journal.h"
@@ -25,12 +26,9 @@
 namespace {
 
 constexpr uint32_t kI2cClockHz = 100000UL;
-constexpr uint32_t kScannerBaud = 9600UL;
 constexpr uint32_t kMicroSdSpiFrequencyHz = 1000000UL;
 constexpr uint8_t kMicroSdMountAttempts = 3U;
 constexpr uint32_t kMicroSdRetryDelayMs = 250UL;
-constexpr uint32_t kButtonDebounceMs = 50UL;
-constexpr uint32_t kAcknowledgementTimeoutMs = 2000UL;
 constexpr uint32_t kBarcodeTimeoutMs = 10000UL;
 constexpr uint32_t kBarcodeIdleTimeoutMs = 100UL;
 constexpr uint32_t kIndicatorFeedbackMs = 1000UL;
@@ -68,7 +66,6 @@ const char* kCollectedHttpHeaders[] = {
     dental::protocol::kDeviceTokenHeader};
 
 struct TransactionProfile {
-  uint8_t buttonGpio;
   const char* action;
   const char* modeTitle;
   const char* savedTitle;
@@ -79,7 +76,6 @@ struct TransactionProfile {
 };
 
 constexpr TransactionProfile kRestockTransaction = {
-    dental::hardware::kRestockTestButtonGpio,
     "RESTOCK",
     "RESTOCK MODE",
     "RESTOCK SAVED",
@@ -90,7 +86,6 @@ constexpr TransactionProfile kRestockTransaction = {
 };
 
 constexpr TransactionProfile kCheckoutTransaction = {
-    dental::hardware::kCheckoutTestButtonGpio,
     "CHECKOUT",
     "CHECKOUT MODE",
     "CHECKOUT SAVED",
@@ -104,19 +99,9 @@ constexpr char kIntegrationTestPath[] = "/integration_test.csv";
 constexpr char kIntegrationTestHeader[] =
     "timestamp,barcode,action,quantity\n";
 
-constexpr uint8_t kGm65TriggerCommand[] = {
-    0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x01, 0xAB, 0xCD};
-constexpr uint8_t kGm65Acknowledgement[] = {
-    0x02, 0x00, 0x00, 0x01, 0x00, 0x33, 0x31};
-
-static_assert(sizeof(kGm65TriggerCommand) == 9U,
-              "The GM65 trigger command must contain exactly nine bytes.");
-static_assert(sizeof(kGm65Acknowledgement) == 7U,
-              "The GM65 acknowledgement must contain exactly seven bytes.");
 
 enum class WorkflowState : uint8_t {
   kIdle,
-  kWaitingForAcknowledgement,
   kWaitingForBarcode,
   kShowingFeedback,
   kShowingCommittedResult,
@@ -142,7 +127,6 @@ LiquidCrystal_I2C lcd(dental::hardware::kLcdI2cAddress,
                       dental::hardware::kLcdColumnCount,
                       dental::hardware::kLcdRowCount);
 RTC_DS3231 rtc;
-HardwareSerial scannerSerial(2);
 HardwareSerial atmegaSerial(1);
 dental::controller_link::PingResponder atmegaResponder;
 struct AtmegaTransmitter {
@@ -152,15 +136,22 @@ struct AtmegaTransmitter {
   }
 } atmegaTransmitter;
 
+void handleControllerBarcode(dental_link::Frame frame, const char* barcode, uint32_t nowMs);
+
 void serviceAtmegaLink() {
   if (!dental::hardware::kAtmegaLinkEnabled) return;
   for (uint8_t processed = 0U; processed < 16U && atmegaSerial.available();
        ++processed) {
-    if (atmegaResponder.receive(static_cast<uint8_t>(atmegaSerial.read()),
-                                atmegaTransmitter) == dental_link::Frame::kScan) {
-      // TEMPORARY Step 3A physical verification only. Never enqueue a transaction.
-      Serial.print("ATmega scanner RX: ");
+    const dental_link::Frame frame = atmegaResponder.receive(
+        static_cast<uint8_t>(atmegaSerial.read()), atmegaTransmitter);
+    if (frame == dental_link::Frame::kScan || frame == dental_link::Frame::kRestock ||
+        frame == dental_link::Frame::kCheckout) {
+      // Retained temporary USB log; routing below is independent of the log.
+      Serial.print(frame == dental_link::Frame::kRestock ? "ATmega RESTOCK RX: " :
+                   frame == dental_link::Frame::kCheckout ? "ATmega CHECKOUT RX: " :
+                   "ATmega scanner RX: ");
       Serial.println(atmegaResponder.barcode());
+      handleControllerBarcode(frame, atmegaResponder.barcode(), millis());
     }
   }
   atmegaResponder.service(atmegaTransmitter);
@@ -366,23 +357,11 @@ dental::cache::CacheProduct offlineProductBuffer = {};
 dental::offline::OfflineJournalRecord offlineCommittedRecordBuffer = {};
 dental::offline::OfflineJournalRecord offlinePendingReadBuffer = {};
 
-struct DebouncedButtonState {
-  const TransactionProfile* transaction;
-  int lastRawState;
-  int stableState;
-  uint32_t lastTransitionMs;
-};
-
-DebouncedButtonState restockButton = {
-    &kRestockTransaction, HIGH, HIGH, 0UL};
-DebouncedButtonState checkoutButton = {
-    &kCheckoutTransaction, HIGH, HIGH, 0UL};
 
 WorkflowState workflowState = WorkflowState::kIdle;
 uint32_t workflowStateStartedMs = 0UL;
 bool feedbackIndicatorIsOn = false;
 const TransactionProfile* activeTransaction = nullptr;
-bool buttonsMustBeReleased = false;
 dental::offline::TransactionRoute activeTransactionRoute =
     dental::offline::TransactionRoute::kOnline;
 bool transactionRouteCaptured = false;
@@ -406,7 +385,6 @@ TransactionResult activeCommittedResultFeedback =
     {{}, {}, 0U, 0ULL, StockStatus::kHigh};
 bool committedResultIndicatorIsOn = false;
 
-size_t acknowledgementMatchIndex = 0U;
 String barcodeBuffer;
 bool barcodeIsInvalid = false;
 uint32_t lastBarcodeByteMs = 0UL;
@@ -751,7 +729,7 @@ void handleStartBarcodeCaptureRequest() {
     sendBarcodeCaptureError(401, "unauthorized");
     return;
   }
-  if (!dental::hardware::kScannerUartEnabled) {
+  if (!dental::hardware::kAtmegaLinkEnabled) {
     sendBarcodeCaptureError(503, "scanner_unavailable");
     return;
   }
@@ -762,15 +740,13 @@ void handleStartBarcodeCaptureRequest() {
   }
 
   drainScannerInput();
-  if (!registrationBarcodeCapture.start(millis())) {
+  if (!registrationBarcodeCapture.start(millis(), false)) {
     sendBarcodeCaptureError(409, "scanner_busy");
     return;
   }
   registrationCaptureOutcomeReported = false;
-  showLcdScreen("REGISTER PRODUCT", "Scanner starting...", "Scan barcode",
+  showLcdScreen("REGISTER PRODUCT", "ATmega scanner ready", "Scan barcode",
                 "Please wait");
-  scannerSerial.write(kGm65TriggerCommand, sizeof(kGm65TriggerCommand));
-  scannerSerial.flush();
   Serial.println("Registration barcode capture started");
   httpServer.send(200, "application/json", "{\"started\":true}");
 }
@@ -1401,17 +1377,21 @@ void configureLedOutputs() {
 }
 
 void resetScannerWorkflowBuffers() {
-  acknowledgementMatchIndex = 0U;
   barcodeBuffer = "";
   barcodeIsInvalid = false;
   lastBarcodeByteMs = 0UL;
 }
 
 void drainScannerInput() {
-  if (!dental::hardware::kScannerUartEnabled) return;
-  while (scannerSerial.available() > 0) {
-    scannerSerial.read();
+  if (!dental::hardware::kAtmegaLinkEnabled) return;
+  // Discard buffered scans before arming; continue answering queued PINGs.
+  // Bound work even if the controller continuously sends input.
+  for (uint16_t processed = 0U; processed < 256U && atmegaSerial.available();
+       ++processed) {
+    atmegaResponder.receive(static_cast<uint8_t>(atmegaSerial.read()),
+                            atmegaTransmitter);
   }
+  atmegaResponder.rejectPartialInput();
 }
 
 void reportRegistrationCaptureOutcome() {
@@ -1813,7 +1793,6 @@ void processBarcodeByte(uint8_t receivedByte, uint32_t nowMs) {
 }
 
 void beginBarcodeWait(uint32_t nowMs) {
-  Serial.println("GM65 trigger acknowledgement received");
   Serial.println("Waiting for barcode scan");
   barcodeBuffer = "";
   barcodeIsInvalid = false;
@@ -1822,46 +1801,11 @@ void beginBarcodeWait(uint32_t nowMs) {
   workflowStateStartedMs = nowMs;
 }
 
-void processAcknowledgementByte(uint8_t receivedByte, uint32_t nowMs) {
-  if (receivedByte == kGm65Acknowledgement[acknowledgementMatchIndex]) {
-    ++acknowledgementMatchIndex;
-    if (acknowledgementMatchIndex == sizeof(kGm65Acknowledgement)) {
-      acknowledgementMatchIndex = 0U;
-      beginBarcodeWait(nowMs);
-    }
-    return;
-  }
-
-  acknowledgementMatchIndex =
-      receivedByte == kGm65Acknowledgement[0] ? 1U : 0U;
-}
 
 void serviceScanner(uint32_t nowMs) {
-  if (!dental::hardware::kScannerUartEnabled) return;
   if (registrationBarcodeCapture.active()) {
-    while (scannerSerial.available() > 0 &&
-           registrationBarcodeCapture.active()) {
-      registrationBarcodeCapture.receive(
-          static_cast<uint8_t>(scannerSerial.read()), nowMs);
-    }
     registrationBarcodeCapture.service(nowMs);
     reportRegistrationCaptureOutcome();
-    return;
-  }
-
-  while (scannerSerial.available() > 0) {
-    const uint8_t receivedByte =
-        static_cast<uint8_t>(scannerSerial.read());
-    if (workflowState == WorkflowState::kWaitingForAcknowledgement) {
-      processAcknowledgementByte(receivedByte, nowMs);
-    } else if (workflowState == WorkflowState::kWaitingForBarcode) {
-      processBarcodeByte(receivedByte, nowMs);
-    }
-
-    if (workflowState == WorkflowState::kShowingFeedback) {
-      drainScannerInput();
-      break;
-    }
   }
 }
 
@@ -1887,9 +1831,9 @@ void beginTransactionWorkflow(const TransactionProfile& transaction) {
     }
   }
   Serial.print(activeTransaction->action);
-  Serial.println(" button pressed");
-  if (!dental::hardware::kScannerUartEnabled) {
-    beginErrorFeedback("GM65 unavailable: scanner migration pending",
+  Serial.println(" operation received from ATmega");
+  if (!dental::hardware::kAtmegaLinkEnabled) {
+    beginErrorFeedback("ATmega scanner link unavailable",
                        "Scanner unavailable");
     return;
   }
@@ -1941,90 +1885,10 @@ void beginTransactionWorkflow(const TransactionProfile& transaction) {
     return;
   }
 
-  drainScannerInput();
   resetScannerWorkflowBuffers();
-  workflowState = WorkflowState::kWaitingForAcknowledgement;
-  workflowStateStartedMs = millis();
-
-  Serial.println("Scanner triggered - waiting for barcode");
-  scannerSerial.write(kGm65TriggerCommand, sizeof(kGm65TriggerCommand));
-  scannerSerial.flush();
+  beginBarcodeWait(millis());
 }
 
-bool updateButton(DebouncedButtonState& button, uint32_t nowMs) {
-  const int rawState = digitalRead(button.transaction->buttonGpio);
-  if (rawState != button.lastRawState) {
-    button.lastRawState = rawState;
-    button.lastTransitionMs = nowMs;
-  }
-
-  if (rawState != button.stableState &&
-      nowMs - button.lastTransitionMs >= kButtonDebounceMs) {
-    button.stableState = rawState;
-    return button.stableState == LOW;
-  }
-
-  return false;
-}
-
-void serviceButtons(uint32_t nowMs) {
-  const bool restockPressed = updateButton(restockButton, nowMs);
-  const bool checkoutPressed = updateButton(checkoutButton, nowMs);
-
-  if (workflowState != WorkflowState::kIdle &&
-      (restockButton.lastRawState == LOW ||
-       checkoutButton.lastRawState == LOW ||
-       restockButton.stableState == LOW ||
-       checkoutButton.stableState == LOW)) {
-    // A press that begins while BUSY is discarded rather than queued. Both
-    // buttons must return fully released before a later IDLE press is eligible.
-    buttonsMustBeReleased = true;
-  }
-
-  if (buttonsMustBeReleased && restockButton.lastRawState == HIGH &&
-      checkoutButton.lastRawState == HIGH &&
-      restockButton.stableState == HIGH &&
-      checkoutButton.stableState == HIGH) {
-    buttonsMustBeReleased = false;
-  }
-
-  if (!restockPressed && !checkoutPressed) {
-    return;
-  }
-
-  if (workflowState != WorkflowState::kIdle ||
-      registrationBarcodeCapture.active() || buttonsMustBeReleased) {
-    if (restockPressed) {
-      Serial.println("RESTOCK button press ignored - system busy");
-    }
-    if (checkoutPressed) {
-      Serial.println("CHECKOUT button press ignored - system busy");
-    }
-    return;
-  }
-
-  if (restockPressed && checkoutPressed) {
-    // Deterministic priority for simultaneous debounced press events.
-    buttonsMustBeReleased = true;
-    Serial.println("Both buttons pressed - RESTOCK accepted");
-    beginTransactionWorkflow(kRestockTransaction);
-  } else if (restockPressed) {
-    beginTransactionWorkflow(kRestockTransaction);
-  } else {
-    beginTransactionWorkflow(kCheckoutTransaction);
-  }
-}
-
-void initializeButton(DebouncedButtonState& button) {
-  pinMode(button.transaction->buttonGpio, INPUT_PULLUP);
-  button.lastRawState = digitalRead(button.transaction->buttonGpio);
-  button.stableState = button.lastRawState;
-  button.lastTransitionMs = millis();
-
-  Serial.print(button.transaction->action);
-  Serial.print(" button initialization: SUCCESS - GPIO");
-  Serial.println(button.transaction->buttonGpio);
-}
 
 void serviceWorkflowTimeouts(uint32_t nowMs) {
   if (workflowState == WorkflowState::kShowingCommittedResult) {
@@ -2048,12 +1912,6 @@ void serviceWorkflowTimeouts(uint32_t nowMs) {
     return;
   }
 
-  if (workflowState == WorkflowState::kWaitingForAcknowledgement &&
-      nowMs - workflowStateStartedMs >= kAcknowledgementTimeoutMs) {
-    beginErrorFeedback("GM65 trigger acknowledgement timeout",
-                       "Scanner no reply");
-    return;
-  }
 
   if (workflowState == WorkflowState::kWaitingForBarcode) {
     if ((barcodeBuffer.length() > 0U || barcodeIsInvalid) &&
@@ -2096,6 +1954,31 @@ void serviceWorkflowTimeouts(uint32_t nowMs) {
   }
 }
 
+void handleControllerBarcode(dental_link::Frame frame, const char* barcode, uint32_t nowMs) {
+  // Preserve the frame while timeout/feedback servicing may drain queued input.
+  char text[dental_link::kMaximumBarcodeLength + 1U];
+  snprintf(text, sizeof(text), "%s", barcode);
+  serviceWorkflowTimeouts(nowMs);
+  struct ExistingScannerWorkflow {
+    bool readyForTransaction() const { return workflowState == WorkflowState::kIdle; }
+    void handleTransactionBarcode(dental_link::Frame operation, const char* value, uint32_t now) {
+      // Operation is selected on ATmega, never inferred from an ESP32 button.
+      const TransactionProfile& profile = operation == dental_link::Frame::kRestock ?
+          kRestockTransaction : kCheckoutTransaction;
+      beginTransactionWorkflow(profile);
+      if (workflowState != WorkflowState::kWaitingForBarcode ||
+          activeTransaction != &profile) return;
+      // Reuse the original validation and completeBarcode() business path.
+      for (const char* byte = value; *byte; ++byte)
+        processBarcodeByte(static_cast<uint8_t>(*byte), now);
+      processBarcodeByte('\n', now);
+    }
+  } workflow;
+  dental::controller_link::routeForwardedFrame(
+      frame, text, nowMs, registrationBarcodeCapture, workflow);
+  reportRegistrationCaptureOutcome();
+}
+
 }  // namespace
 
 void setup() {
@@ -2108,10 +1991,6 @@ void setup() {
   configureLedOutputs();
   Serial.println("LED initialization: SUCCESS - all indicators off");
 
-  initializeButton(restockButton);
-  initializeButton(checkoutButton);
-  buttonsMustBeReleased = restockButton.stableState == LOW ||
-                          checkoutButton.stableState == LOW;
 
   const bool wireInitialized =
       Wire.begin(dental::hardware::kI2cSdaGpio,
@@ -2241,10 +2120,9 @@ void setup() {
 }
 
 void loop() {
-  // Each service gets a fresh timestamp. The button or scanner service can
+  // Each service gets a fresh timestamp. Controller or scanner services can
   // start a new timed state, so reusing an earlier sample would make unsigned
   // elapsed-time subtraction wrap and falsely expire that state immediately.
-  serviceButtons(millis());
   serviceScanner(millis());
   serviceWorkflowTimeouts(millis());
   serviceWiFi(millis());

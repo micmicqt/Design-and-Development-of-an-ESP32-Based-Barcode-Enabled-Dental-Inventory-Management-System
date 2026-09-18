@@ -33,9 +33,10 @@ enum class CaptureFailure : uint8_t {
  */
 class BarcodeCapture {
  public:
-  bool start(uint32_t nowMs) {
+  bool start(uint32_t nowMs, bool waitForAcknowledgement = true) {
     if (active()) return false;
-    state_ = CaptureState::kWaitingForAcknowledgement;
+    state_ = waitForAcknowledgement ? CaptureState::kWaitingForAcknowledgement :
+                                     CaptureState::kWaitingForBarcode;
     failure_ = CaptureFailure::kNone;
     acknowledgementMatchIndex_ = 0U;
     barcodeLength_ = 0U;

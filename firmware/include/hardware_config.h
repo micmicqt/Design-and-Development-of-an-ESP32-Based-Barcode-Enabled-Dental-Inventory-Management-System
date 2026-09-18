@@ -48,10 +48,8 @@ static constexpr uint8_t kScannerSchematicU0RxdNetGpio = 3;
 // Legacy GPIO16/17 ownership is removed; these belong to the ATmega link only.
 static constexpr bool kScannerUartEnabled = false;
 
-// Verified Phase 3 breadboard transaction-button assignments. These diagnostic
-// mappings remain separate from the unresolved final-PCB switch-net semantics.
-static constexpr uint8_t kRestockTestButtonGpio = 13;
-static constexpr uint8_t kCheckoutTestButtonGpio = 14;
+// Physical buttons now belong to ATmega PD2/PD3, not ESP32 GPIO13/14.
+static constexpr bool kLegacyTransactionButtonsEnabled = false;
 
 // FINAL UART1 ownership: RX GPIO16 / TX GPIO17, through the level interface.
 // GPIO34/25 are no longer used for this link; GM65 migration is pending.
@@ -72,8 +70,7 @@ constexpr bool isControllerLinkGpio(int pin) {
 }
 constexpr bool isExistingPeripheralGpio(int pin) {
   return pin == 0 || pin == 1 || pin == 3 || (pin >= 6 && pin <= 11) ||
-      pin == 12 || pin == kRestockTestButtonGpio ||
-      pin == kCheckoutTestButtonGpio || pin == kI2cSdaGpio ||
+      pin == 12 || pin == 13 || pin == 14 || pin == kI2cSdaGpio ||
       pin == kI2cSclGpio || pin == kMicroSdChipSelectGpio ||
       pin == kMicroSdClockGpio || pin == kMicroSdMosiGpio ||
       pin == kMicroSdMisoGpio || pin == kTwoIndicatorControlAGpio ||
