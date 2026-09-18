@@ -9,14 +9,17 @@ namespace controller_link {
 class PingResponder {
  public:
   template <typename Transmitter>
-  void receive(uint8_t byte, Transmitter& transmitter) {
+  dental_link::Frame receive(uint8_t byte, Transmitter& transmitter) {
     const dental_link::Frame frame = parser_.receive(byte);
     if (frame == dental_link::Frame::kPing && remaining_ == 0U) {
       remaining_ = sizeof(dental_link::kPong) - 1U;
       position_ = 0U;
     }
     service(transmitter);
+    return frame;
   }
+
+  const char* barcode() const { return parser_.barcode(); }
 
   template <typename Transmitter>
   void service(Transmitter& transmitter) {

@@ -2,8 +2,8 @@
 
 Separate primary-controller foundation. The working ESP32 project remains in
 `../firmware/` and retains existing functionality except the disabled legacy
-scanner during migration. Step 2
-adds only a configurable UART responder. No desktop changes are required.
+scanner during migration. Step 2 adds a UART responder; Step 3A adds bounded
+GM65 capture/forwarding only. No desktop changes are required.
 
 ## Build and startup
 
@@ -11,8 +11,8 @@ PlatformIO Atmel AVR 5.1.0, AVR-GCC/avr-libc, bare-metal C++11 (no Arduino runti
 or third-party libraries). Target Arduino Uno R3's **onboard ATmega328P**,
 explicitly `F_CPU = 16000000UL`.
 The AVR runtime supplies reset/startup and calls `main()`. Startup drives only
-the four status pins OFF. The corrected Step 2 initializes a D6/D7 software UART,
-Timer1 and Timer0, without accessing hardware USART0 or D0/D1.
+the four status pins OFF. Step 2 initializes the D6/D7 software UART, Timer1
+and Timer0. Step 3A additionally initializes hardware USART0 for GM65 on D0/D1.
 The status APIs write both bits of each group together, preserving other bits.
 No dynamic allocation, periodic LED cycling or inventory functionality is added.
 
@@ -44,7 +44,8 @@ are introduced in this foundation step.
 
 ATmega software UART: **D6/PD6 RX, D7/PD7 TX, 9600 baud, 8N1**.
 Hardware USART0 D0/PD0 RX and D1/PD1 TX belong permanently to GM65; its driver
-is not yet migrated or initialized. The controller link never accesses USART0.
+is initialized by Step 3A for scan capture only. The controller link never
+accesses USART0.
 Timer1 runs freely at 2 MHz (prescaler 8). Compare A advances TX one bit at a
 time; PD6 pin-change interrupt PCINT22 detects the falling start edge and
 compare B validates it at half a bit, samples eight LSB-first bits, and validates
@@ -65,9 +66,10 @@ and response waiting each have a one-second timeout; neither can block forever.
 Internal outcome and counters record verification/timeout; the link does not
 depend on USB Serial Monitor or change either status LED group.
 
-Case-sensitive lines contain at most eight printable ASCII characters excluding
-terminators. Optional CRLF is accepted; empty lines are ignored. Binary, malformed
-or oversized frames are discarded through LF, with fixed nine-byte storage.
+Case-sensitive lines contain at most 69 printable ASCII characters excluding
+terminators (five-byte SCAN prefix plus 64 barcode bytes). Optional CRLF is
+accepted; empty lines are ignored. Binary, malformed or oversized frames are
+discarded through LF, with fixed 70-byte storage.
 Software-UART stop-bit/framing and queue-overrun errors quarantine the current frame. Partial frames
 expire with their attempt; responses outside a waiting state are ignored. This
 is a bring-up protocol, not authenticated or transaction-grade transport.
@@ -78,7 +80,8 @@ Final ownership is **UART1 RX GPIO16 / TX GPIO17** for ATmega communication.
 This supersedes the earlier GPIO34/25 link and legacy GM65 UART2 mapping.
 Debug UART0 remains unchanged. GM65 UART initialization is disabled with no
 replacement pins assigned. Its implementation is preserved, but scanner
-migration to ATmega is a later TODO. RESTOCK/CHECKOUT report scanner-unavailable
+migration of scanner-trigger/transaction behavior to ATmega is a later TODO.
+RESTOCK/CHECKOUT report scanner-unavailable
 feedback; registration capture returns HTTP 503 `scanner_unavailable`.
 `DENTAL_ATMEGA_LINK_RX_GPIO` and `DENTAL_ATMEGA_LINK_TX_GPIO` can be overridden
 with PlatformIO build flags; setting BOTH to `-1` disables the link.
@@ -115,11 +118,72 @@ Only the normal bounded PING/PONG requester/responder remains enabled.
 No inventory/peripheral functionality was migrated by this test.
 
 ESP32 processes at most 16 RX bytes per loop and checks TX capacity before
-writing. Only PING produces PONG. At most one five-byte reply is buffered; extra
+writing. Only PING produces PONG; SCAN only produces a temporary USB debug line.
+At most one five-byte reply is buffered; extra
 PINGs arriving while TX is busy are ignored rather than queued without bound.
 The responder has no inventory, FIFO, offline journal, RTC, MicroSD, HTTP or
 Electron callback. Existing ESP32 workflows coexist; scanner-dependent operations
-fail safely until the GM65 migration is completed.
+fail safely until the GM65 transaction migration is completed.
+
+## Step 3A: GM65 capture only
+
+GM65 TX connects to **Uno D0/PD0 RX**, and GM65 RX to **D1/PD1 TX**,
+with the confirmed appropriate electrical interface and common GND. Hardware
+USART0 uses 9600 baud, 8N1 (normal-speed divider 103). Its bounded RX ISR reads
+status before UDR0 and records framing/parity/overrun errors. The 64-slot RX
+ring has 63 usable entries; overflow drops uncertain queued input and rejects
+the affected scan through a delimiter. No trigger/configuration bytes are sent.
+
+Barcode capacity is **64 printable ASCII bytes** plus NUL. Numeric values are
+never converted; leading zeroes and spaces are preserved exactly. Empty and
+all-space scans, binary/control bytes, malformed and oversized input are
+rejected, never truncated. CR or LF completes a scan; CRLF completes it once.
+A one-second inter-byte timeout rejects a partial scan until its next delimiter.
+
+Completed scans use **`SCAN:<barcode>\n`** over D7/D6 at 9600 8N1. An empty LF
+precedes each frame to resynchronize any earlier partial controller-link input.
+One scan is buffered for forwarding; additional scans while busy are dropped,
+not combined. PING and SCAN bytes never interleave. TX attempts one byte per
+loop, with a one-second timeout. On timeout a binary rejection marker and LF
+invalidate any partial scan, preventing silent truncation. If TX remains full,
+only this nonblocking resynchronization is retried; other main-loop work continues.
+Normal bounded PING/PONG remains active between scan frames.
+
+ESP32 validates SCAN separately and retains a temporary USB verification line.
+Step 3A physical verification passed using a real GM65 barcode scan, observed as:
+
+```text
+ATmega scanner RX: 4806016001569
+```
+
+This confirms GM65 -> ATmega USART0 D0/D1 -> bounded capture -> D7/D6
+controller link -> ESP32 GPIO16/GPIO17 -> exact barcode reception.
+Physical leading-zero verification was not performed; leading-zero preservation
+is covered by automated tests only. No new diagnostic behavior was added.
+
+No SCAN callback enters online event FIFO, offline pending journal, CSV logging,
+inventory, SQLite or Electron. ESP32 direct GM65 UART remains disabled; its
+scanner-dependent production workflows remain unavailable. Buttons, RTC, LCD,
+MicroSD and inventory transaction migration are not part of Step 3A.
+
+### Physical test procedure (not performed automatically)
+
+1. With power off, check the existing common GND, scanner supply/interface,
+   D0/D1 scanner wiring and D7/D6 controller-link level-shifter wiring.
+2. Before Uno USB upload, isolate GM65 TX from D0 so the scanner cannot compete
+   with the Uno USB-to-serial transmitter/bootloader. Use the existing normal
+   `uno` environment on COM10; no ISP/fuse changes. Upload ESP32 only when
+   explicitly authorized. After uploads, power off and restore runtime wiring.
+3. Power both controllers/scanner; open **ESP32** USB Serial at 115200. Do not
+   open Uno USB Serial or inject USB bytes on D0/D1 during scanner operation.
+4. Use a real GM65 scan, in its existing autonomous/manual scan-output mode
+   with CR/LF termination. Step 3A does not send command-mode triggers; if it
+   remains command-triggered, no scan output is expected until it is configured
+   appropriately using the scanner's supported setup procedure.
+5. Scan `0012345678905` and another known barcode; check one exact ESP32 line
+   per scan. Repeat after idle periods. Do not press RESTOCK/CHECKOUT for this test.
+6. Verify inventory/history/pending-event counts do not change. This is receive/
+   forward bring-up only, not a stock transaction or desktop registration flow.
 
 ## Focused host tests
 
@@ -135,12 +199,15 @@ Use an existing host C++ compiler, for example the workspace's ignored Zig setup
 & .\.runtime\firmware-tests\atmega_ping_client_test.exe
 & .\.runtime\ziglang\ziglang\zig.exe c++ -std=c++11 -Wall -Wextra -Werror -Ifirmware-atmega/include firmware-atmega/tests/software_uart_test.cpp -o .runtime/firmware-tests/atmega_software_uart_test.exe
 & .\.runtime\firmware-tests\atmega_software_uart_test.exe
+& .\.runtime\ziglang\ziglang\zig.exe c++ -std=c++11 -Wall -Wextra -Werror -Ifirmware-atmega/include firmware-atmega/tests/scanner_capture_test.cpp -o .runtime/firmware-tests/atmega_scanner_capture_test.exe
+& .\.runtime\firmware-tests\atmega_scanner_capture_test.exe
 & .\.runtime\ziglang\ziglang\zig.exe c++ -std=c++11 -Wall -Wextra -Werror -Ifirmware/include firmware/tests/atmega_link_test.cpp -o .runtime/firmware-tests/esp32_atmega_link_test.exe
 & .\.runtime\firmware-tests\esp32_atmega_link_test.exe
 ```
 
 Current focused coverage: eight requester, eight software-UART and eight ESP32
-responder scenarios. Software-UART coverage includes D6/D7 ownership,
+baseline responder scenarios plus five scanner integration scenarios and thirteen
+ATmega scanner capture/forwarding scenarios. Software-UART coverage includes D6/D7 ownership,
 all 256 byte encodings, start/stop bits, false starts, framing errors, queue
 bounds, timer wrap and a software PING/PONG path. Host tests do not prove actual
 ISR latency margins or electrical timing; the physical round-trip passed, but

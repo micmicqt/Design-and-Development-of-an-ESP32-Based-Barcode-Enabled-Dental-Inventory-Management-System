@@ -156,8 +156,12 @@ void serviceAtmegaLink() {
   if (!dental::hardware::kAtmegaLinkEnabled) return;
   for (uint8_t processed = 0U; processed < 16U && atmegaSerial.available();
        ++processed) {
-    atmegaResponder.receive(static_cast<uint8_t>(atmegaSerial.read()),
-                            atmegaTransmitter);
+    if (atmegaResponder.receive(static_cast<uint8_t>(atmegaSerial.read()),
+                                atmegaTransmitter) == dental_link::Frame::kScan) {
+      // TEMPORARY Step 3A physical verification only. Never enqueue a transaction.
+      Serial.print("ATmega scanner RX: ");
+      Serial.println(atmegaResponder.barcode());
+    }
   }
   atmegaResponder.service(atmegaTransmitter);
 }

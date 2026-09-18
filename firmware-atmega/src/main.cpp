@@ -1,6 +1,8 @@
 #include "status_outputs.h"
 #include "ping_client.h"
 #include "uart_link.h"
+#include "scanner_capture.h"
+#include "scanner_uart.h"
 
 #include <avr/interrupt.h>
 
@@ -13,7 +15,9 @@ int main() {
   dental_atmega::initializeStatusOutputs();
   dental_atmega::uart::initialize();
   dental_atmega::uart::initializeClock();
+  dental_atmega::scanner_uart::initialize();
   dental_atmega::PingClient link;
+  dental_atmega::ScannerTransport scanner;
   dental_atmega::uart::Transmitter transmitter;
   sei();
   for (;;) {
@@ -25,6 +29,10 @@ int main() {
       if (error) link.receiveError();
       else link.receive(dental_atmega::uart::milliseconds(), byte);
     }
-    link.service(dental_atmega::uart::milliseconds(), transmitter);
+    for (uint8_t received = 0U; received < 8U; ++received) {
+      if (!dental_atmega::scanner_uart::tryRead(byte, error)) break;
+      scanner.receive(dental_atmega::uart::milliseconds(), byte, error);
+    }
+    scanner.service(dental_atmega::uart::milliseconds(), link, transmitter);
   }
 }
