@@ -9,13 +9,11 @@
 namespace dental {
 namespace hardware {
 
-// RTC-only ESP32 I2C bus, 3.3 V. LCD now belongs to ATmega A4/A5 on a
-// physically separate bus; never join its pull-ups to these ESP32 pins.
-static constexpr uint8_t kI2cSdaGpio = 21;
-static constexpr uint8_t kI2cSclGpio = 22;
+// LCD and DS3231 now share the ATmega A4/A5 bus. ESP32 owns neither I2C device.
 static constexpr bool kEsp32LcdEnabled = false;
+static constexpr bool kEsp32RtcEnabled = false;
 static_assert(!kEsp32LcdEnabled, "LCD is ATmega-owned");
-static constexpr uint8_t kDs3231I2cAddress = 0x68;
+static_assert(!kEsp32RtcEnabled, "RTC is ATmega-owned");
 
 // Verified Phase 3 breadboard MicroSD SPI nets. The tested module is powered
 // from 5 V and provides its own regulation/logic buffering.
@@ -70,8 +68,8 @@ constexpr bool isControllerLinkGpio(int pin) {
 }
 constexpr bool isExistingPeripheralGpio(int pin) {
   return pin == 0 || pin == 1 || pin == 3 || (pin >= 6 && pin <= 11) ||
-      pin == 12 || pin == 13 || pin == 14 || pin == kI2cSdaGpio ||
-      pin == kI2cSclGpio || pin == kMicroSdChipSelectGpio ||
+      pin == 12 || pin == 13 || pin == 14 ||
+      pin == kMicroSdChipSelectGpio ||
       pin == kMicroSdClockGpio || pin == kMicroSdMosiGpio ||
       pin == kMicroSdMisoGpio || pin == kTwoIndicatorControlAGpio ||
       pin == kTwoIndicatorControlBGpio || pin == kThreeIndicatorControlAGpio ||

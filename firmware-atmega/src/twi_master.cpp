@@ -14,6 +14,10 @@ void AvrHardware::initialize() {
 }
 void AvrHardware::start() { TWCR = _BV(TWINT) | _BV(TWEN) | _BV(TWSTA); }
 void AvrHardware::send(uint8_t value) { TWDR = value; TWCR = _BV(TWINT) | _BV(TWEN); }
+void AvrHardware::receive(bool acknowledge) {
+  TWCR = _BV(TWINT) | _BV(TWEN) | (acknowledge ? _BV(TWEA) : 0U);
+}
+uint8_t AvrHardware::read() const { return TWDR; }
 void AvrHardware::stop() { TWCR = _BV(TWINT) | _BV(TWEN) | _BV(TWSTO); }
 void AvrHardware::reset() { TWCR = 0U; TWCR = _BV(TWEN); }
 bool AvrHardware::ready() const { return (TWCR & _BV(TWINT)) != 0U; }

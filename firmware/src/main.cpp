@@ -1,12 +1,10 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <HardwareSerial.h>
-#include <RTClib.h>
 #include <SD.h>
 #include <SPI.h>
 #include <WebServer.h>
 #include <WiFi.h>
-#include <Wire.h>
 #include <bootloader_random.h>
 #include <esp_system.h>
 
@@ -21,10 +19,10 @@
 #include "rtc_recovery.h"
 #include "secrets.h"
 #include "transaction_event_queue.h"
+#include "../../firmware-common/include/rtc_link_protocol.h"
 
 namespace {
 
-constexpr uint32_t kI2cClockHz = 100000UL;
 constexpr uint32_t kMicroSdSpiFrequencyHz = 1000000UL;
 constexpr uint8_t kMicroSdMountAttempts = 3U;
 constexpr uint32_t kMicroSdRetryDelayMs = 250UL;
@@ -39,10 +37,9 @@ constexpr uint32_t kWiFiConnectionTimeoutMs = 15000UL;
 constexpr uint32_t kWiFiRetryBackoffMs = 30000UL;
 constexpr uint32_t kWiFiProgressIntervalMs = 2000UL;
 constexpr uint32_t kDesktopPresenceLeaseMs = 12000UL;
-constexpr uint8_t kDs3231StatusRegister = 0x0FU;
-constexpr uint8_t kDs3231OscillatorStopFlag = 0x80U;
-constexpr uint8_t kRtcStatusReadAttempts = 3U;
-constexpr uint32_t kRtcStatusRetryDelayMs = 25UL;
+constexpr uint32_t kRtcBridgeTimeoutMs = 1500UL;
+constexpr uint32_t kRtcStatusPollMs = 5000UL;
+constexpr uint32_t kUnixEpochAt2000 = 946684800UL;
 using dental::events::AcknowledgementResult;
 using dental::events::PendingTransactionEvent;
 using dental::events::ResultApplicationResult;
@@ -122,7 +119,6 @@ enum class WiFiConnectionState : uint8_t {
 static_assert(kMaximumBarcodeLength == dental::events::kMaximumBarcodeLength,
               "The delivery queue must preserve the complete scanner barcode.");
 
-RTC_DS3231 rtc;
 HardwareSerial atmegaSerial(1);
 dental::controller_link::PingResponder atmegaResponder;
 struct AtmegaTransmitter {
@@ -133,6 +129,8 @@ struct AtmegaTransmitter {
 } atmegaTransmitter;
 
 void handleControllerBarcode(dental_link::Frame frame, const char* barcode, uint32_t nowMs);
+void handleControllerRtcFrame(dental_link::Frame frame, const char* payload,
+                              uint32_t nowMs);
 
 void serviceAtmegaLink() {
   if (!dental::hardware::kAtmegaLinkEnabled) return;
@@ -148,6 +146,10 @@ void serviceAtmegaLink() {
                    "ATmega scanner RX: ");
       Serial.println(atmegaResponder.barcode());
       handleControllerBarcode(frame, atmegaResponder.barcode(), millis());
+    } else if (frame == dental_link::Frame::kRtcStatus ||
+               frame == dental_link::Frame::kRtcTime ||
+               frame == dental_link::Frame::kRtcSyncResult) {
+      handleControllerRtcFrame(frame, atmegaResponder.payload(), millis());
     }
   }
   atmegaResponder.service(atmegaTransmitter);
@@ -159,6 +161,13 @@ bool microSdAvailable = false;
 dental::rtc_recovery::Status rtcStatus = {
     dental::rtc_recovery::State::kUnavailable,
     dental::rtc_recovery::Reason::kCommunicationFailure};
+
+enum class RtcBridgeRequest : uint8_t { kNone, kStatus, kTime, kSync };
+RtcBridgeRequest rtcBridgeRequest = RtcBridgeRequest::kNone;
+uint32_t rtcBridgeStartedMs = 0UL;
+uint32_t lastRtcStatusPollMs = 0UL;
+bool rtcBridgeResponseSucceeded = false;
+char rtcBridgeTimestamp[20] = {};
 
 class SdCacheStorage : public dental::cache::CacheStorage {
  public:
@@ -388,7 +397,6 @@ bool registrationCaptureOutcomeReported = false;
 
 void setStockStatusIndicator(StockStatus status);
 void startNextCommittedResultFeedback(uint32_t nowMs);
-bool readDs3231StatusRegister(uint8_t& status);
 void drainScannerInput();
 
 StockStatus toEventStockStatus(dental::cache::StockStatus status) {
@@ -419,6 +427,120 @@ void showRtcSynchronizationRequiredScreen() {
 void setRtcStatus(dental::rtc_recovery::Status status) {
   rtcStatus = status;
   rtcAvailable = dental::rtc_recovery::timeIsTrusted(status);
+}
+
+dental::rtc_recovery::State recoveryState(dental_link::rtc::State state) {
+  return state == dental_link::rtc::State::kReady
+             ? dental::rtc_recovery::State::kReady
+             : state == dental_link::rtc::State::kNeedsSync
+                   ? dental::rtc_recovery::State::kNeedsSync
+                   : dental::rtc_recovery::State::kUnavailable;
+}
+
+dental::rtc_recovery::Reason recoveryReason(dental_link::rtc::Reason reason) {
+  switch (reason) {
+    case dental_link::rtc::Reason::kNone:
+      return dental::rtc_recovery::Reason::kNone;
+    case dental_link::rtc::Reason::kLostPower:
+      return dental::rtc_recovery::Reason::kLostPower;
+    case dental_link::rtc::Reason::kInvalidTime:
+      return dental::rtc_recovery::Reason::kInvalidTime;
+    case dental_link::rtc::Reason::kVerificationFailed:
+      return dental::rtc_recovery::Reason::kVerificationFailed;
+    case dental_link::rtc::Reason::kCommunicationFailure:
+      return dental::rtc_recovery::Reason::kCommunicationFailure;
+  }
+  return dental::rtc_recovery::Reason::kCommunicationFailure;
+}
+
+void failRtcBridgeRequest() {
+  rtcBridgeRequest = RtcBridgeRequest::kNone;
+  rtcBridgeResponseSucceeded = false;
+  setRtcStatus({dental::rtc_recovery::State::kUnavailable,
+                dental::rtc_recovery::Reason::kCommunicationFailure});
+}
+
+void handleControllerRtcFrame(dental_link::Frame frame, const char* payload,
+                              uint32_t nowMs) {
+  if (frame == dental_link::Frame::kRtcTime) {
+    dental_link::rtc::DateTime value;
+    if (rtcBridgeRequest != RtcBridgeRequest::kTime ||
+        !dental_link::rtc::parseDateTime(payload, value)) return;
+    snprintf(rtcBridgeTimestamp, sizeof(rtcBridgeTimestamp), "%s", payload);
+    setRtcStatus({dental::rtc_recovery::State::kReady,
+                  dental::rtc_recovery::Reason::kNone});
+    rtcBridgeResponseSucceeded = true;
+    rtcBridgeRequest = RtcBridgeRequest::kNone;
+    lastRtcStatusPollMs = nowMs;
+    return;
+  }
+
+  dental_link::rtc::State state;
+  dental_link::rtc::Reason reason;
+  if (!dental_link::rtc::parseState(payload, state, reason)) return;
+  setRtcStatus({recoveryState(state), recoveryReason(reason)});
+  lastRtcStatusPollMs = nowMs;
+  if ((frame == dental_link::Frame::kRtcStatus &&
+       (rtcBridgeRequest == RtcBridgeRequest::kStatus ||
+        rtcBridgeRequest == RtcBridgeRequest::kTime)) ||
+      (frame == dental_link::Frame::kRtcSyncResult &&
+       rtcBridgeRequest == RtcBridgeRequest::kSync)) {
+    rtcBridgeResponseSucceeded =
+        frame == dental_link::Frame::kRtcStatus
+            ? rtcBridgeRequest == RtcBridgeRequest::kStatus
+            : state == dental_link::rtc::State::kReady;
+    rtcBridgeRequest = RtcBridgeRequest::kNone;
+  }
+}
+
+bool waitForRtcBridgeIdle(uint32_t timeoutMs) {
+  const uint32_t started = millis();
+  while ((rtcBridgeRequest != RtcBridgeRequest::kNone ||
+          atmegaResponder.busy()) && millis() - started < timeoutMs) {
+    serviceAtmegaLink();
+    delay(1UL);
+  }
+  return rtcBridgeRequest == RtcBridgeRequest::kNone &&
+         !atmegaResponder.busy();
+}
+
+bool requestRtcBridge(const char* line, RtcBridgeRequest request) {
+  if (!dental::hardware::kAtmegaLinkEnabled ||
+      rtcBridgeRequest != RtcBridgeRequest::kNone ||
+      !atmegaResponder.queueLine(line)) return false;
+  rtcBridgeRequest = request;
+  rtcBridgeStartedMs = millis();
+  rtcBridgeResponseSucceeded = false;
+  return true;
+}
+
+bool requestRtcBridgeAndWait(const char* line, RtcBridgeRequest request) {
+  if (!waitForRtcBridgeIdle(kRtcBridgeTimeoutMs) ||
+      !requestRtcBridge(line, request)) {
+    failRtcBridgeRequest(); return false;
+  }
+  while (rtcBridgeRequest != RtcBridgeRequest::kNone &&
+         millis() - rtcBridgeStartedMs < kRtcBridgeTimeoutMs) {
+    serviceAtmegaLink();
+    delay(1UL);
+  }
+  if (rtcBridgeRequest != RtcBridgeRequest::kNone) {
+    failRtcBridgeRequest(); return false;
+  }
+  return rtcBridgeResponseSucceeded;
+}
+
+void serviceRtcBridge(uint32_t nowMs) {
+  if (rtcBridgeRequest != RtcBridgeRequest::kNone) {
+    if (nowMs - rtcBridgeStartedMs >= kRtcBridgeTimeoutMs)
+      failRtcBridgeRequest();
+    return;
+  }
+  if (nowMs - lastRtcStatusPollMs >= kRtcStatusPollMs &&
+      !atmegaResponder.busy()) {
+    requestRtcBridge(dental_link::kRtcStatusRequest,
+                     RtcBridgeRequest::kStatus);
+  }
 }
 
 const char* currentHttpMode() {
@@ -654,36 +776,30 @@ void handleRtcSyncRequest() {
     return;
   }
 
-  rtc.adjust(DateTime(request.localEpochSeconds));
-
-  uint8_t statusRegister = 0U;
-  const bool statusReadable = readDs3231StatusRegister(statusRegister);
-  if (!statusReadable) {
-    setRtcStatus({dental::rtc_recovery::State::kUnavailable,
-                  dental::rtc_recovery::Reason::kCommunicationFailure});
-    Serial.println("RTC synchronization: FAILED - status reread failed");
-    sendRtcSyncError(503, "rtc_unavailable");
+  dental_link::rtc::DateTime localTime;
+  char timestamp[20];
+  char frame[40];
+  if (request.localEpochSeconds < kUnixEpochAt2000 ||
+      !dental_link::rtc::fromSecondsSince2000(
+          request.localEpochSeconds - kUnixEpochAt2000, localTime) ||
+      !dental_link::rtc::formatDateTime(localTime, timestamp,
+                                        sizeof(timestamp))) {
+    sendRtcSyncError(400, "invalid_timestamp");
+    return;
+  }
+  const int frameLength = snprintf(frame, sizeof(frame), "%s%s\n",
+                                   dental_link::kRtcSyncPrefix, timestamp);
+  if (frameLength <= 0 || frameLength >= static_cast<int>(sizeof(frame)) ||
+      !requestRtcBridgeAndWait(frame, RtcBridgeRequest::kSync)) {
+    Serial.println("RTC synchronization: FAILED - ATmega verification failed");
+    sendRtcSyncError(
+        rtcStatus.state == dental::rtc_recovery::State::kUnavailable ? 503 : 500,
+        rtcStatus.state == dental::rtc_recovery::State::kUnavailable
+            ? "rtc_unavailable"
+            : "verification_failed");
     return;
   }
 
-  const DateTime observed = rtc.now();
-  const bool oscillatorStopped =
-      (statusRegister & kDs3231OscillatorStopFlag) != 0U;
-  if (!dental::rtc_recovery::synchronizationVerified(
-          request.localEpochSeconds, true, oscillatorStopped,
-          observed.isValid(), observed.unixtime())) {
-    setRtcStatus(
-        {dental::rtc_recovery::State::kNeedsSync,
-         oscillatorStopped
-             ? dental::rtc_recovery::Reason::kLostPower
-             : dental::rtc_recovery::Reason::kVerificationFailed});
-    Serial.println("RTC synchronization: FAILED - verification failed");
-    sendRtcSyncError(500, "verification_failed");
-    return;
-  }
-
-  setRtcStatus({dental::rtc_recovery::State::kReady,
-                dental::rtc_recovery::Reason::kNone});
   Serial.println("RTC synchronization: SUCCESS - desktop time verified");
   if (workflowState == WorkflowState::kIdle) {
     showIdleScreen();
@@ -1239,39 +1355,6 @@ void serviceWiFi(uint32_t nowMs) {
   }
 }
 
-bool i2cAddressResponds(uint8_t address) {
-  Wire.beginTransmission(address);
-  return Wire.endTransmission() == 0U;
-}
-
-bool readDs3231StatusRegister(uint8_t& status) {
-  for (uint8_t attempt = 1U; attempt <= kRtcStatusReadAttempts; ++attempt) {
-    Wire.beginTransmission(dental::hardware::kDs3231I2cAddress);
-    Wire.write(kDs3231StatusRegister);
-    const uint8_t transmissionResult = Wire.endTransmission(false);
-    const uint8_t receivedBytes =
-        transmissionResult == 0U
-            ? Wire.requestFrom(dental::hardware::kDs3231I2cAddress,
-                               static_cast<uint8_t>(1U))
-            : 0U;
-
-    if (transmissionResult == 0U && receivedBytes == 1U &&
-        Wire.available() == 1) {
-      status = static_cast<uint8_t>(Wire.read());
-      return true;
-    }
-
-    while (Wire.available() > 0) {
-      Wire.read();
-    }
-    if (attempt < kRtcStatusReadAttempts) {
-      delay(kRtcStatusRetryDelayMs);
-    }
-  }
-
-  return false;
-}
-
 void setTransactionIndicatorOff() {
   digitalWrite(dental::hardware::kTwoIndicatorControlAGpio, LOW);
   digitalWrite(dental::hardware::kTwoIndicatorControlBGpio, LOW);
@@ -1551,41 +1634,16 @@ CsvAppendResult appendTransactionEvent(const char* timestamp,
 }
 
 bool readRtcTimestamp(char* destination, size_t destinationSize) {
-  if (!rtcAvailable) {
-    return false;
-  }
-  if (!i2cAddressResponds(dental::hardware::kDs3231I2cAddress)) {
-    setRtcStatus({dental::rtc_recovery::State::kUnavailable,
-                  dental::rtc_recovery::Reason::kCommunicationFailure});
-    return false;
-  }
-
-  uint8_t statusRegister = 0U;
-  if (!readDs3231StatusRegister(statusRegister)) {
-    setRtcStatus({dental::rtc_recovery::State::kUnavailable,
-                  dental::rtc_recovery::Reason::kCommunicationFailure});
-    return false;
-  }
-  if ((statusRegister & kDs3231OscillatorStopFlag) != 0U) {
-    setRtcStatus({dental::rtc_recovery::State::kNeedsSync,
-                  dental::rtc_recovery::Reason::kLostPower});
-    return false;
-  }
-
-  const DateTime now = rtc.now();
-  if (!now.isValid()) {
-    setRtcStatus({dental::rtc_recovery::State::kNeedsSync,
-                  dental::rtc_recovery::Reason::kInvalidTime});
-    return false;
-  }
-
-  const int charactersWritten = snprintf(
-      destination, destinationSize, "%04u-%02u-%02u %02u:%02u:%02u",
-      static_cast<unsigned>(now.year()), static_cast<unsigned>(now.month()),
-      static_cast<unsigned>(now.day()), static_cast<unsigned>(now.hour()),
-      static_cast<unsigned>(now.minute()), static_cast<unsigned>(now.second()));
-  return charactersWritten > 0 &&
-         static_cast<size_t>(charactersWritten) < destinationSize;
+  // Never gate a transaction solely on ESP32's volatile cached status. Ask the
+  // ATmega/DS3231 directly so a valid retained clock recovers after either
+  // controller/link restart without requiring Electron to reconnect.
+  if (!destination || destinationSize < 20U ||
+      !requestRtcBridgeAndWait(dental_link::kRtcTimeRequest,
+                               RtcBridgeRequest::kTime)) return false;
+  const size_t length = strlen(rtcBridgeTimestamp);
+  if (length != 19U || length + 1U > destinationSize) return false;
+  memcpy(destination, rtcBridgeTimestamp, length + 1U);
+  return true;
 }
 
 bool barcodeContainsVisibleCharacter(const String& barcode) {
@@ -1965,44 +2023,22 @@ void setup() {
   configureLedOutputs();
   Serial.println("LED initialization: SUCCESS - all indicators off");
 
-
-  const bool wireInitialized =
-      Wire.begin(dental::hardware::kI2cSdaGpio,
-                 dental::hardware::kI2cSclGpio, kI2cClockHz);
-  if (!wireInitialized) {
-    Serial.println("I2C initialization: FAILED");
+  if (dental::hardware::kAtmegaLinkEnabled) {
+    atmegaSerial.begin(dental_link::kBaud, SERIAL_8N1,
+                      dental::hardware::kAtmegaLinkRxGpio,
+                      dental::hardware::kAtmegaLinkTxGpio);
+    Serial.println("ATmega link: UART1 ready / 9600 8N1");
   } else {
-    Serial.println("I2C initialization: SUCCESS - GPIO21/GPIO22 at 100000 Hz");
+    Serial.println("ATmega link: DISABLED - confirm ESP32 RX/TX GPIO mapping");
   }
 
-  Serial.println("LCD ownership: ATmega A4/A5 - ESP32 LCD access disabled");
-
-  if (wireInitialized && rtc.begin(&Wire)) {
-    uint8_t statusRegister = 0U;
-    if (!readDs3231StatusRegister(statusRegister)) {
-      setRtcStatus({dental::rtc_recovery::State::kUnavailable,
-                    dental::rtc_recovery::Reason::kCommunicationFailure});
-      Serial.println(
-          "RTC initialization: FAILED - status register read failed");
-    } else if ((statusRegister & kDs3231OscillatorStopFlag) != 0U) {
-      setRtcStatus({dental::rtc_recovery::State::kNeedsSync,
-                    dental::rtc_recovery::Reason::kLostPower});
-      Serial.println(
-          "RTC initialization: NEEDS SYNCHRONIZATION - lost-power flag set");
-    } else if (!rtc.now().isValid()) {
-      setRtcStatus({dental::rtc_recovery::State::kNeedsSync,
-                    dental::rtc_recovery::Reason::kInvalidTime});
-      Serial.println(
-          "RTC initialization: NEEDS SYNCHRONIZATION - retained time is invalid");
-    } else {
-      setRtcStatus({dental::rtc_recovery::State::kReady,
-                    dental::rtc_recovery::Reason::kNone});
-      Serial.println("RTC initialization: SUCCESS - retained time preserved");
-    }
+  Serial.println("LCD/RTC ownership: ATmega A4/A5 shared 100000 Hz I2C bus");
+  if (requestRtcBridgeAndWait(dental_link::kRtcStatusRequest,
+                              RtcBridgeRequest::kStatus)) {
+    Serial.print("ATmega RTC state: ");
+    Serial.println(dental::rtc_recovery::stateName(rtcStatus.state));
   } else {
-    setRtcStatus({dental::rtc_recovery::State::kUnavailable,
-                  dental::rtc_recovery::Reason::kCommunicationFailure});
-    Serial.println("RTC initialization: FAILED - DS3231 not responding");
+    Serial.println("ATmega RTC state: unavailable - controller response timeout");
   }
 
   microSdAvailable = initializeMicroSd();
@@ -2071,14 +2107,6 @@ void setup() {
   }
 
   initializeWiFi();
-  if (dental::hardware::kAtmegaLinkEnabled) {
-    atmegaSerial.begin(dental_link::kBaud, SERIAL_8N1,
-                      dental::hardware::kAtmegaLinkRxGpio,
-                      dental::hardware::kAtmegaLinkTxGpio);
-    Serial.println("ATmega link: UART1 ready / 9600 8N1");
-  } else {
-    Serial.println("ATmega link: DISABLED - confirm ESP32 RX/TX GPIO mapping");
-  }
 }
 
 void loop() {
@@ -2089,5 +2117,6 @@ void loop() {
   serviceWorkflowTimeouts(millis());
   serviceWiFi(millis());
   serviceAtmegaLink();
+  serviceRtcBridge(millis());
   delay(1UL);
 }

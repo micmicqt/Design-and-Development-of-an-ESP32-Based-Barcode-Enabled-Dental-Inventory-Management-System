@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../firmware-common/include/controller_link_protocol.h"
+#include <string.h>
 
 namespace dental {
 namespace controller_link {
@@ -12,15 +13,13 @@ class PingResponder {
   dental_link::Frame receive(uint8_t byte, Transmitter& transmitter) {
     atBoundary_ = byte == '\n';
     const dental_link::Frame frame = parser_.receive(byte);
-    if (frame == dental_link::Frame::kPing && remaining_ == 0U) {
-      remaining_ = sizeof(dental_link::kPong) - 1U;
-      position_ = 0U;
-    }
+    if (frame == dental_link::Frame::kPing) queueLine(dental_link::kPong);
     service(transmitter);
     return frame;
   }
 
   const char* barcode() const { return parser_.barcode(); }
+  const char* payload() const { return parser_.payload(); }
   void rejectPartialInput() {
     if (!atBoundary_) parser_.rejectUntilNewline();
   }
@@ -28,17 +27,29 @@ class PingResponder {
   template <typename Transmitter>
   void service(Transmitter& transmitter) {
     // Only one byte per call. Busy TX never stalls the existing state machine.
-    if (remaining_ != 0U && transmitter.tryWrite(
-            static_cast<uint8_t>(dental_link::kPong[position_]))) {
+    if (length_ != 0U && transmitter.tryWrite(
+            static_cast<uint8_t>(output_[position_]))) {
       ++position_;
-      --remaining_;
+      if (position_ == length_) length_ = position_ = 0U;
     }
   }
 
+  bool queueLine(const char* line) {
+    if (!line || length_ != 0U) return false;
+    const size_t length = strlen(line);
+    if (length == 0U || length >= sizeof(output_)) return false;
+    memcpy(output_, line, length);
+    length_ = static_cast<uint8_t>(length);
+    position_ = 0U;
+    return true;
+  }
+  bool busy() const { return length_ != 0U; }
+
  private:
   dental_link::LineParser parser_;
+  char output_[64] = {};
   uint8_t position_ = 0U;
-  uint8_t remaining_ = 0U;
+  uint8_t length_ = 0U;
   bool atBoundary_ = true;
 };
 

@@ -162,9 +162,10 @@ ESP32 processes at most 16 RX bytes per loop and checks TX capacity before
 writing. Only PING produces PONG; barcode frames also produce temporary USB debug lines.
 At most one five-byte reply is buffered; extra
 PINGs arriving while TX is busy are ignored rather than queued without bound.
-The responder has no inventory, FIFO, offline journal, RTC, MicroSD, HTTP or
-Electron callback. ESP32 routes typed operations outside the transport parser
-into the corresponding existing workflow (Step 3B).
+The Step 3 transport responder itself has no inventory, FIFO, offline journal,
+MicroSD, HTTP or Electron callback. Step 4B adds only bounded RTC bridge frames;
+ESP32 still routes typed operations outside the transport parser into the
+corresponding existing workflow (Step 3B).
 
 ### Completed Step 3C physical verification
 
@@ -205,8 +206,8 @@ only; it does not claim physical verification of the A1 transmit path.
 | D13 | PB5 | SPI SCK |
 | A0 | PC0 | GM65 RX into ATmega; physically verified |
 | A1 | PC1 | GM65 TX from ATmega; implemented, physical verification pending |
-| A4 | PC4 | LCD I2C SDA |
-| A5 | PC5 | LCD I2C SCL |
+| A4 | PC4 | Shared LCD + DS3231 I2C SDA |
+| A5 | PC5 | Shared LCD + DS3231 I2C SCL |
 
 ## Historical Step 3A: GM65 capture on USART0 (superseded)
 
@@ -256,7 +257,8 @@ Step 3A added no transaction routing into online FIFO, offline pending journal,
 CSV, inventory, SQLite or Electron. ESP32 direct GM65 UART remains disabled.
 Step 3B below moves physical buttons, mode selection and scan pairing to ATmega.
 At the Step 3B checkpoint, RTC, LCD and MicroSD remained on ESP32. Step 4A below
-now moves only LCD ownership; RTC/MicroSD and business processing stay there.
+moved LCD ownership first. Step 4B then moves RTC ownership to the same ATmega
+bus; MicroSD and business processing remain on ESP32.
 
 ## Step 3B: ATmega-owned physical operations
 
@@ -379,10 +381,10 @@ remain free from GM65 ownership.
 
 ## Step 4A: ATmega TWI and LCD bring-up (physically verified)
 
-The LCD now belongs exclusively to ATmega **A4 / PC4 SDA** and **A5 / PC5
-SCL**. ESP32 GPIO21/GPIO22 remain the **RTC-only, 3.3 V bus**. These buses must
-not be electrically joined. No RTC, SD, timestamp, offline-journal, sync or
-desktop ownership is migrated in this step.
+At the Step 4A checkpoint, the LCD moved exclusively to ATmega **A4 / PC4 SDA**
+and **A5 / PC5 SCL**, while the RTC temporarily stayed on ESP32 GPIO21/GPIO22.
+Step 4B below supersedes only that temporary RTC arrangement. MicroSD,
+offline-journal and desktop business processing remain on ESP32.
 
 `twi_master.h` implements a cooperative hardware-TWI master, with its AVR
 register adapter in `src/twi_master.cpp`. At 16 MHz, prescaler one and TWBR=72
@@ -430,8 +432,8 @@ ESP32's LCD object, dependency, address probe and writes are removed. Legacy
 feedback call sites remain an explicit no-op migration shim, preserving
 transaction timers, LED feedback and result/ACK processing without introducing
 new LCD transport. Startup, online and offline readiness no longer require an
-ESP32 LCD. The RTC still initializes on its original bus and retains all
-existing trust/recovery behavior.
+ESP32 LCD. At this historical checkpoint the RTC still initialized on its
+original bus; Step 4B redirects that same trust/recovery behavior to ATmega.
 
 ### Completed Step 4A physical verification
 
@@ -442,12 +444,14 @@ Inventory`, `ATmega Controller` and `LCD READY` at startup, then showed
 `RESTOCK WAIT` from a D2 operation and `CHECKOUT WAIT` from a D3 operation.
 The RTC remained on the independent ESP32 GPIO21/GPIO22 bus and was not
 migrated. This establishes ATmega LCD ownership and basic workflow display
-integration; final transaction-result screens remain deferred.
+integration at the Step 4A checkpoint; Step 4B below supersedes the temporary
+RTC wiring. Final transaction-result screens remain deferred.
 
 ### Wiring and future repeat procedure
 
-1. Power everything off before rewiring. Remove LCD SDA/SCL from ESP32 GPIO21/
-   GPIO22; leave RTC SDA/SCL and its 3.3 V supply there unchanged.
+1. These are the historical Step 4A instructions. Power everything off before
+   rewiring. Remove LCD SDA/SCL from ESP32 GPIO21/GPIO22; at this checkpoint the
+   RTC SDA/SCL and its 3.3 V supply remained there unchanged.
 2. Connect LCD SDA -> Uno A4, LCD SCL -> Uno A5, LCD GND -> common GND. For the
    5 V-rated 20x4 LCD/backpack, use regulated **5 V** for LCD VCC
    (Uno 5 V when Uno supplies this circuit). Confirm the module rating before
@@ -457,7 +461,7 @@ integration; final transaction-result screens remain deferred.
 3. Preserve GM65 TX -> A0 and A1 -> GM65 RX only after the electrical checks in
    Step 3C above. Keep D0/D1 disconnected from GM65. Preserve the D2/D3
    active-HIGH buttons with their external 10 kOhm pull-downs, the D6/D7
-   level-shifted controller link, status outputs and ESP32 RTC/SD.
+   level-shifted controller link, status outputs and ESP32 SD.
 4. Only when upload is explicitly authorized, use `pio run -e uno -t upload` on
    COM10. No scanner wire now competes with D0/D1. Update ESP32 firmware only
    with separate explicit authorization; power off before rewiring.
@@ -478,8 +482,8 @@ integration; final transaction-result screens remain deferred.
    Verify the core button/scanner/link path still works and ESP32 no longer
    reports LCD unavailable. Do not hot-remove powered wiring or MicroSD.
 
-Focused tests: `twi_master_test.cpp` (12 scenarios), `lcd_display_test.cpp`
-(15 scenarios), plus existing workflow/scanner/UART/status tests. LCD tests
+Focused tests: `twi_master_test.cpp` (13 scenarios), `lcd_display_test.cpp`
+(16 scenarios), plus existing workflow/scanner/UART/status tests. LCD tests
 cover startup timing, formatting, all row addresses, bounded copied text,
 clear, busy/NACK/timeouts, clock wrap, wait screens, latest-screen coalescing,
 explicit recovery and continued RESTOCK/CHECKOUT transport despite LCD failure.
@@ -488,6 +492,168 @@ guards, in addition to the existing controller/routing/event regressions.
 
 Hardware references: [Microchip ATmega328P datasheet](https://ww1.microchip.com/downloads/en/DeviceDoc/Atmel-7810-Automotive-Microcontrollers-ATmega328P_Datasheet.pdf)
 and [NXP PCF8574/PCF8574A datasheet](https://www.nxp.com/docs/en/data-sheet/PCF8574_PCF8574A.pdf).
+
+## Step 4B: ATmega-owned DS3231 RTC (physically verified)
+
+The DS3231 now shares the ATmega hardware-TWI bus with the LCD:
+
+| Device | Address | SDA | SCL | Bus rate |
+|---|---:|---|---|---:|
+| 20x4 LCD backpack | `0x27` | A4 / PC4 | A5 / PC5 | 100 kHz |
+| DS3231 RTC | `0x68` | A4 / PC4 | A5 / PC5 | 100 kHz |
+
+The bare-metal driver performs bounded register write/read transactions through
+the existing cooperative TWI master. It decodes and encodes BCD, supports valid
+12-hour reads and writes explicit 24-hour values, validates calendar dates from
+2000 through 2099, checks the DS3231 oscillator-stop flag, and rereads both the
+flag and timestamp after a controlled write. It never substitutes compile time
+or another invented timestamp. RTC failure is retained as `unavailable`,
+`needs_sync` (`lost_power`, `invalid_time`, or verification failure), or `ready`.
+An RTC NACK/error cannot block the LCD, and an LCD failure cannot block the RTC,
+buttons, scanner, controller link, or transaction processing.
+
+On every ATmega boot, the driver independently reads the physical DS3231 status
+register and retained calendar. OSF clear plus a valid retained date/time becomes
+`ready` immediately, without ESP32, Wi-Fi, backend, or Electron participation.
+Normal ATmega/ESP32 reboot, controller-link restart, desktop disconnect, and
+ONLINE/OFFLINE routing do not change that trust. `needs_sync` is reserved for a
+real OSF/lost-power indication, invalid retained calendar, or failed write
+verification; a communication failure is `unavailable`. A successful sync
+writes the DS3231, clears OSF while preserving other status bits, rereads both
+status and time, and therefore reconstructs `ready` from hardware on later boots.
+
+The shared TWI master permits only one transaction at a time and retains each
+completion until its initiating client consumes it. Repeated START reads and
+STOP completion remain inside the existing wrap-safe 20 ms deadline. This
+prevents the LCD and RTC clients from consuming one another's completion while
+preserving Step 4A's 100 kHz bus and cooperative main loop.
+
+RTC bridge frames on the existing fixed-buffer D6/D7 link are:
+
+```text
+RTC_STATUS?                     -> RTC_STATUS:<state>:<reason>
+RTC_TIME?                       -> RTC_TIME:YYYY-MM-DD HH:MM:SS
+RTC_SYNC:YYYY-MM-DD HH:MM:SS    -> RTC_SYNCED:<state>:<reason>
+```
+
+Each wire frame is terminated by `\n`.
+
+They coexist with PING/PONG, SCAN, RESTOCK and CHECKOUT without byte
+interleaving. The ESP32 uses a bounded 1.5-second bridge deadline and polls the
+ATmega state periodically. Existing `/status` fields remain compatible. The
+existing authenticated `POST /rtc/sync` endpoint still accepts only the
+backend-created epoch/UTC-offset request protected by the ignored device token;
+the renderer gains no arbitrary RTC-write capability. ESP32 converts the
+validated desktop time to a bounded local timestamp frame, and ATmega validates,
+writes and verifies it before reporting success.
+
+Transaction timestamp ownership is also complete in Step 4B without changing
+RESTOCK/CHECKOUT operation frames: immediately before CSV/event/journal work,
+ESP32 requests `RTC_TIME?` and uses only the validated ATmega/DS3231 response.
+If the RTC is not trusted or the controller response times out, the existing
+transaction error path runs. ESP32 no longer includes RTClib, initializes Wire,
+probes `0x68`, reads/writes DS3231 registers, or owns GPIO21/GPIO22 for RTC.
+ESP32's cached RTC status is informational only: every transaction asks the
+ATmega for `RTC_TIME?`, so a controller/link restart cannot require desktop sync
+when the DS3231 itself remains valid. The original RTC timestamp is stored in
+the existing online/offline record and is never replaced by later synchronization.
+
+The ATmega LCD idle screen now uses the same hardware time source:
+
+```text
+Dental Inventory
+YYYY-MM-DD
+HH:MM:SS
+SYSTEM READY
+```
+
+ATmega performs one bounded DS3231 refresh per second and rewrites only the LCD
+time row (plus the date row when the day changes); it never clears the screen for
+clock ticks. `RESTOCK WAIT` and `CHECKOUT WAIT` have explicit priority over the
+clock, then the clock returns after timeout/dispatch/cooldown. `RTC NEEDS SYNC`
+or `RTC UNAVAILABLE` replaces date/time when untrusted, so no fabricated time is
+shown. The refresh is cooperative and shares the same serialized TWI master.
+
+### Electrical source-of-truth note
+
+The repository still does not identify the exact DS3231 breakout, LCD backpack
+revision, onboard SDA/SCL resistor values, or their pull-up rails. The LCD was
+physically verified at regulated 5 V in Step 4A; the RTC was previously operated
+at 3.3 V. That does **not** prove that directly joining the two breakout buses is
+safe: a 5 V LCD pull-up can place 5 V on a 3.3 V-powered RTC board or an auxiliary
+EEPROM whose tolerance is unknown. AVR weak pull-ups are enabled by the retained
+TWI setup but are not a documented substitute for the modules' required external
+pull-ups.
+
+Before wiring, identify both exact board revisions and inspect/measure, with
+power off, which rail each onboard SDA/SCL pull-up reaches and the effective
+parallel resistance. Confirm the DS3231 board and every auxiliary device are
+rated for the chosen VCC and bus-high voltage. After selecting the arrangement
+supported by those module documents/final schematic, power it without the data
+lines connected and verify both supply rails, then connect the bus and measure
+idle SDA/SCL before attaching any voltage-sensitive controller. Do not add,
+remove, or choose pull-up/level-shifter values from this software document.
+
+### Completed Step 4B physical verification
+
+After the corrected Uno and ESP32 images were uploaded, a complete power cycle
+with Electron closed brought the retained DS3231 directly to `ready`. The LCD
+displayed `Dental Inventory`, retained date `2026-09-19`, an advancing
+`HH:MM:SS` clock and `SYSTEM READY`. This physically verifies standalone
+`DS3231 -> ATmega -> LCD` operation without desktop, backend, or Wi-Fi clock
+ownership.
+
+With Electron still closed, RESTOCK barcode `4806016001569` selected the
+existing OFFLINE route and passed RTC validation/timestamp retrieval. Processing
+then stopped only at `ERROR: MicroSD is unavailable; event was not started`;
+there was no RTC unavailable/untrusted error. Previously verified ONLINE
+RESTOCK and CHECKOUT scans of the same barcode likewise passed the ATmega RTC
+stage after authenticated desktop synchronization and stopped only at the
+currently unmigrated MicroSD dependency.
+
+The MicroSD error is expected and outside Step 4B. The next migration stage is
+**Step 5 — MicroSD / offline transaction storage migration**. It must restore
+the mandatory original offline storage behavior without moving RTC ownership
+back to ESP32.
+
+### Step 4B repeat procedure
+
+1. Do not upload yet. Power off the Uno, ESP32 and peripheral supply; do not
+   hot-move I2C or MicroSD wiring.
+2. Leave LCD SDA on A4 and LCD SCL on A5. Remove only DS3231 SDA/SCL from ESP32
+   GPIO21/GPIO22. Connect DS3231 SDA to the shared A4 node and DS3231 SCL to the
+   shared A5 node. Preserve common GND.
+3. Connect DS3231 VCC only to the rail proven safe by the exact breakout/final
+   schematic inspection above. Do not assume that its previous 3.3 V supply is
+   compatible with the LCD backpack's pull-ups, and do not assume 5 V solely
+   because the DS3231 IC itself supports it.
+4. With firmware still absent, power the bus and verify LCD at `0x27`, RTC at
+   `0x68`, and safe idle SDA/SCL voltage. Power off again before changing wires.
+5. Only after explicit upload authorization, build/upload the Uno and ESP32
+   images. Open ESP32 USB Serial at 115200. Expect ATmega-link readiness and an
+   RTC state of `ready`, `needs_sync`, or `unavailable`; there must be no ESP32
+   Wire/RTClib initialization.
+6. With Electron closed and Wi-Fi optional, verify a retained DS3231 with OSF
+   clear boots directly to `ready`; the LCD must show advancing date/time. Reset
+   ATmega and ESP32 separately and verify no new synchronization is requested.
+   Verify RESTOCK WAIT and CHECKOUT WAIT override the clock and return to it
+   after timeout/cooldown. An absent/NACKing RTC must leave LCD and scan workflows
+   usable; an absent/NACKing LCD must leave RTC state/sync reporting usable.
+7. If `/status` reports `needs_sync`, log into Electron and allow the existing
+   authenticated recovery coordinator to synchronize it. Confirm `/status`
+   becomes `rtc:true`, `rtcState:"ready"`, with no renderer clock-setting API.
+8. Close Electron and disconnect Wi-Fi without resetting the RTC. Perform a
+   separately authorized offline test transaction and confirm its original
+   stored timestamp matches the ATmega-owned DS3231. Reconnect later and confirm
+   synchronization does not replace that timestamp. Repeat an online transaction
+   if authorized. Preserve all existing FIFO/journal, result and ACK checks.
+   Until Step 5 migrates MicroSD, reaching the explicit MicroSD-unavailable
+   error after the RTC stage is the expected boundary rather than an RTC failure.
+
+Focused Step 4B coverage adds 16 DS3231, 9 RTC-link, 4 shared-bus, LCD clock/
+priority/failure-state coverage, one LCD cross-client deferral and one new TWI
+read/completion-ownership scenario, plus the existing LCD, workflow,
+scanner, UART, status, ESP32 controller-link and transaction regressions.
 
 ## Existing focused host tests
 

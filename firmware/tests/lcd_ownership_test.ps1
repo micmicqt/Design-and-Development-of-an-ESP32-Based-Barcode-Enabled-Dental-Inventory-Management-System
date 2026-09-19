@@ -14,7 +14,8 @@ if ($source -notmatch 'void showLcdScreen\(const String&, const String&, const S
 if ($source -notmatch 'return rtcAvailable && microSdAvailable &&\s*cacheMetadata.available &&\s*offlinePendingJournal.compatibleWith\(cacheMetadata\)') {
   throw 'Offline readiness must retain RTC/SD/cache/journal checks without an LCD gate'
 }
-if ($source -notmatch 'rtc.begin\(&Wire\)' -or $source -notmatch 'Wire.begin\(dental::hardware::kI2cSdaGpio') {
-  throw 'ESP32 RTC bus ownership was unexpectedly removed'
+if ($source -match 'rtc.begin\(&Wire\)' -or
+    $source -match 'Wire.begin\(dental::hardware::kI2cSdaGpio') {
+  throw 'Step 4B must not restore direct ESP32 RTC bus ownership'
 }
 Write-Output 'ESP32 active LCD ownership: 5 source-integration checks PASSED'

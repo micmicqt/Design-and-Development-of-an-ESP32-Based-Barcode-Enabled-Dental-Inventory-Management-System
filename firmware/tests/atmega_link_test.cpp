@@ -78,12 +78,45 @@ void confirmedPins() {
   assert(!dental::hardware::isExistingPeripheralGpio(17));
   assert(!dental::hardware::kScannerUartEnabled);
   assert(!dental::hardware::kEsp32LcdEnabled);
-  assert(dental::hardware::isExistingPeripheralGpio(21));
-  assert(dental::hardware::isExistingPeripheralGpio(22));
+  assert(!dental::hardware::kEsp32RtcEnabled);
+  assert(!dental::hardware::isExistingPeripheralGpio(21));
+  assert(!dental::hardware::isExistingPeripheralGpio(22));
   assert(!dental::hardware::isControllerLinkGpio(20));
   assert(!dental::hardware::isControllerLinkGpio(24));
   assert(!dental::hardware::isControllerLinkGpio(31));
   assert(!dental::hardware::isControllerLinkGpio(38));
+}
+void rtcFrames() {
+  PingResponder r; Writer w; dental_link::Frame frame = dental_link::Frame::kNone;
+  for (const char* p = "RTC_STATUS:needs_sync:lost_power\n"; *p; ++p)
+    frame = r.receive(*p, w);
+  assert(frame == dental_link::Frame::kRtcStatus);
+  assert(strcmp(r.payload(), "needs_sync:lost_power") == 0 && w.size == 0U);
+  for (const char* p = "RTC_TIME:2026-09-19 12:34:56\n"; *p; ++p)
+    frame = r.receive(*p, w);
+  assert(frame == dental_link::Frame::kRtcTime);
+  assert(strcmp(r.payload(), "2026-09-19 12:34:56") == 0);
+}
+void rtcRequestsAndSync() {
+  PingResponder r; Writer w; dental_link::Frame frame = dental_link::Frame::kNone;
+  for (const char* p = "RTC_STATUS?\n"; *p; ++p) frame = r.receive(*p, w);
+  assert(frame == dental_link::Frame::kRtcStatusRequest);
+  for (const char* p = "RTC_TIME?\n"; *p; ++p) frame = r.receive(*p, w);
+  assert(frame == dental_link::Frame::kRtcTimeRequest);
+  for (const char* p = "RTC_SYNC:2026-09-19 12:34:56\n"; *p; ++p)
+    frame = r.receive(*p, w);
+  assert(frame == dental_link::Frame::kRtcSync);
+  assert(strcmp(r.payload(), "2026-09-19 12:34:56") == 0);
+}
+void queuedRtcCommandDoesNotInterleavePong() {
+  PingResponder r; Writer w;
+  assert(r.queueLine("RTC_STATUS?\n"));
+  feed(r, w, "PING\n");
+  for (unsigned i = 0U; i < 100U; ++i) r.service(w);
+  assert(w.size == strlen("RTC_STATUS?\n"));
+  assert(memcmp(w.bytes, "RTC_STATUS?\n", w.size) == 0);
+  feed(r, w, "PING\n");
+  assert(w.size == strlen("RTC_STATUS?\nPONG\n"));
 }
 }
 void scanRecognition() {
@@ -129,5 +162,6 @@ int main() {
   pingPong(); malformed(); oversized(); busyTx(); fragmentedAndRepeated();
   noTransactionSideEffects(); exchange(); confirmedPins();
   scanRecognition(); scanZeroes(); badScans(); scanNoSideEffects(); scannerEndToEnd();
-  puts("ESP32 ATmega responder: 13 focused scenarios PASSED");
+  rtcFrames(); rtcRequestsAndSync(); queuedRtcCommandDoesNotInterleavePong();
+  puts("ESP32 ATmega responder: 16 focused scenarios PASSED");
 }

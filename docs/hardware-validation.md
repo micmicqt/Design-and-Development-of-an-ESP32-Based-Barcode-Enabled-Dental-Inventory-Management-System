@@ -101,6 +101,23 @@ button ownership.
 
 ## Shared I2C / LCD / DS3231 questions
 
+### ATmega Step 4B ownership update
+
+The software source of truth now assigns the LCD (`0x27`) and DS3231 (`0x68`)
+to the shared ATmega A4/PC4 SDA and A5/PC5 SCL bus at 100 kHz. ESP32 GPIO21/22
+are no longer active RTC pins. Shared-bus ownership, standalone retained-time
+boot, the advancing ATmega LCD clock, authenticated online synchronization, and
+offline RTC timestamp retrieval have all been physically verified. The current
+transaction boundary is the expected unmigrated MicroSD dependency; Step 5 owns
+MicroSD/offline-storage migration.
+
+The repository still does not contain the exact breakout revisions or pull-up
+values/rails, so the electrical questions below remain a required pre-power
+inspection. In particular, the Step 4A LCD was verified at 5 V while the RTC was
+previously powered at 3.3 V; those two facts alone do not prove that their SDA/
+SCL pull-ups may be joined safely. Do not infer resistor removal, replacement,
+or a level-shifter value without the exact module documentation/final schematic.
+
 - What are the exact LCD backpack/controller and DS3231 module part numbers?
 - What supply voltage is used by each module on the assembled PCB?
 - Which modules contain SDA/SCL pull-ups, what are their values, and to which voltage rail are they connected?

@@ -2,6 +2,8 @@
 #include "hardware_config.h"
 #include "physical_workflow.h"
 #include "twi_master.h"
+#include "../../firmware-common/include/rtc_link_protocol.h"
+#include <stdio.h>
 #include <string.h>
 
 namespace dental_atmega {
@@ -38,7 +40,8 @@ class Display {
     if (state_ == State::kFailed) return;
     if (pending_) {
       if (bus_.busy()) return;
-      if (bus_.result() != twi::Result::kSuccess) { fail(bus_.result()); return; }
+      const twi::Result result = bus_.takeResult();
+      if (result != twi::Result::kSuccess) { fail(result); return; }
       pending_ = false; since_ = now;
       if (state_ == State::kInitializing) {
         // Reset expander, 3/3/3/2 nibble handshake, 28/08/01/06/0C commands.
@@ -46,6 +49,10 @@ class Display {
       }
       return;
     }
+    // Another shared-bus client (currently the RTC) owns this transfer or its
+    // completion. Defer rather than misclassifying normal serialization as an
+    // LCD failure; the initiating client must consume its own completion.
+    if (bus_.busy() || bus_.completionPending()) return;
     if (static_cast<uint32_t>(now - since_) < delay_) return;
     if (state_ == State::kInitializing) {
       if (init_ == 10U) { state_ = State::kReady; return; }
@@ -83,7 +90,11 @@ class Display {
     return true;
   }
   bool available() const { return state_ == State::kReady; }
-  bool busy() const { return state_ == State::kInitializing || pending_ || operation_ != Operation::kNone; }
+  bool busy() const {
+    return state_ == State::kInitializing || pending_ ||
+        operation_ != Operation::kNone || bus_.busy() ||
+        bus_.completionPending();
+  }
   State state() const { return state_; }
   twi::Result error() const { return error_; }
  private:
@@ -111,15 +122,46 @@ class Display {
   twi::Result error_ = twi::Result::kIdle;
 };
 
-enum class Screen : uint8_t { kReady, kRestockWait, kCheckoutWait };
-inline Screen screenFor(PhysicalState state) {
-  return state == PhysicalState::kWaitingRestockScan ? Screen::kRestockWait :
-         state == PhysicalState::kWaitingCheckoutScan ? Screen::kCheckoutWait : Screen::kReady;
+enum class Screen : uint8_t {
+  kClock, kRtcNeedsSync, kRtcUnavailable, kRestockWait, kCheckoutWait
+};
+inline Screen screenFor(PhysicalState state, dental_link::rtc::State rtcState) {
+  if (state == PhysicalState::kWaitingRestockScan) return Screen::kRestockWait;
+  if (state == PhysicalState::kWaitingCheckoutScan) return Screen::kCheckoutWait;
+  return rtcState == dental_link::rtc::State::kReady ? Screen::kClock :
+      rtcState == dental_link::rtc::State::kNeedsSync ? Screen::kRtcNeedsSync :
+      Screen::kRtcUnavailable;
 }
-inline void screenLine(Screen screen, uint8_t row, char* out) {
-  const char* text = row == 0U ? "Dental Inventory" : row == 1U ? "ATmega Controller" :
-      row == 2U ? (screen == Screen::kRestockWait ? "RESTOCK WAIT" :
-                   screen == Screen::kCheckoutWait ? "CHECKOUT WAIT" : "LCD READY") : "";
+inline void screenLine(Screen screen, uint8_t row,
+                       const dental_link::rtc::DateTime& time, char* out) {
+  char formatted[21] = {};
+  const char* text = "";
+  if (row == 0U) text = "Dental Inventory";
+  else if (screen == Screen::kClock && row == 1U) {
+    snprintf(formatted, sizeof(formatted), "%04u-%02u-%02u",
+        static_cast<unsigned>(time.year), static_cast<unsigned>(time.month),
+        static_cast<unsigned>(time.day));
+    text = formatted;
+  } else if (screen == Screen::kClock && row == 2U) {
+    snprintf(formatted, sizeof(formatted), "%02u:%02u:%02u",
+        static_cast<unsigned>(time.hour), static_cast<unsigned>(time.minute),
+        static_cast<unsigned>(time.second));
+    text = formatted;
+  } else if (screen == Screen::kClock && row == 3U) text = "SYSTEM READY";
+  else if (screen == Screen::kRtcNeedsSync && row == 1U)
+    text = "RTC NEEDS SYNC";
+  else if (screen == Screen::kRtcUnavailable && row == 1U)
+    text = "RTC UNAVAILABLE";
+  else if (row == 1U && (screen == Screen::kRestockWait ||
+                         screen == Screen::kCheckoutWait))
+    text = "ATmega Controller";
+  else if (screen == Screen::kRestockWait && row == 2U)
+    text = "RESTOCK WAIT";
+  else if (screen == Screen::kCheckoutWait && row == 2U)
+    text = "CHECKOUT WAIT";
+  else if ((screen == Screen::kRtcNeedsSync ||
+            screen == Screen::kRtcUnavailable) && row == 3U)
+    text = "SYSTEM READY";
   memset(out, ' ', kColumns);
   for (uint8_t i = 0U; i < kColumns && text[i]; ++i) out[i] = text[i];
 }
@@ -129,27 +171,49 @@ inline void screenLine(Screen screen, uint8_t row, char* out) {
 class WorkflowScreen {
  public:
   template <typename Lcd>
-  void service(uint32_t now, PhysicalState state, Lcd& display) {
+  void service(uint32_t now, PhysicalState state,
+               dental_link::rtc::State rtcState,
+               const dental_link::rtc::DateTime& rtcTime, Lcd& display) {
     display.service(now);
     if (!display.available()) { started_ = false; return; }
     if (display.busy()) return;
-    const Screen desired = screenFor(state);
+    const Screen desired = screenFor(state, rtcState);
     if (!started_ || desired != screen_) {
-      started_ = true; screen_ = desired; step_ = 0U;
+      started_ = true; screen_ = desired; step_ = 0U; endStep_ = 8U;
+      renderTime_ = rtcTime; renderedTimeValid_ = false;
+    } else if (screen_ == Screen::kClock && step_ >= endStep_) {
+      const uint32_t next = dental_link::rtc::secondsSince2000(rtcTime);
+      if (!renderedTimeValid_ || next != renderedSeconds_) {
+        renderTime_ = rtcTime;
+        const bool dateChanged = !renderedTimeValid_ ||
+            next / 86400UL != renderedSeconds_ / 86400UL;
+        step_ = dateChanged ? 2U : 4U;
+        endStep_ = 6U; // Update date when needed and time once per RTC second.
+      }
     }
-    if (step_ >= 8U) return;
+    if (step_ >= endStep_) return;
     const uint8_t row = step_ / 2U;
     if ((step_ & 1U) == 0U) {
       if (display.setCursor(now, 0U, row)) ++step_;
     } else {
-      char text[kColumns]; screenLine(screen_, row, text);
-      if (display.write(now, text, kColumns)) ++step_;
+      char text[kColumns]; screenLine(screen_, row, renderTime_, text);
+      if (display.write(now, text, kColumns)) {
+        ++step_;
+        if (screen_ == Screen::kClock && step_ >= endStep_) {
+          renderedSeconds_ = dental_link::rtc::secondsSince2000(renderTime_);
+          renderedTimeValid_ = true;
+        }
+      }
     }
   }
  private:
-  Screen screen_ = Screen::kReady;
+  dental_link::rtc::DateTime renderTime_ = {};
+  uint32_t renderedSeconds_ = 0UL;
+  Screen screen_ = Screen::kRtcUnavailable;
   uint8_t step_ = 0U;
+  uint8_t endStep_ = 8U;
   bool started_ = false;
+  bool renderedTimeValid_ = false;
 };
 } // namespace lcd
 } // namespace dental_atmega

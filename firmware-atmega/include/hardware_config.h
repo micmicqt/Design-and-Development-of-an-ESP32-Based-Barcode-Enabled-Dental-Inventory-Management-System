@@ -5,10 +5,11 @@
 namespace dental_atmega {
 namespace hardware {
 
-constexpr uint8_t kTwiSdaBit = 4U; // PC4 / Uno A4, LCD only (RTC stays ESP32).
+constexpr uint8_t kTwiSdaBit = 4U; // PC4 / Uno A4, shared LCD + DS3231 SDA.
 constexpr uint8_t kTwiSclBit = 5U; // PC5 / Uno A5.
 constexpr uint8_t kTwiMask = (1U << kTwiSdaBit) | (1U << kTwiSclBit);
 constexpr uint8_t kLcdAddress = 0x27U;
+constexpr uint8_t kRtcAddress = 0x68U;
 constexpr uint8_t kScannerRxBit = 0U; // PC0 / Uno A0: GM65 TX -> ATmega RX.
 constexpr uint8_t kScannerTxBit = 1U; // PC1 / Uno A1: ATmega TX -> GM65 RX.
 constexpr uint8_t kScannerMask = (1U << kScannerRxBit) | (1U << kScannerTxBit);

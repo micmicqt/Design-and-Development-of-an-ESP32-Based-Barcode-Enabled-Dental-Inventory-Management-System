@@ -12,6 +12,12 @@ constexpr uint8_t kMaximumBarcodeLength = 64U;
 constexpr char kScanPrefix[] = "SCAN:";
 constexpr char kRestockPrefix[] = "RESTOCK:";
 constexpr char kCheckoutPrefix[] = "CHECKOUT:";
+constexpr char kRtcStatusRequest[] = "RTC_STATUS?\n";
+constexpr char kRtcTimeRequest[] = "RTC_TIME?\n";
+constexpr char kRtcStatusPrefix[] = "RTC_STATUS:";
+constexpr char kRtcTimePrefix[] = "RTC_TIME:";
+constexpr char kRtcSyncPrefix[] = "RTC_SYNC:";
+constexpr char kRtcSyncResultPrefix[] = "RTC_SYNCED:";
 constexpr uint8_t kMaximumLineLength = 9U + kMaximumBarcodeLength;
 
 inline bool validBarcode(const char* text, uint8_t length) {
@@ -25,7 +31,11 @@ inline bool validBarcode(const char* text, uint8_t length) {
   return visible;
 }
 
-enum class Frame : uint8_t { kNone, kPing, kPong, kScan, kRestock, kCheckout, kRejected };
+enum class Frame : uint8_t {
+  kNone, kPing, kPong, kScan, kRestock, kCheckout,
+  kRtcStatusRequest, kRtcStatus, kRtcTimeRequest, kRtcTime, kRtcSync,
+  kRtcSyncResult, kRejected
+};
 
 inline const char* barcodePrefix(Frame frame) {
   return frame == Frame::kScan ? kScanPrefix :
@@ -40,6 +50,8 @@ class LineParser {
   void rejectUntilNewline() { rejected_ = true; }
   // Read immediately after kScan; next receive may overwrite this storage.
   const char* barcode() const { return buffer_ + barcodeOffset_; }
+  // Read immediately after a payload-bearing RTC frame.
+  const char* payload() const { return buffer_ + payloadOffset_; }
 
   Frame receive(uint8_t byte) {
     if (byte == '\n') {
@@ -52,6 +64,12 @@ class LineParser {
         else if (matchesBarcodePrefix(kScanPrefix, 5U)) frame = Frame::kScan;
         else if (matchesBarcodePrefix(kRestockPrefix, 8U)) frame = Frame::kRestock;
         else if (matchesBarcodePrefix(kCheckoutPrefix, 9U)) frame = Frame::kCheckout;
+        else if (strcmp(buffer_, "RTC_STATUS?") == 0) frame = Frame::kRtcStatusRequest;
+        else if (strcmp(buffer_, "RTC_TIME?") == 0) frame = Frame::kRtcTimeRequest;
+        else if (matchesPayloadPrefix(kRtcStatusPrefix, 11U)) frame = Frame::kRtcStatus;
+        else if (matchesPayloadPrefix(kRtcTimePrefix, 9U)) frame = Frame::kRtcTime;
+        else if (matchesPayloadPrefix(kRtcSyncPrefix, 9U)) frame = Frame::kRtcSync;
+        else if (matchesPayloadPrefix(kRtcSyncResultPrefix, 11U)) frame = Frame::kRtcSyncResult;
       }
       reset();
       return frame;
@@ -77,8 +95,14 @@ class LineParser {
     barcodeOffset_ = offset;
     return true;
   }
+  bool matchesPayloadPrefix(const char* prefix, uint8_t offset) {
+    if (length_ <= offset || memcmp(buffer_, prefix, offset) != 0) return false;
+    payloadOffset_ = offset;
+    return true;
+  }
   char buffer_[kMaximumLineLength + 1U] = {};
   uint8_t barcodeOffset_ = 0U;
+  uint8_t payloadOffset_ = 0U;
   uint8_t length_ = 0U;
   bool rejected_ = false;
   bool carriageReturn_ = false;

@@ -83,6 +83,7 @@ class PhysicalWorkflow {
     }
   }
   PhysicalState state() const { return state_; }
+  bool controllerTransmissionActive() const { return transport_.active(); }
 
  private:
   bool waiting() const {
