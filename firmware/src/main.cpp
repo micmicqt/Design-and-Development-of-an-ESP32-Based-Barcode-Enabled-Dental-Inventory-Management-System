@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <HardwareSerial.h>
-#include <LiquidCrystal_I2C.h>
 #include <RTClib.h>
 #include <SD.h>
 #include <SPI.h>
@@ -32,8 +31,8 @@ constexpr uint32_t kMicroSdRetryDelayMs = 250UL;
 constexpr uint32_t kBarcodeTimeoutMs = 10000UL;
 constexpr uint32_t kBarcodeIdleTimeoutMs = 100UL;
 constexpr uint32_t kIndicatorFeedbackMs = 1000UL;
-constexpr uint32_t kLcdFeedbackMs = 2000UL;
-constexpr uint32_t kCommittedResultLcdFeedbackMs = 4000UL;
+constexpr uint32_t kWorkflowFeedbackMs = 2000UL;
+constexpr uint32_t kCommittedResultFeedbackMs = 4000UL;
 constexpr size_t kMaximumBarcodeLength = 256U;
 constexpr uint16_t kHttpServerPort = 80U;
 constexpr uint32_t kWiFiConnectionTimeoutMs = 15000UL;
@@ -123,9 +122,6 @@ enum class WiFiConnectionState : uint8_t {
 static_assert(kMaximumBarcodeLength == dental::events::kMaximumBarcodeLength,
               "The delivery queue must preserve the complete scanner barcode.");
 
-LiquidCrystal_I2C lcd(dental::hardware::kLcdI2cAddress,
-                      dental::hardware::kLcdColumnCount,
-                      dental::hardware::kLcdRowCount);
 RTC_DS3231 rtc;
 HardwareSerial atmegaSerial(1);
 dental::controller_link::PingResponder atmegaResponder;
@@ -158,7 +154,6 @@ void serviceAtmegaLink() {
 }
 WebServer httpServer(kHttpServerPort);
 
-bool lcdAvailable = false;
 bool rtcAvailable = false;
 bool microSdAvailable = false;
 dental::rtc_recovery::Status rtcStatus = {
@@ -405,27 +400,10 @@ StockStatus toEventStockStatus(dental::cache::StockStatus status) {
   return StockStatus::kEmpty;
 }
 
-void writePaddedLcdLine(uint8_t row, const String& text) {
-  if (!lcdAvailable) {
-    return;
-  }
-
-  char paddedLine[dental::hardware::kLcdColumnCount + 1U];
-  snprintf(paddedLine, sizeof(paddedLine), "%-20.20s", text.c_str());
-  lcd.setCursor(0, row);
-  lcd.print(paddedLine);
-}
-
-void showLcdScreen(const String& line1, const String& line2,
-                   const String& line3, const String& line4) {
-  writePaddedLcdLine(0U, line1);
-  writePaddedLcdLine(1U, line2);
-  writePaddedLcdLine(2U, line3);
-  writePaddedLcdLine(3U, line4);
-}
-
-void showInitializationScreen() {
-  showLcdScreen("Any Time Dental", "Inventory System", "Initializing...", "");
+// Migration boundary: LCD now belongs to ATmega PC4/PC5. Retain legacy
+// feedback call sites as a no-op until final result-screen transport migrates;
+// no ESP32 I2C access, LCD prerequisite or new controller protocol is added.
+void showLcdScreen(const String&, const String&, const String&, const String&) {
 }
 
 void showIdleScreen() {
@@ -470,7 +448,7 @@ bool offlineTransactionIsActive() {
 bool offlineOperationIsReady() {
   const dental::cache::CacheMetadata& cacheMetadata =
       offlineInventoryCache.metadata();
-  return lcdAvailable && rtcAvailable && microSdAvailable &&
+  return rtcAvailable && microSdAvailable &&
          cacheMetadata.available &&
          offlinePendingJournal.compatibleWith(cacheMetadata);
 }
@@ -707,7 +685,7 @@ void handleRtcSyncRequest() {
   setRtcStatus({dental::rtc_recovery::State::kReady,
                 dental::rtc_recovery::Reason::kNone});
   Serial.println("RTC synchronization: SUCCESS - desktop time verified");
-  if (workflowState == WorkflowState::kIdle && lcdAvailable) {
+  if (workflowState == WorkflowState::kIdle) {
     showIdleScreen();
   }
   sendRtcSyncSuccess(false);
@@ -1845,10 +1823,6 @@ void beginTransactionWorkflow(const TransactionProfile& transaction) {
   showLcdScreen(activeTransaction->modeTitle, "Scanner starting...",
                 "Scan barcode", "Please wait");
 
-  if (!lcdAvailable) {
-    beginErrorFeedback("LCD is unavailable", "LCD unavailable");
-    return;
-  }
   if (!rtcAvailable) {
     if (rtcStatus.state == dental::rtc_recovery::State::kNeedsSync) {
       beginErrorFeedback("RTC time is untrusted; event was not started",
@@ -1899,7 +1873,7 @@ void serviceWorkflowTimeouts(uint32_t nowMs) {
       committedResultIndicatorIsOn = false;
     }
 
-    if (elapsedMs >= kCommittedResultLcdFeedbackMs) {
+    if (elapsedMs >= kCommittedResultFeedbackMs) {
       setTransactionIndicatorOff();
       committedResultIndicatorIsOn = false;
       workflowState = WorkflowState::kIdle;
@@ -1934,7 +1908,7 @@ void serviceWorkflowTimeouts(uint32_t nowMs) {
       feedbackIndicatorIsOn = false;
     }
 
-    if (elapsedMs >= kLcdFeedbackMs) {
+    if (elapsedMs >= kWorkflowFeedbackMs) {
       setTransactionIndicatorOff();
       feedbackIndicatorIsOn = false;
       drainScannerInput();
@@ -2001,16 +1975,7 @@ void setup() {
     Serial.println("I2C initialization: SUCCESS - GPIO21/GPIO22 at 100000 Hz");
   }
 
-  if (wireInitialized &&
-      i2cAddressResponds(dental::hardware::kLcdI2cAddress)) {
-    lcd.init();
-    lcd.backlight();
-    lcdAvailable = true;
-    showInitializationScreen();
-    Serial.println("LCD initialization: SUCCESS - 0x27 / 20x4");
-  } else {
-    Serial.println("LCD initialization: FAILED - no response at 0x27");
-  }
+  Serial.println("LCD ownership: ATmega A4/A5 - ESP32 LCD access disabled");
 
   if (wireInitialized && rtc.begin(&Wire)) {
     uint8_t statusRegister = 0U;
@@ -2088,10 +2053,7 @@ void setup() {
   Serial.println(
       "GM65 initialization: DISABLED - scanner migration pending");
 
-  if (!lcdAvailable) {
-    beginErrorFeedback("Initialization failed: LCD unavailable",
-                       "LCD unavailable");
-  } else if (rtcStatus.state ==
+  if (rtcStatus.state ==
              dental::rtc_recovery::State::kUnavailable) {
     beginErrorFeedback("Initialization failed: RTC unavailable",
                        "RTC unavailable");

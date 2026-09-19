@@ -77,6 +77,7 @@ void confirmedPins() {
   assert(!dental::hardware::isExistingPeripheralGpio(16));
   assert(!dental::hardware::isExistingPeripheralGpio(17));
   assert(!dental::hardware::kScannerUartEnabled);
+  assert(!dental::hardware::kEsp32LcdEnabled);
   assert(dental::hardware::isExistingPeripheralGpio(21));
   assert(dental::hardware::isExistingPeripheralGpio(22));
   assert(!dental::hardware::isControllerLinkGpio(20));

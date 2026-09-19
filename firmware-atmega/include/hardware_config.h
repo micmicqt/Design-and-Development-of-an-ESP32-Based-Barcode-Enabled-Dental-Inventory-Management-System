@@ -5,6 +5,11 @@
 namespace dental_atmega {
 namespace hardware {
 
+constexpr uint8_t kTwiSdaBit = 4U; // PC4 / Uno A4, LCD only (RTC stays ESP32).
+constexpr uint8_t kTwiSclBit = 5U; // PC5 / Uno A5.
+constexpr uint8_t kTwiMask = (1U << kTwiSdaBit) | (1U << kTwiSclBit);
+constexpr uint8_t kLcdAddress = 0x27U;
+
 // AVR port bits are authoritative; Arduino numbers are documentation only.
 constexpr uint8_t kSmallInputABit = 5U;  // PD5 / Arduino D5
 constexpr uint8_t kSmallInputBBit = 4U;  // PD4 / Arduino D4

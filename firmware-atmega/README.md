@@ -178,8 +178,8 @@ is covered by automated tests only. No new diagnostic behavior was added.
 Step 3A added no transaction routing into online FIFO, offline pending journal,
 CSV, inventory, SQLite or Electron. ESP32 direct GM65 UART remains disabled.
 Step 3B below moves physical buttons, mode selection and scan pairing to ATmega.
-RTC, LCD, MicroSD and the existing business-processing paths remain on ESP32
-until their later migration steps.
+At the Step 3B checkpoint, RTC, LCD and MicroSD remained on ESP32. Step 4A below
+now moves only LCD ownership; RTC/MicroSD and business processing stay there.
 
 ## Step 3B: ATmega-owned physical operations
 
@@ -249,10 +249,10 @@ Runtime scanner wiring was receive-only: GM65 TX -> D0; D1 -> GM65 RX
 remains disconnected. D1 may be reconsidered only during a dedicated future
 scanner command/trigger implementation with electrical verification.
 Temporary DBG frames, queues, handlers and diagnostic-only tests are removed;
-concise operation logs remain. The existing "LCD unavailable" message is outside
-Step 3B and is not treated as a Step 3B failure. This checkpoint records the
-reported physical ONLINE verification, not new offline or leading-zero physical
-verification.
+concise operation logs remain. The historical "LCD unavailable" message was
+outside Step 3B; Step 4A below removes that legacy ESP32 prerequisite. This
+checkpoint records the reported physical ONLINE verification, not new offline
+or leading-zero physical verification.
 
 ### Step 3B physical procedure (future repeat testing only)
 
@@ -265,9 +265,9 @@ verification.
    do not inject Uno USB serial bytes into the GM65 hardware UART.
 2. With Electron authenticated and hardware healthy, briefly press/release
    ATmega D2 RESTOCK, then scan a known barcode within ten seconds. Expect one
-   `ATmega RESTOCK RX: <barcode>` line, existing saved-event LCD/LED feedback,
-   and one desktop event/dialog. The LCD cannot show the ATmega scan-wait state
-   before forwarding because no arm notification is implemented.
+   `ATmega RESTOCK RX: <barcode>` line, LED feedback and one desktop event/dialog.
+   With Step 4A firmware, the ATmega LCD shows local scan-wait feedback before
+   forwarding; final saved/result LCD screens are deferred to a later step.
    Complete through the existing desktop confirmation/result/ACK flow if a real
    stock change is intended. Repeat separately with ATmega D3 CHECKOUT and
    expect `ATmega CHECKOUT RX: <barcode>`.
@@ -312,7 +312,119 @@ SCAN frames; use the Step 3B procedure above for typed stock operations.
 6. Verify inventory/history/pending-event counts do not change. This is receive/
    forward bring-up only, not a stock transaction or desktop registration flow.
 
-## Focused host tests
+## Step 4A: ATmega TWI and LCD bring-up (physically verified)
+
+The LCD now belongs exclusively to ATmega **A4 / PC4 SDA** and **A5 / PC5
+SCL**. ESP32 GPIO21/GPIO22 remain the **RTC-only, 3.3 V bus**. These buses must
+not be electrically joined. No RTC, SD, timestamp, offline-journal, sync or
+desktop ownership is migrated in this step.
+
+`twi_master.h` implements a cooperative hardware-TWI master, with its AVR
+register adapter in `src/twi_master.cpp`. At 16 MHz, prescaler one and TWBR=72
+produce 100 kHz. Only PC4/PC5 direction/pull-up bits are changed. Each write
+copies at most six bytes and services one ready hardware state per main-loop
+iteration. There are no polling waits, TWI interrupts, interrupt-disabled
+sections or timer changes. Timer1 software UART, Timer0 clock and USART0
+interrupts keep running. Every transfer, including STOP completion, has a
+wrap-safe 20 ms total deadline. Address/data NACK, arbitration loss, bus error,
+invalid requests and timeout are explicit results. Arbitration loss releases
+the bus without STOP; timeout resets only TWI. A permanently stuck external bus
+is not forcibly clocked or retried indefinitely.
+
+`lcd_display.h` drives the existing PCF8574-style backpack at **0x27 / 20x4**.
+The repository's previously used mapping is RS=P0, RW=P1, E=P2, backlight=P3,
+D4..D7=P4..P7. RW stays LOW. The driver performs the delayed 3/3/3/2 nibble
+initialization handshake, function/display/clear/entry commands and then
+supports clear, checked cursor positioning (00/40/14/54 row offsets) and up to
+20 copied printable characters, bounded by remaining row width. All delays
+are cooperative millisecond settling deadlines, not blocking delays. Screen
+updates are padded row writes, not repeated clears.
+
+The temporary bring-up screen is:
+
+```text
+Dental Inventory
+ATmega Controller
+LCD READY
+```
+
+While ATmega is armed, line 3 changes to `RESTOCK WAIT` or `CHECKOUT WAIT`.
+It returns to the bring-up screen after dispatch/timeout. Final transaction
+result/error screens are **not migrated yet**. LCD READY means initialization
+writes were acknowledged by the backpack, not proof that the glass displays
+characters or the contrast setting is correct.
+
+LCD failure is retained in `Display::state()/error()` and the actual firmware's
+`lcdState` / `lcdLastError` globals. No debug traffic is sent on D0/D1 or on the
+controller link. A failure stops LCD writes until reinitialization/reset, but
+does not gate buttons, scanner capture or frame transport. An explicitly
+restarted initialization resets the logical cursor and repaints the desired
+screen. There is no automatic unlimited recovery loop.
+
+ESP32's LCD object, dependency, address probe and writes are removed. Legacy
+feedback call sites remain an explicit no-op migration shim, preserving
+transaction timers, LED feedback and result/ACK processing without introducing
+new LCD transport. Startup, online and offline readiness no longer require an
+ESP32 LCD. The RTC still initializes on its original bus and retains all
+existing trust/recovery behavior.
+
+### Completed Step 4A physical verification
+
+Step 4A passed on real hardware with LCD SDA -> Uno A4 / PC4, LCD SCL ->
+Uno A5 / PC5, LCD VCC -> regulated 5 V and LCD GND -> common GND. The backpack
+responded at 0x27 on the 100 kHz ATmega bus. The display showed `Dental
+Inventory`, `ATmega Controller` and `LCD READY` at startup, then showed
+`RESTOCK WAIT` from a D2 operation and `CHECKOUT WAIT` from a D3 operation.
+The RTC remained on the independent ESP32 GPIO21/GPIO22 bus and was not
+migrated. This establishes ATmega LCD ownership and basic workflow display
+integration; final transaction-result screens remain deferred.
+
+### Wiring and future repeat procedure
+
+1. Power everything off before rewiring. Remove LCD SDA/SCL from ESP32 GPIO21/
+   GPIO22; leave RTC SDA/SCL and its 3.3 V supply there unchanged.
+2. Connect LCD SDA -> Uno A4, LCD SCL -> Uno A5, LCD GND -> common GND. For the
+   5 V-rated 20x4 LCD/backpack, use regulated **5 V** for LCD VCC
+   (Uno 5 V when Uno supplies this circuit). Confirm the module rating before
+   changing its supply. Backpack pull-ups belong only to this ATmega bus;
+   internal AVR weak pull-ups are not a substitute for external bus pull-ups.
+   Do not join independent 5 V supply outputs or connect this bus to ESP32.
+3. Preserve GM65 TX -> D0, with **D1 -> GM65 RX disconnected**. Preserve D2/D3
+   active-LOW buttons, D6/D7 level-shifted controller link to ESP32 GPIO17/16,
+   all status outputs and ESP32 RTC/SD wiring.
+4. Only when upload is explicitly authorized: isolate GM65 TX from D0 for the
+   normal Uno bootloader upload, keep D1 free and use `pio run -e uno -t upload`
+   on COM10. Update ESP32 firmware only with separate explicit authorization.
+   Power off before restoring scanner wiring.
+5. Boot and verify the three startup lines and blank fourth row; adjust LCD
+   contrast if necessary. Open ESP32 USB Serial at 115200 only, not Uno Serial.
+   Check RTC/Wi-Fi/HTTP startup, and the LCD ownership migration message.
+6. Press/release D2: verify RESTOCK WAIT. Do not scan yet; after 10 seconds it
+   returns to ready. Press/release D3 after release/rearm: verify CHECKOUT WAIT
+   and the same timeout recovery. Verify controller PING/PONG and scanner
+   reception still operate while LCD updates. Host tests cannot prove ISR
+   latency margins; verify these on the physical system.
+7. If a real transaction is explicitly authorized, scan a known item after
+   arming and verify the existing ESP32 ONLINE/OFFLINE route and result/ACK
+   behavior. This can change stock/journal state; it is not required for the
+   initial display-only bring-up. Do not synchronize pending offline records
+   merely to test the LCD. Final LCD result screens remain deferred.
+8. For an absent-LCD check, power off, disconnect only the LCD, then boot.
+   Verify the core button/scanner/link path still works and ESP32 no longer
+   reports LCD unavailable. Do not hot-remove powered wiring or MicroSD.
+
+Focused tests: `twi_master_test.cpp` (12 scenarios), `lcd_display_test.cpp`
+(15 scenarios), plus existing workflow/scanner/UART/status tests. LCD tests
+cover startup timing, formatting, all row addresses, bounded copied text,
+clear, busy/NACK/timeouts, clock wrap, wait screens, latest-screen coalescing,
+explicit recovery and continued RESTOCK/CHECKOUT transport despite LCD failure.
+Run `firmware/tests/lcd_ownership_test.ps1` for active ESP32 source integration
+guards, in addition to the existing controller/routing/event regressions.
+
+Hardware references: [Microchip ATmega328P datasheet](https://ww1.microchip.com/downloads/en/DeviceDoc/Atmel-7810-Automotive-Microcontrollers-ATmega328P_Datasheet.pdf)
+and [NXP PCF8574/PCF8574A datasheet](https://www.nxp.com/docs/en/data-sheet/PCF8574_PCF8574A.pdf).
+
+## Existing focused host tests
 
 `tests/status_encoding_test.cpp` tests all seven states, the reserved Big 01
 exclusion, startup OFF defaults, determinism, invalid-value fail-OFF, and masked

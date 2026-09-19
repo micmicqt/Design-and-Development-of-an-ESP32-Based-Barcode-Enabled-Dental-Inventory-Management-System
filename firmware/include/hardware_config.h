@@ -9,12 +9,12 @@
 namespace dental {
 namespace hardware {
 
-// Verified Phase 3 breadboard LCD/RTC I2C bus (both modules powered at 3.3 V).
+// RTC-only ESP32 I2C bus, 3.3 V. LCD now belongs to ATmega A4/A5 on a
+// physically separate bus; never join its pull-ups to these ESP32 pins.
 static constexpr uint8_t kI2cSdaGpio = 21;
 static constexpr uint8_t kI2cSclGpio = 22;
-static constexpr uint8_t kLcdI2cAddress = 0x27;
-static constexpr uint8_t kLcdColumnCount = 20;
-static constexpr uint8_t kLcdRowCount = 4;
+static constexpr bool kEsp32LcdEnabled = false;
+static_assert(!kEsp32LcdEnabled, "LCD is ATmega-owned");
 static constexpr uint8_t kDs3231I2cAddress = 0x68;
 
 // Verified Phase 3 breadboard MicroSD SPI nets. The tested module is powered

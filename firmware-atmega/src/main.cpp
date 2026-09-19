@@ -3,6 +3,7 @@
 #include "uart_link.h"
 #include "physical_workflow.h"
 #include "scanner_uart.h"
+#include "lcd_display.h"
 
 #include <avr/interrupt.h>
 #include <avr/io.h>
@@ -11,6 +12,11 @@
 #error "F_CPU must be explicitly configured"
 #endif
 static_assert(F_CPU == 16000000UL, "ATmega target requires 16 MHz");
+
+// Retained local diagnostic state; no USB logging on scanner-owned D0/D1 and
+// no new controller-link frames. Ready means backpack ACKs, not optical proof.
+volatile dental_atmega::lcd::State lcdState = dental_atmega::lcd::State::kInitializing;
+volatile dental_atmega::twi::Result lcdLastError = dental_atmega::twi::Result::kIdle;
 
 int main() {
   dental_atmega::initializeStatusOutputs();
@@ -22,7 +28,13 @@ int main() {
   dental_atmega::PingClient link;
   dental_atmega::PhysicalWorkflow scanner;
   dental_atmega::uart::Transmitter transmitter;
+  dental_atmega::twi::AvrHardware twiHardware;
+  dental_atmega::twi::Master<dental_atmega::twi::AvrHardware> twi(twiHardware);
+  twi.initialize();
+  dental_atmega::lcd::Display<decltype(twi)> lcd(twi);
+  dental_atmega::lcd::WorkflowScreen lcdScreen;
   sei();
+  lcd.begin(dental_atmega::uart::milliseconds());
   for (;;) {
     // Bounded polling; neither missing PONG nor a stuck transmitter blocks main.
     uint8_t byte;
@@ -41,5 +53,10 @@ int main() {
                     (pins & _BV(dental_atmega::hardware::kRestockButtonBit)) != 0U,
                     (pins & _BV(dental_atmega::hardware::kCheckoutButtonBit)) != 0U);
     scanner.service(dental_atmega::uart::milliseconds(), link, transmitter);
+    // Cooperative peripheral service after core input/transport processing.
+    // LCD failure/status never participates in transaction acceptance.
+    lcdScreen.service(dental_atmega::uart::milliseconds(), scanner.state(), lcd);
+    lcdState = lcd.state();
+    lcdLastError = lcd.error();
   }
 }
