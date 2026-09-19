@@ -52,30 +52,40 @@ No `setStockStatus` or `setTransactionStatus` truth table may be finalized until
 
 ## UART / GM65 questions
 
+ATmega migration Step 3C assigns GM65 TX -> Uno A0/PC0 and Uno A1/PC1 -> GM65
+RX, leaving D0/D1 free. A0 reception is physically verified for RESTOCK and
+CHECKOUT using barcode `4806016001569`. A1 transmission is implemented and
+designated by the final schematic, but physical A1 -> scanner RX verification
+is pending. Production sends no GM65 command. The repository still lacks an exact scanner/adapter
+part revision and a current final schematic/netlist showing UART conditioning.
+Do not infer that the ATmega's 5 V A1 output is safe for scanner RX from the
+generic `TTL` label alone. Confirm the actual module's UART input rating and any
+existing divider/series/level-conversion network before physical connection.
+
 - What is the exact GM65 scanner module and adapter-board part number and datasheet revision?
 - Do the connector labels `TX` and `RX` name signals driven by the scanner, or signals expected from the host?
-- Is the PCB UART crossed correctly (scanner TX to ESP32 RX and scanner RX to ESP32 TX)?
+- Is the final A1 -> scanner RX electrical interface safe for the exact GM65 adapter revision?
 - What voltage levels does the actual scanner use on TX and RX? Are they 3.3 V TTL, 5 V TTL, RS-232, or level-shifted on the module?
 - What supply voltage and peak current does the scanner require?
 - What baud rate, data bits, parity, stop bits, terminator, encoding, and scanner output mode are configured?
 - What maximum barcode length and inter-byte/frame timeout should firmware support?
-- Can UART0 be shared safely with the DevKitC USB-UART bridge during programming, reset, logging, and normal scanning?
-- Does an attached scanner drive GPIO3 or contend with GPIO1 during ESP32 flashing or boot messages?
-- Is a connector, jumper, resistor, or alternate UART routing required to isolate the scanner during upload/debug?
+- Verify that D0/D1 remain free from GM65 ownership and available to the Uno USART0/bootloader path.
 
-## SW1 / SW2 questions
+## ATmega SW1 / SW2 source of truth
 
-- Which physical switch is RESTOCK and which is CHECKOUT? Do not infer this from SW1/SW2 numbering.
-- The supplied raster appears to connect the switch common rail to 5 V. Is that visual trace correct in the native schematic and on the PCB?
-- What voltage reaches GPIO14 and GPIO12 in both released and pressed states? Measure this before connecting/powering an ESP32 input.
-- Are external pull-up or pull-down resistors present? None are clearly established by the supplied drawing.
-- What active level should firmware use, and are the inputs ever floating?
-- Is hardware debouncing present, or must firmware debounce the buttons?
-- GPIO12 is an ESP32 boot-strapping pin. Can either switch state or its surrounding circuit alter the flash-voltage strap or prevent a reliable boot?
-- What happens if a switch is held during reset, power-up, flashing, or brownout recovery?
-- Is input protection or level shifting required before the switch nets are safe for the ESP32?
+The final main-controller schematic assigns both switches to the ATmega328P,
+not to the legacy ESP32 switch nets listed in the Phase 1 table:
 
-Until these questions are answered, neither switch may be configured even as an input with an internal pull resistor.
+- SW1 RESTOCK: +5 V -> pushbutton -> D2/PD2; R7 10 kOhm from D2 to GND.
+- SW2 CHECKOUT: +5 V -> pushbutton -> D3/PD3; R8 10 kOhm from D3 to GND.
+
+Both inputs are active HIGH: released is LOW and pressed is HIGH. DDRD bits 2
+and 3 remain clear for input operation, and PORTD bits 2 and 3 remain clear so
+the AVR internal pull-ups are disabled. The external resistors establish the
+released LOW state. Firmware provides 50-ms debounce, release-before-rearm and
+simultaneous-button protection. The old GPIO14/GPIO12 ESP32 switch entries are
+historical Phase 1 schematic observations and are not the current runtime
+button ownership.
 
 ## D1-D5 / 74LS04 / 74LS08 questions
 

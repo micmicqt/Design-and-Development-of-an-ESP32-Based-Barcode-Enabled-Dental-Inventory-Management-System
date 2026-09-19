@@ -17,9 +17,9 @@ struct Fixture {
   dental_atmega::PhysicalWorkflow owner;
   dental_atmega::PingClient ping;
   Writer wire;
-  Fixture() { owner.buttons(0UL, true, true); owner.buttons(50UL, true, true); }
+  Fixture() { owner.buttons(0UL, false, false); owner.buttons(50UL, false, false); }
   void press(bool restock, uint32_t now = 100UL) {
-    owner.buttons(now, !restock, restock); owner.buttons(now + 50UL, !restock, restock);
+    owner.buttons(now, restock, !restock); owner.buttons(now + 50UL, restock, !restock);
   }
   void scan(const char* text, uint32_t now = 200UL) {
     for (; *text; ++text) owner.receive(now, *text);
@@ -40,39 +40,45 @@ void pins() {
   assert(dental_atmega::hardware::kRestockButtonBit == 2U);
   assert(dental_atmega::hardware::kCheckoutButtonBit == 3U);
   assert((dental_atmega::hardware::kButtonMask & 0xF3U) == 0U);
+  assert(dental_atmega::hardware::buttonDdr(0xFFU) == 0xF3U);
+  assert(dental_atmega::hardware::buttonPort(0xFFU) == 0xF3U);
+  assert(dental_atmega::hardware::buttonDdr(0xF0U) == 0xF0U);
+  assert(dental_atmega::hardware::buttonPort(0xF0U) == 0xF0U);
+  assert(dental_atmega::hardware::buttonPressed(0x04U, 2U));
+  assert(!dental_atmega::hardware::buttonPressed(0x00U, 2U));
 }
 void restockArms() { Fixture f; f.press(true); assert(f.owner.state() == PhysicalState::kWaitingRestockScan); }
 void checkoutArms() { Fixture f; f.press(false); assert(f.owner.state() == PhysicalState::kWaitingCheckoutScan); }
 void debounce() {
-  Fixture f; f.owner.buttons(100UL, false, true); f.owner.buttons(120UL, true, true);
-  f.owner.buttons(130UL, false, true); f.owner.buttons(179UL, false, true);
+  Fixture f; f.owner.buttons(100UL, true, false); f.owner.buttons(120UL, false, false);
+  f.owner.buttons(130UL, true, false); f.owner.buttons(179UL, true, false);
   assert(f.owner.state() == PhysicalState::kIdle);
-  f.owner.buttons(180UL, false, true); assert(f.owner.state() == PhysicalState::kWaitingRestockScan);
+  f.owner.buttons(180UL, true, false); assert(f.owner.state() == PhysicalState::kWaitingRestockScan);
 }
 void held() {
   Fixture f; f.press(true); f.scan("00123\n"); f.flush();
-  for (uint32_t now = 300UL; now < 3000UL; now += 50UL) f.owner.buttons(now, false, true);
+  for (uint32_t now = 300UL; now < 3000UL; now += 50UL) f.owner.buttons(now, true, false);
   f.scan("00123\n", 3000UL); f.flush(3001UL);
   assert(f.operations() == 1U && f.owner.state() == PhysicalState::kIdle);
 }
 void simultaneous() {
-  Fixture f; f.owner.buttons(100UL, false, false); f.owner.buttons(150UL, false, false);
+  Fixture f; f.owner.buttons(100UL, true, true); f.owner.buttons(150UL, true, true);
   f.scan("123\n"); f.flush(); assert(f.operations() == 0U);
-  f.owner.buttons(200UL, true, true); f.owner.buttons(250UL, true, true);
-  f.owner.buttons(300UL, true, true); f.press(false, 350UL);
+  f.owner.buttons(200UL, false, false); f.owner.buttons(250UL, false, false);
+  f.owner.buttons(300UL, false, false); f.press(false, 350UL);
   assert(f.owner.state() == PhysicalState::kWaitingCheckoutScan);
 }
 void bootHeld() {
   dental_atmega::PhysicalWorkflow owner;
-  owner.buttons(0UL, false, true); owner.buttons(100UL, false, true);
+  owner.buttons(0UL, true, false); owner.buttons(100UL, true, false);
   assert(owner.state() == PhysicalState::kIdle);
-  owner.buttons(150UL, true, true); owner.buttons(200UL, true, true);
-  owner.buttons(250UL, false, true); owner.buttons(300UL, false, true);
+  owner.buttons(150UL, false, false); owner.buttons(200UL, false, false);
+  owner.buttons(250UL, true, false); owner.buttons(300UL, true, false);
   assert(owner.state() == PhysicalState::kWaitingRestockScan);
 }
 void busyPress() {
-  Fixture f; f.press(true); f.owner.buttons(160UL, true, true); f.owner.buttons(210UL, true, true);
-  f.owner.buttons(220UL, true, false); f.owner.buttons(270UL, true, false);
+  Fixture f; f.press(true); f.owner.buttons(160UL, false, false); f.owner.buttons(210UL, false, false);
+  f.owner.buttons(220UL, false, true); f.owner.buttons(270UL, false, true);
   assert(f.owner.state() == PhysicalState::kWaitingRestockScan);
   f.scan("123\n", 300UL); f.flush(301UL);
   assert(f.operations() == 1U && memcmp(f.wire.bytes, "\nRESTOCK:123\n", 13U) == 0);
@@ -130,7 +136,7 @@ void repeatedScans() {
 }
 void rearmAfterRelease() {
   Fixture f; f.press(true); f.scan("123\n"); f.flush();
-  f.owner.buttons(2201UL, true, true); f.owner.buttons(2251UL, true, true);
+  f.owner.buttons(2201UL, false, false); f.owner.buttons(2251UL, false, false);
   f.press(false, 2300UL); f.scan("123\n", 2400UL); f.flush(2401UL);
   assert(f.operations() == 2U);
 }

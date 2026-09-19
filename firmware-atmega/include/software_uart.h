@@ -5,10 +5,19 @@
 namespace dental_atmega {
 namespace software_uart {
 
-constexpr uint8_t kRxPortBit = 6U;  // PD6 / Uno D6
-constexpr uint8_t kTxPortBit = 7U;  // PD7 / Uno D7
+constexpr uint8_t kRxPortBit = 6U;  // Controller RX: PD6 / Uno D6.
+constexpr uint8_t kTxPortBit = 7U;  // Controller TX: PD7 / Uno D7.
+constexpr uint8_t kScannerRxPortBit = 0U;  // Scanner RX: PC0 / Uno A0.
+constexpr uint8_t kScannerTxPortBit = 1U;  // Scanner TX: PC1 / Uno A1.
 constexpr uint16_t kBitTicks = 208U;  // Timer1: 16 MHz / 8 / 9600, rounded.
 constexpr uint16_t kHalfBitTicks = 104U;
+
+inline bool deadlineDue(uint16_t now, uint16_t deadline) {
+  return static_cast<int16_t>(now - deadline) >= 0;
+}
+inline bool deadlineBefore(uint16_t left, uint16_t right) {
+  return static_cast<int16_t>(left - right) < 0;
+}
 
 enum class SampleResult : uint8_t { kMore, kFalseStart, kByte, kFramingError };
 
@@ -55,14 +64,53 @@ class Sender {
   bool active_ = false;
 };
 
+class TimedSender {
+ public:
+  void begin(uint8_t byte, uint16_t now) {
+    sender_.begin(byte); next_ = static_cast<uint16_t>(now + kBitTicks);
+  }
+  bool active() const { return sender_.active(); }
+  bool due(uint16_t now) const { return active() && deadlineDue(now, next_); }
+  uint16_t next() const { return next_; }
+  bool tick() {
+    const bool high = sender_.tick();
+    next_ = static_cast<uint16_t>(next_ + kBitTicks);
+    return high;
+  }
+ private:
+  Sender sender_;
+  uint16_t next_ = 0U;
+};
+
+class TimedReceiver {
+ public:
+  void begin(uint16_t now) {
+    receiver_.begin(); next_ = static_cast<uint16_t>(now + kHalfBitTicks);
+  }
+  bool active() const { return receiver_.active(); }
+  bool due(uint16_t now) const { return active() && deadlineDue(now, next_); }
+  uint16_t next() const { return next_; }
+  SampleResult sample(bool high) {
+    const SampleResult result = receiver_.sample(high);
+    next_ = static_cast<uint16_t>(next_ + kBitTicks);
+    return result;
+  }
+  uint8_t byte() const { return receiver_.byte(); }
+ private:
+  Receiver receiver_;
+  uint16_t next_ = 0U;
+};
+
 // Single ISR/main producer/consumer ring, used inside atomic main sections.
 // One slot is reserved to distinguish full/empty; no heap or blocking wait.
 struct ReceivedByte { uint8_t byte; bool error; };
-template <typename T>
+template <typename T, uint8_t Capacity = 16U>
 class Ring {
  public:
+  static_assert(Capacity >= 2U && (Capacity & (Capacity - 1U)) == 0U,
+                "Ring capacity must be a power of two");
   bool push(const T& value) {
-    const uint8_t next = static_cast<uint8_t>((head_ + 1U) & 15U);
+    const uint8_t next = static_cast<uint8_t>((head_ + 1U) & (Capacity - 1U));
     if (next == tail_) return false;
     entries_[head_] = value;
     head_ = next;
@@ -71,11 +119,12 @@ class Ring {
   bool pop(T& value) {
     if (head_ == tail_) return false;
     value = entries_[tail_];
-    tail_ = static_cast<uint8_t>((tail_ + 1U) & 15U);
+    tail_ = static_cast<uint8_t>((tail_ + 1U) & (Capacity - 1U));
     return true;
   }
+  void clear() { tail_ = head_; }
  private:
-  T entries_[16] = {};
+  T entries_[Capacity] = {};
   volatile uint8_t head_ = 0U;
   volatile uint8_t tail_ = 0U;
 };

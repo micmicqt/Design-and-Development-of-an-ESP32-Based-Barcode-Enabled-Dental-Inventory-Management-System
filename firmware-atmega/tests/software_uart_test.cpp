@@ -18,7 +18,8 @@ void pins() {
   assert(soft::kRxPortBit == 6U && soft::kTxPortBit == 7U);
   const uint8_t linkMask = (1U << soft::kRxPortBit) | (1U << soft::kTxPortBit);
   assert((linkMask & dental_atmega::hardware::kSmallMask) == 0U);
-  assert((linkMask & 3U) == 0U); // D0/D1 reserved for hardware-UART GM65.
+  assert((linkMask & 3U) == 0U); // D0/D1 remain free from both software UARTs.
+  assert(soft::kScannerRxPortBit == 0U && soft::kScannerTxPortBit == 1U);
 }
 void timing() {
   assert(soft::kBitTicks == 208U && soft::kHalfBitTicks == 104U);

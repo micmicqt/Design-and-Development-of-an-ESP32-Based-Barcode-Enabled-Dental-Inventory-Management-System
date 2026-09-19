@@ -13,8 +13,8 @@
 #endif
 static_assert(F_CPU == 16000000UL, "ATmega target requires 16 MHz");
 
-// Retained local diagnostic state; no USB logging on scanner-owned D0/D1 and
-// no new controller-link frames. Ready means backpack ACKs, not optical proof.
+// Retained local diagnostic state; no new controller-link frames. USART0
+// D0/D1 is free from the scanner. Ready means backpack ACKs, not optical proof.
 volatile dental_atmega::lcd::State lcdState = dental_atmega::lcd::State::kInitializing;
 volatile dental_atmega::twi::Result lcdLastError = dental_atmega::twi::Result::kIdle;
 
@@ -23,8 +23,8 @@ int main() {
   dental_atmega::uart::initialize();
   dental_atmega::uart::initializeClock();
   dental_atmega::scanner_uart::initialize();
-  DDRD &= static_cast<uint8_t>(~dental_atmega::hardware::kButtonMask);
-  PORTD |= dental_atmega::hardware::kButtonMask; // Active LOW buttons to GND.
+  DDRD = dental_atmega::hardware::buttonDdr(DDRD);
+  PORTD = dental_atmega::hardware::buttonPort(PORTD); // External 10 kOhm pull-downs.
   dental_atmega::PingClient link;
   dental_atmega::PhysicalWorkflow scanner;
   dental_atmega::uart::Transmitter transmitter;
@@ -50,8 +50,10 @@ int main() {
     }
     const uint8_t pins = PIND;
     scanner.buttons(dental_atmega::uart::milliseconds(),
-                    (pins & _BV(dental_atmega::hardware::kRestockButtonBit)) != 0U,
-                    (pins & _BV(dental_atmega::hardware::kCheckoutButtonBit)) != 0U);
+                    dental_atmega::hardware::buttonPressed(
+                        pins, dental_atmega::hardware::kRestockButtonBit),
+                    dental_atmega::hardware::buttonPressed(
+                        pins, dental_atmega::hardware::kCheckoutButtonBit));
     scanner.service(dental_atmega::uart::milliseconds(), link, transmitter);
     // Cooperative peripheral service after core input/transport processing.
     // LCD failure/status never participates in transaction acceptance.

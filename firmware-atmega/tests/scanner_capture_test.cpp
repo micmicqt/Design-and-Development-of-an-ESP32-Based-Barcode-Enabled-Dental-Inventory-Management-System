@@ -80,6 +80,15 @@ void arbitration() {
   for (const char* p = "PONG\n"; *p; ++p) ping.receive(2002UL, *p);
   assert(ping.verifiedCount() == 1U);
 }
+void pingAfterScannerTraffic() {
+  ScannerTransport t; dental_atmega::PingClient ping; Writer w;
+  submit(t, "00123\n"); flush(t, ping, w, 2UL);
+  assert(w.size == 12U && memcmp(w.bytes, "\nSCAN:00123\n", 12U) == 0);
+  for (unsigned i = 0U; i < 5U; ++i) t.service(2000UL, ping, w);
+  assert(w.size == 17U && memcmp(w.bytes + 12U, "PING\n", 5U) == 0);
+  for (const char* p = "PONG\n"; *p; ++p) ping.receive(2001UL, *p);
+  assert(ping.verifiedCount() == 1U);
+}
 void incompleteTx() {
   ScannerTransport t; dental_atmega::PingClient ping; Writer w;
   submit(t, "123456\n"); for (unsigned i = 0U; i < 8U; ++i) t.service(2UL, ping, w);
@@ -96,6 +105,6 @@ void incompleteTx() {
 }
 int main() {
   numeric(); zeroes(); cr(); lf(); crlf(); bounds(); malformed(); repeated(); errors();
-  encoding(); backpressure(); arbitration(); incompleteTx();
-  puts("ATmega scanner capture/transport: 13 focused scenarios PASSED");
+  encoding(); backpressure(); arbitration(); pingAfterScannerTraffic(); incompleteTx();
+  puts("ATmega scanner capture/transport: 14 focused scenarios PASSED");
 }

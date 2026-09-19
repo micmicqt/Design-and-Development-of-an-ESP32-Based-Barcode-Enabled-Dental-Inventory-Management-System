@@ -12,22 +12,22 @@ enum class PhysicalState : uint8_t {
 class DebouncedInput {
  public:
   static constexpr uint32_t kDebounceMs = 50UL;
-  bool update(uint32_t now, bool released) {
+  bool update(uint32_t now, bool pressed) {
     if (!initialized_) {
-      initialized_ = true; raw_ = stable_ = released; changed_ = now; return false;
+      initialized_ = true; raw_ = stable_ = pressed; changed_ = now; return false;
     }
-    if (released != raw_) { raw_ = released; changed_ = now; }
+    if (pressed != raw_) { raw_ = pressed; changed_ = now; }
     if (raw_ != stable_ && static_cast<uint32_t>(now - changed_) >= kDebounceMs) {
-      stable_ = raw_; return !stable_;
+      stable_ = raw_; return stable_;
     }
     return false;
   }
-  bool released() const { return raw_ && stable_; }
+  bool released() const { return !raw_ && !stable_; }
  private:
   uint32_t changed_ = 0UL;
   bool initialized_ = false;
-  bool raw_ = true;
-  bool stable_ = true;
+  bool raw_ = false;
+  bool stable_ = false;
 };
 
 // ATmega alone selects the physical operation. No stock/database/peripheral
@@ -37,17 +37,17 @@ class PhysicalWorkflow {
   static constexpr uint32_t kScanTimeoutMs = 10000UL;
   static constexpr uint32_t kCooldownMs = 2000UL;
 
-  void buttons(uint32_t now, bool restockReleased, bool checkoutReleased) {
+  void buttons(uint32_t now, bool restockPressed, bool checkoutPressed) {
     expire(now);
-    const bool restockPress = restock_.update(now, restockReleased);
-    const bool checkoutPress = checkout_.update(now, checkoutReleased);
-    if (!restockReleased && !checkoutReleased) {
+    const bool restockPress = restock_.update(now, restockPressed);
+    const bool checkoutPress = checkout_.update(now, checkoutPressed);
+    if (restockPressed && checkoutPressed) {
       mustRelease_ = true;
       if (waiting()) cancelWait();
       return; // Reject simultaneous input, never guess an operation.
     }
     if (state_ != PhysicalState::kIdle || transport_.active()) {
-      if (!restockReleased || !checkoutReleased) mustRelease_ = true;
+      if (restockPressed || checkoutPressed) mustRelease_ = true;
       return; // Busy presses are not deferred or replayed.
     }
     if (mustRelease_) {

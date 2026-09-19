@@ -174,8 +174,8 @@ void failureIsolation() {
     Fixture f; f.bus.stuck = true; f.initialize();
     dental_atmega::PhysicalWorkflow workflow; dental_atmega::PingClient ping;
     Writer wire; lcd::WorkflowScreen screen;
-    workflow.buttons(0U, true, true); workflow.buttons(50U, true, true);
-    workflow.buttons(100U, !restock, restock); workflow.buttons(150U, !restock, restock);
+    workflow.buttons(0U, false, false); workflow.buttons(50U, false, false);
+    workflow.buttons(100U, restock, !restock); workflow.buttons(150U, restock, !restock);
     assert(workflow.state() == (restock ? dental_atmega::PhysicalState::kWaitingRestockScan : dental_atmega::PhysicalState::kWaitingCheckoutScan));
     for (const char* p = "001234\r\n"; *p; ++p) workflow.receive(200U, *p);
     for (unsigned i = 0U; i < 100U; ++i) {
