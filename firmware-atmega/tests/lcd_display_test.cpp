@@ -135,7 +135,13 @@ void wrap() {
 void screenLines() {
   const dental_link::rtc::DateTime time = {2026U, 9U, 20U, 1U, 2U, 3U};
   char line[20];
-  lcd::screenLine(lcd::Screen::kClock, 0U, time, line); assert(memcmp(line, "Dental Inventory    ", 20U) == 0);
+  lcd::screenLine(lcd::Screen::kReset, 0U, time, line);
+  assert(memcmp(line, "                    ", 20U) == 0);
+  lcd::screenLine(lcd::Screen::kReset, 1U, time, line);
+  assert(memcmp(line, "    SYSTEM RESET    ", 20U) == 0);
+  lcd::screenLine(lcd::Screen::kReset, 2U, time, line);
+  assert(memcmp(line, "  INITIALIZING...   ", 20U) == 0);
+  lcd::screenLine(lcd::Screen::kClock, 0U, time, line); assert(memcmp(line, "Any Time Dental     ", 20U) == 0);
   lcd::screenLine(lcd::Screen::kClock, 1U, time, line); assert(memcmp(line, "2026-09-20          ", 20U) == 0);
   lcd::screenLine(lcd::Screen::kClock, 2U, time, line); assert(memcmp(line, "01:02:03            ", 20U) == 0);
   lcd::screenLine(lcd::Screen::kClock, 3U, time, line); assert(memcmp(line, "SYSTEM READY        ", 20U) == 0);
@@ -143,11 +149,52 @@ void screenLines() {
   lcd::screenLine(lcd::Screen::kRtcNeedsSync, 2U, time, line); assert(memcmp(line, "                    ", 20U) == 0);
   lcd::screenLine(lcd::Screen::kRtcUnavailable, 1U, time, line); assert(memcmp(line, "RTC UNAVAILABLE     ", 20U) == 0);
   lcd::screenLine(lcd::Screen::kRtcUnavailable, 2U, time, line); assert(memcmp(line, "                    ", 20U) == 0);
-  lcd::screenLine(lcd::Screen::kRestockWait, 2U, time, line); assert(memcmp(line, "RESTOCK WAIT        ", 20U) == 0);
-  lcd::screenLine(lcd::Screen::kCheckoutWait, 2U, time, line); assert(memcmp(line, "CHECKOUT WAIT       ", 20U) == 0);
+  lcd::screenLine(lcd::Screen::kRestockWait, 2U, time, line); assert(memcmp(line, "RESTOCK MODE        ", 20U) == 0);
+  lcd::screenLine(lcd::Screen::kCheckoutWait, 2U, time, line); assert(memcmp(line, "CHECKOUT MODE       ", 20U) == 0);
+  assert(lcd::screenFor(dental_atmega::PhysicalState::kDeliveryError,
+                        dental_link::rtc::State::kReady) == lcd::Screen::kLinkError);
+  lcd::screenLine(lcd::Screen::kLinkError, 2U, time, line);
+  assert(memcmp(line, "NO CONTROLLER REPLY ", 20U) == 0);
+  assert(lcd::screenFor(dental_atmega::PhysicalState::kStorageUnavailable,
+                        dental_link::rtc::State::kReady) == lcd::Screen::kStorageError);
+  lcd::screenLine(lcd::Screen::kStorageError, 1U, time, line);
+  assert(memcmp(line, "STORAGE UNAVAILABLE ", 20U) == 0);
+  lcd::screenLine(lcd::Screen::kModeBusy, 1U, time, line);
+  assert(memcmp(line, "CONTROLLER BUSY     ", 20U) == 0);
+  assert(lcd::screenFor(dental_atmega::PhysicalState::kInitializing,
+                        dental_link::rtc::State::kReady) == lcd::Screen::kInitializing);
+  lcd::screenLine(lcd::Screen::kInitializing, 1U, time, line);
+  assert(memcmp(line, "SYSTEM INITIALIZING ", 20U) == 0);
+  lcd::screenLine(lcd::Screen::kInitializing, 2U, time, line);
+  assert(memcmp(line, "PLEASE WAIT         ", 20U) == 0);
+}
+void startupResetSplash() {
+  Fixture f; f.initialize(); lcd::WorkflowScreen screen;
+  const dental_link::rtc::DateTime time = {2026U, 9U, 20U, 1U, 2U, 3U};
+  const size_t first = f.bus.writes.size();
+  for (unsigned i = 0U; i < 600U; ++i)
+    screen.service(f.now++, dental_atmega::PhysicalState::kIdle,
+                   dental_link::rtc::State::kReady, time, f.display);
+  assert(f.bus.writes.size() == first + 84U);
+  const char* reset = "    SYSTEM RESET    ";
+  const char* initializing = "  INITIALIZING...   ";
+  for (unsigned i = 0U; i < 20U; ++i) {
+    assert(decode(f.bus.writes[first + 22U + i]) ==
+           static_cast<uint8_t>(reset[i]));
+    assert(decode(f.bus.writes[first + 43U + i]) ==
+           static_cast<uint8_t>(initializing[i]));
+  }
+  for (unsigned i = 0U; i < 500U; ++i)
+    screen.service(f.now++, dental_atmega::PhysicalState::kIdle,
+                   dental_link::rtc::State::kReady, time, f.display);
+  assert(f.bus.writes.size() == first + 84U); // Visible for at least 1.1 s.
+  for (unsigned i = 0U; i < 800U; ++i)
+    screen.service(f.now++, dental_atmega::PhysicalState::kIdle,
+                   dental_link::rtc::State::kReady, time, f.display);
+  assert(f.bus.writes.size() == first + 168U); // Normal screen follows.
 }
 void workflowScreens() {
-  Fixture f; f.initialize(); lcd::WorkflowScreen screen;
+  Fixture f; f.initialize(); lcd::WorkflowScreen screen(false);
   const dental_link::rtc::DateTime time = {2026U, 9U, 20U, 1U, 2U, 3U};
   const dental_atmega::PhysicalState states[] = {
     dental_atmega::PhysicalState::kIdle,
@@ -170,7 +217,7 @@ void workflowScreens() {
   }
 }
 void clockAdvancesWithoutFullRepaint() {
-  Fixture f; f.initialize(); lcd::WorkflowScreen screen;
+  Fixture f; f.initialize(); lcd::WorkflowScreen screen(false);
   dental_link::rtc::DateTime time = {2026U, 9U, 20U, 1U, 2U, 3U};
   for (unsigned i = 0U; i < 600U; ++i)
     screen.service(f.now++, dental_atmega::PhysicalState::kIdle,
@@ -189,7 +236,7 @@ void clockAdvancesWithoutFullRepaint() {
     assert(decode(f.bus.writes[i]) != 0x01U); // No LCD clear per second.
 }
 void abnormalRtcNeverDisplaysTime() {
-  Fixture f; f.initialize(); lcd::WorkflowScreen screen;
+  Fixture f; f.initialize(); lcd::WorkflowScreen screen(false);
   const dental_link::rtc::DateTime time = {2026U, 9U, 20U, 1U, 2U, 3U};
   for (auto state : {dental_link::rtc::State::kNeedsSync,
                      dental_link::rtc::State::kUnavailable}) {
@@ -207,7 +254,7 @@ void abnormalRtcNeverDisplaysTime() {
   }
 }
 void latestScreenAndRecovery() {
-  Fixture f; f.initialize(); lcd::WorkflowScreen screen;
+  Fixture f; f.initialize(); lcd::WorkflowScreen screen(false);
   const dental_link::rtc::DateTime time = {2026U, 9U, 20U, 1U, 2U, 3U};
   for (unsigned i = 0U; i < 25U; ++i)
     screen.service(f.now++, dental_atmega::PhysicalState::kWaitingRestockScan,
@@ -241,7 +288,7 @@ void failureIsolation() {
   for (bool restock : {true, false}) {
     Fixture f; f.bus.stuck = true; f.initialize();
     dental_atmega::PhysicalWorkflow workflow; dental_atmega::PingClient ping;
-    Writer wire; lcd::WorkflowScreen screen;
+    Writer wire; lcd::WorkflowScreen screen(false);
     workflow.buttons(0U, false, false); workflow.buttons(50U, false, false);
     workflow.buttons(100U, restock, !restock); workflow.buttons(150U, restock, !restock);
     assert(workflow.state() == (restock ? dental_atmega::PhysicalState::kWaitingRestockScan : dental_atmega::PhysicalState::kWaitingCheckoutScan));
@@ -251,22 +298,79 @@ void failureIsolation() {
       screen.service(201U, workflow.state(), dental_link::rtc::State::kReady,
                      time, f.display);
     }
-    dental_link::LineParser parser; unsigned operations = 0U;
+    workflow.modeResponse(202U, restock ?
+        dental_link::Frame::kRestockAccepted :
+        dental_link::Frame::kCheckoutAccepted);
+    for (unsigned i = 0U; i < 100U; ++i) {
+      workflow.service(202U, ping, wire);
+      screen.service(202U, workflow.state(), dental_link::rtc::State::kReady,
+                     time, f.display);
+    }
+    dental_link::LineParser parser; unsigned modes = 0U; unsigned scans = 0U;
     for (uint8_t byte : wire.bytes) {
       const auto frame = parser.receive(byte);
-      if (frame == (restock ? dental_link::Frame::kRestock : dental_link::Frame::kCheckout)) {
-        ++operations; assert(strcmp(parser.barcode(), "001234") == 0);
+      if (frame == (restock ? dental_link::Frame::kRestockMode :
+                              dental_link::Frame::kCheckoutMode)) ++modes;
+      if (frame == dental_link::Frame::kScan) {
+        ++scans; assert(strcmp(parser.barcode(), "001234") == 0);
       }
     }
-    assert(operations == 1U && f.display.error() == Result::kTimeout);
+    assert(modes == 1U && scans == 1U && f.display.error() == Result::kTimeout);
   }
+}
+void committedAndOfflineFeedback() {
+  const dental_link::rtc::DateTime time = {2026U, 9U, 20U, 1U, 2U, 3U};
+  const struct {
+    dental_link::Frame frame;
+    lcd::Screen screen;
+    const char* heading;
+  } cases[] = {
+      {dental_link::Frame::kRestockCommittedFeedback,
+       lcd::Screen::kRestockCommitted, "RESTOCK SUCCESS"},
+      {dental_link::Frame::kCheckoutCommittedFeedback,
+       lcd::Screen::kCheckoutCommitted, "CHECKOUT SUCCESS"},
+      {dental_link::Frame::kRestockOfflineFeedback,
+       lcd::Screen::kRestockOffline, "OFFLINE RESTOCK"},
+      {dental_link::Frame::kCheckoutOfflineFeedback,
+       lcd::Screen::kCheckoutOffline, "OFFLINE CHECKOUT"},
+      {dental_link::Frame::kScanErrorFeedback,
+       lcd::Screen::kScanError, "TRANSACTION ERROR"},
+      {dental_link::Frame::kScanDismissedFeedback,
+       lcd::Screen::kScanDismissed, "SCAN DISMISSED"},
+      {dental_link::Frame::kUnknownBarcodeFeedback,
+       lcd::Screen::kUnknownBarcode, "ITEM NOT FOUND"},
+  };
+  for (const auto& item : cases) {
+    assert(lcd::feedbackScreen(item.frame) == item.screen);
+    char line[20];
+    lcd::screenLine(item.screen, 1U, time, line);
+    assert(memcmp(line, item.heading, strlen(item.heading)) == 0);
+  }
+  Fixture f; f.initialize(); lcd::WorkflowScreen screen(false);
+  screen.feedback(f.now, dental_link::Frame::kRestockCommittedFeedback);
+  const size_t first = f.bus.writes.size();
+  for (unsigned i = 0U; i < 600U; ++i)
+    screen.service(f.now++, dental_atmega::PhysicalState::kIdle,
+                   dental_link::rtc::State::kReady, time, f.display);
+  assert(f.bus.writes.size() == first + 84U);
+  for (unsigned i = 0U; i < strlen("RESTOCK SUCCESS"); ++i)
+    assert(decode(f.bus.writes[first + 22U + i]) ==
+           static_cast<uint8_t>("RESTOCK SUCCESS"[i]));
+  f.now += lcd::WorkflowScreen::kFeedbackMs;
+  const size_t afterFeedback = f.bus.writes.size();
+  for (unsigned i = 0U; i < 600U; ++i)
+    screen.service(f.now++, dental_atmega::PhysicalState::kIdle,
+                   dental_link::rtc::State::kReady, time, f.display);
+  assert(f.bus.writes.size() == afterFeedback + 84U);
+  assert(decode(f.bus.writes[afterFeedback + 22U]) == '2');
 }
 }
 int main() {
   encoding(); cursors(); initialization(); clearAndCursor(); textAndCopy(); textBounds();
   busyRejects(); sharedBusOwnershipDefers(); nackAndRestart(); textFailure();
-  timeout(); wrap(); screenLines(); workflowScreens();
-  clockAdvancesWithoutFullRepaint(); abnormalRtcNeverDisplaysTime();
-  latestScreenAndRecovery(); failureIsolation();
-  puts("ATmega LCD: 18 focused scenarios PASSED");
+  timeout(); wrap(); screenLines(); startupResetSplash(); workflowScreens();
+  clockAdvancesWithoutFullRepaint();
+  abnormalRtcNeverDisplaysTime();
+  latestScreenAndRecovery(); failureIsolation(); committedAndOfflineFeedback();
+  puts("ATmega LCD: 21 focused scenarios PASSED");
 }

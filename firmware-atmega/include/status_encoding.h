@@ -5,7 +5,7 @@
 namespace dental_atmega {
 
 enum class SmallStatus : uint8_t { OFF, YELLOW, RED, GREEN };
-enum class BigStatus : uint8_t { OFF, YELLOW, GREEN };
+enum class BigStatus : uint8_t { OFF, RED, GREEN };
 
 struct LogicInputs {
   bool a;
@@ -24,7 +24,7 @@ constexpr LogicInputs encodeSmall(SmallStatus status) {
 }
 
 constexpr LogicInputs encodeBig(BigStatus status) {
-  return status == BigStatus::YELLOW ? LogicInputs{true, false}
+  return status == BigStatus::RED ? LogicInputs{true, false}
        : status == BigStatus::GREEN ? LogicInputs{true, true}
        : LogicInputs{false, false};
 }

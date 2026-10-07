@@ -282,21 +282,37 @@ inline bool parseSimpleJsonString(const char* text, size_t length, size_t& index
   return true;
 }
 
-// The narrow ACK contract deliberately accepts exactly one unescaped eventId
-// string. Generated IDs never require escapes; extra keys/duplicates reject.
+// The narrow ACK contract accepts one unescaped eventId and an optional
+// display-only unknown-barcode disposition. It never changes FIFO ACK rules.
 inline bool parseAcknowledgementBody(const char* body, size_t length,
-                                    char (&eventId)[kEventIdCapacity]) {
+                                    char (&eventId)[kEventIdCapacity],
+                                    bool* unknownBarcode = nullptr) {
   if (length == 0U || length > kAcknowledgementBodyMaximumLength) return false;
+  if (unknownBarcode != nullptr) *unknownBarcode = false;
   size_t index = 0U;
   char key[8U];
   if (!consumeJsonCharacter(body, length, index, '{') ||
       !parseSimpleJsonString(body, length, index, key, sizeof(key)) ||
       strcmp(key, "eventId") != 0 ||
       !consumeJsonCharacter(body, length, index, ':') ||
-      !parseSimpleJsonString(body, length, index, eventId, sizeof(eventId)) ||
-      !consumeJsonCharacter(body, length, index, '}')) return false;
+      !parseSimpleJsonString(body, length, index, eventId, sizeof(eventId)))
+    return false;
+  bool unknown = false;
+  if (consumeJsonCharacter(body, length, index, ',')) {
+    char reason[16U] = {};
+    if (!parseSimpleJsonString(body, length, index, key, sizeof(key)) ||
+        strcmp(key, "reason") != 0 ||
+        !consumeJsonCharacter(body, length, index, ':') ||
+        !parseSimpleJsonString(body, length, index, reason, sizeof(reason)) ||
+        strcmp(reason, "unknown_barcode") != 0) return false;
+    unknown = true;
+  }
+  if (!consumeJsonCharacter(body, length, index, '}')) return false;
   skipJsonWhitespace(body, length, index);
-  return index == length && eventIdUsesSafeAlphabet(eventId, strlen(eventId));
+  const bool valid = index == length &&
+      eventIdUsesSafeAlphabet(eventId, strlen(eventId));
+  if (valid && unknownBarcode != nullptr) *unknownBarcode = unknown;
+  return valid;
 }
 
 inline bool parseUnsignedJsonInteger(const char* text, size_t length,

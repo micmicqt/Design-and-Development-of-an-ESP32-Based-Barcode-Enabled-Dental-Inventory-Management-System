@@ -8,6 +8,11 @@ export interface AuthenticationService {
   authenticate(credentials: Readonly<LoginCredentials>): boolean | Promise<boolean>
 }
 
+export interface FirstRunAdminService {
+  needsSetup(): boolean
+  createFirstAdmin(credentials: Readonly<LoginCredentials>): Promise<void>
+}
+
 export type CredentialVerifier = (
   credentials: Readonly<LoginCredentials>
 ) => boolean | Promise<boolean>

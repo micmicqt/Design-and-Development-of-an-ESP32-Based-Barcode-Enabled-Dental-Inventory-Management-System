@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { offlineEventFingerprint, isLegacyOfflineEventId, legacyReceiptIdentity } from './offline-event-identity';
 import type {
   HardwareTransactionEvent,
   HardwareTransactionReceipt,
@@ -868,7 +869,7 @@ export function createInventoryService(
   `);
   const findOfflineReconciliationReceiptStatement = database.prepare(`
     SELECT
-      receipts.event_id,
+      identities.wire_event_id AS event_id,
       movements.transaction_id,
       receipts.product_id,
       receipts.barcode,
@@ -884,6 +885,7 @@ export function createInventoryService(
       receipts.cache_generation,
       receipts.resulting_status
     FROM offline_reconciliation_receipts AS receipts
+    INNER JOIN offline_event_identities AS identities ON identities.receipt_id = receipts.event_id
     INNER JOIN transactions AS movements
       ON movements.transaction_id = receipts.transaction_id
     WHERE receipts.event_id = ?
@@ -897,6 +899,14 @@ export function createInventoryService(
       AND deleted_at IS NULL
       AND current_stock = ?
   `);
+  const findOfflineIdentityStatement = database.prepare(`SELECT receipt_id FROM offline_event_identities
+    WHERE wire_event_id = ? AND payload_fingerprint = ?`);
+  const findLatestOfflineIdentityStatement = database.prepare(`SELECT receipts.event_timestamp
+    FROM offline_event_identities AS identities
+    JOIN offline_reconciliation_receipts AS receipts ON receipts.event_id = identities.receipt_id
+    WHERE identities.wire_event_id = ? ORDER BY receipts.event_timestamp DESC LIMIT 1`);
+  const insertOfflineIdentityStatement = database.prepare(`INSERT INTO offline_event_identities
+    (receipt_id, wire_event_id, payload_fingerprint, identity_kind) VALUES (?, ?, ?, ?)`);
   const updateOfflineStockStatement = database.prepare(`
     UPDATE products
     SET
@@ -1128,7 +1138,11 @@ export function createInventoryService(
 
   const reconcileOfflineEventInTransaction = database.transaction(
     (event: NormalizedOfflinePendingEvent): OfflineReconciliationResult => {
-      const existingReceipt = findOfflineReconciliationReceipt(event.eventId);
+      const fingerprint = offlineEventFingerprint(event);
+      const knownIdentity = findOfflineIdentityStatement.get(event.eventId, fingerprint) as
+        { receipt_id: string } | undefined;
+      const existingReceipt = knownIdentity === undefined ? null :
+        findOfflineReconciliationReceipt(knownIdentity.receipt_id);
       if (existingReceipt !== null) {
         if (!isSameOfflineEvent(existingReceipt, event)) {
           throw new OfflineReconciliationConflictError(
@@ -1137,8 +1151,22 @@ export function createInventoryService(
             event.eventId,
           );
         }
+        console.info(`[Offline sync] stage=identity decision=ALREADY_APPLIED fingerprint=${fingerprint}`);
         return { status: "ALREADY_APPLIED", receipt: existingReceipt };
       }
+      const previousIdentity = findLatestOfflineIdentityStatement.get(event.eventId) as
+        { event_timestamp: string } | undefined;
+      const collision = previousIdentity !== undefined;
+      // Only a later, fully validated legacy event may use compatibility identity.
+      // Same-time edits, earlier replays and corrected high-bit IDs fail closed.
+      if (collision && (!isLegacyOfflineEventId(event.eventId) ||
+          event.timestamp <= previousIdentity.event_timestamp)) {
+        throw new OfflineReconciliationConflictError('EVENT_ID_CONFLICT',
+          'This offline event ID conflicts outside the explicit legacy-reuse compatibility rule.', event.eventId);
+      }
+      const receiptIdentity = collision ? legacyReceiptIdentity(fingerprint) : event.eventId;
+      console.info(`[Offline sync] stage=identity decision=${collision ? 'LEGACY_COLLISION' : 'NORMAL'} fingerprint=${fingerprint}`);
+      console.info('[Offline sync] stage=database_begin');
 
       const productRow = getActiveProductStatement.get(
         event.productId,
@@ -1215,7 +1243,7 @@ export function createInventoryService(
         event.timestamp,
       );
       insertOfflineReconciliationReceiptStatement.run(
-        event.eventId,
+        receiptIdentity,
         transactionId,
         event.timestamp,
         productRow.id,
@@ -1227,8 +1255,10 @@ export function createInventoryService(
         event.cacheGeneration,
         status,
       );
+      insertOfflineIdentityStatement.run(receiptIdentity, event.eventId, fingerprint,
+        collision ? 'LEGACY_COLLISION' : 'NORMAL');
 
-      const receipt = findOfflineReconciliationReceipt(event.eventId);
+      const receipt = findOfflineReconciliationReceipt(receiptIdentity);
       if (receipt === null) {
         throw new Error("The committed offline reconciliation receipt is unavailable.");
       }

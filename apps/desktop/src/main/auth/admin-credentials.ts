@@ -67,12 +67,19 @@ export async function initializeAdminCredentials(
 
   const passwordHash = await hashPassword(credentials.password);
 
-  database
-    .prepare(
-      `INSERT INTO configured_admin (id, username, password_hash)
-       VALUES (1, ?, ?)`,
-    )
-    .run(username, passwordHash);
+  try {
+    database
+      .prepare(
+        `INSERT INTO configured_admin (id, username, password_hash)
+         VALUES (1, ?, ?)`,
+      )
+      .run(username, passwordHash);
+  } catch (error) {
+    // A second setup request may finish hashing after the first one inserts.
+    // The single-row primary key prevents replacement even in that race.
+    if (hasConfiguredAdmin(database)) throw new AdminAlreadyConfiguredError();
+    throw error;
+  }
 }
 
 /** Development/maintenance entry point; never expose this function over IPC. */

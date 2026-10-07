@@ -1,8 +1,8 @@
 #pragma once
 
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
+#include "immutable_text.h"
 
 namespace dental_link {
 namespace rtc {
@@ -26,19 +26,19 @@ struct DateTime {
 };
 
 inline const char* stateName(State state) {
-  return state == State::kReady ? "ready" :
-      state == State::kNeedsSync ? "needs_sync" : "unavailable";
+  return state == State::kReady ? DENTAL_TEXT_LITERAL("ready") :
+      state == State::kNeedsSync ? DENTAL_TEXT_LITERAL("needs_sync") : DENTAL_TEXT_LITERAL("unavailable");
 }
 
 inline const char* reasonName(Reason reason) {
   switch (reason) {
-    case Reason::kNone: return "none";
-    case Reason::kCommunicationFailure: return "communication_failure";
-    case Reason::kLostPower: return "lost_power";
-    case Reason::kInvalidTime: return "invalid_time";
-    case Reason::kVerificationFailed: return "verification_failed";
+    case Reason::kNone: return DENTAL_TEXT_LITERAL("none");
+    case Reason::kCommunicationFailure: return DENTAL_TEXT_LITERAL("communication_failure");
+    case Reason::kLostPower: return DENTAL_TEXT_LITERAL("lost_power");
+    case Reason::kInvalidTime: return DENTAL_TEXT_LITERAL("invalid_time");
+    case Reason::kVerificationFailed: return DENTAL_TEXT_LITERAL("verification_failed");
   }
-  return "communication_failure";
+  return DENTAL_TEXT_LITERAL("communication_failure");
 }
 
 inline bool isLeapYear(uint16_t year) {
@@ -46,10 +46,15 @@ inline bool isLeapYear(uint16_t year) {
 }
 
 inline uint8_t daysInMonth(uint16_t year, uint8_t month) {
-  static const uint8_t days[] = {31U, 28U, 31U, 30U, 31U, 30U,
+  static const uint8_t days[] DENTAL_FLASH_STORAGE = {31U, 28U, 31U, 30U, 31U, 30U,
                                  31U, 31U, 30U, 31U, 30U, 31U};
   if (month < 1U || month > 12U) return 0U;
-  return month == 2U && isLeapYear(year) ? 29U : days[month - 1U];
+  if (month == 2U && isLeapYear(year)) return 29U;
+#ifdef __AVR__
+  return pgm_read_byte(days + month - 1U);
+#else
+  return days[month - 1U];
+#endif
 }
 
 inline bool valid(const DateTime& value) {
@@ -83,13 +88,23 @@ inline bool parseDateTime(const char* text, DateTime& value) {
   return valid(value);
 }
 
+inline void twoDigits(uint8_t value, char* output) {
+  output[0] = static_cast<char>('0' + value / 10U);
+  output[1] = static_cast<char>('0' + value % 10U);
+}
+
 inline bool formatDateTime(const DateTime& value, char* output, uint8_t capacity) {
   if (!valid(value) || !output || capacity < 20U) return false;
-  const int written = snprintf(output, capacity, "%04u-%02u-%02u %02u:%02u:%02u",
-      static_cast<unsigned>(value.year), static_cast<unsigned>(value.month),
-      static_cast<unsigned>(value.day), static_cast<unsigned>(value.hour),
-      static_cast<unsigned>(value.minute), static_cast<unsigned>(value.second));
-  return written == 19;
+  // Valid dates are 2000..2099: fixed-width output, no printf varargs/stack.
+  output[0] = '2'; output[1] = '0';
+  twoDigits(static_cast<uint8_t>(value.year - 2000U), output + 2U);
+  output[4] = '-'; twoDigits(value.month, output + 5U);
+  output[7] = '-'; twoDigits(value.day, output + 8U);
+  output[10] = ' '; twoDigits(value.hour, output + 11U);
+  output[13] = ':'; twoDigits(value.minute, output + 14U);
+  output[16] = ':'; twoDigits(value.second, output + 17U);
+  output[19] = '\0';
+  return true;
 }
 
 inline uint32_t secondsSince2000(const DateTime& value) {
@@ -132,19 +147,19 @@ inline bool parseState(const char* text, State& state, Reason& reason) {
   const char* separator = strchr(text, ':');
   if (!separator || strchr(separator + 1, ':')) return false;
   const size_t stateLength = static_cast<size_t>(separator - text);
-  if (stateLength == 5U && memcmp(text, "ready", 5U) == 0) state = State::kReady;
-  else if (stateLength == 10U && memcmp(text, "needs_sync", 10U) == 0)
+  if (stateLength == 5U && text::compare(text, DENTAL_TEXT_LITERAL("ready"), 5U) == 0) state = State::kReady;
+  else if (stateLength == 10U && text::compare(text, DENTAL_TEXT_LITERAL("needs_sync"), 10U) == 0)
     state = State::kNeedsSync;
-  else if (stateLength == 11U && memcmp(text, "unavailable", 11U) == 0)
+  else if (stateLength == 11U && text::compare(text, DENTAL_TEXT_LITERAL("unavailable"), 11U) == 0)
     state = State::kUnavailable;
   else return false;
   const char* reasonText = separator + 1;
-  if (strcmp(reasonText, "none") == 0) reason = Reason::kNone;
-  else if (strcmp(reasonText, "communication_failure") == 0)
+  if (text::compare(reasonText, DENTAL_TEXT_LITERAL("none")) == 0) reason = Reason::kNone;
+  else if (text::compare(reasonText, DENTAL_TEXT_LITERAL("communication_failure")) == 0)
     reason = Reason::kCommunicationFailure;
-  else if (strcmp(reasonText, "lost_power") == 0) reason = Reason::kLostPower;
-  else if (strcmp(reasonText, "invalid_time") == 0) reason = Reason::kInvalidTime;
-  else if (strcmp(reasonText, "verification_failed") == 0)
+  else if (text::compare(reasonText, DENTAL_TEXT_LITERAL("lost_power")) == 0) reason = Reason::kLostPower;
+  else if (text::compare(reasonText, DENTAL_TEXT_LITERAL("invalid_time")) == 0) reason = Reason::kInvalidTime;
+  else if (text::compare(reasonText, DENTAL_TEXT_LITERAL("verification_failed")) == 0)
     reason = Reason::kVerificationFailed;
   else return false;
   return (state == State::kReady) == (reason == Reason::kNone);

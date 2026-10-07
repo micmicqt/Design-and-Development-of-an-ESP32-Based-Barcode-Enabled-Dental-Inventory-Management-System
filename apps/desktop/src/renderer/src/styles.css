@@ -183,6 +183,7 @@ button:disabled {
   top: 50%;
   right: 7px;
   display: grid;
+  place-items: center;
   width: 37px;
   height: 37px;
   padding: 0;
@@ -2075,6 +2076,119 @@ button:focus-visible {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.sidebar__device-setup {
+  width: 100%;
+  min-height: 32px;
+  margin-top: 13px;
+  color: #dbedff;
+  font-size: 10px;
+  font-weight: 750;
+  background: rgb(255 255 255 / 8%);
+  border: 1px solid rgb(255 255 255 / 15%);
+  border-radius: 7px;
+}
+
+.sidebar__device-setup:hover:not(:disabled) {
+  background: rgb(255 255 255 / 16%);
+}
+
+.device-setup-backdrop {
+  position: fixed;
+  z-index: 30;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(8 31 48 / 64%);
+}
+
+.device-setup-dialog {
+  width: min(100%, 480px);
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+  padding: 27px;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: 0 24px 80px rgb(9 32 48 / 25%);
+}
+
+.device-setup-dialog__heading,
+.device-setup-dialog__actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.device-setup-dialog__heading { margin-bottom: 23px; }
+.device-setup-dialog__heading p { margin: 0 0 4px; color: var(--green); font-size: 11px; font-weight: 800; }
+.device-setup-dialog__heading h2 { margin: 0; font-size: 23px; }
+.device-setup-dialog__close { color: var(--muted); font-size: 24px; background: none; border: 0; }
+.device-setup-dialog form { display: grid; gap: 9px; }
+.device-setup-dialog label { font-size: 12px; font-weight: 750; }
+.device-setup-dialog input {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 12px;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid #cad8d1;
+  border-radius: 8px;
+}
+.device-setup-dialog input:focus { outline: 2px solid #78b7a0; outline-offset: 1px; }
+.device-setup-dialog__hint { margin: 0 0 9px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.device-setup-dialog__token { position: relative; }
+.device-setup-dialog__token input { padding-right: 65px; }
+.device-setup-dialog__token button {
+  position: absolute;
+  top: 50%;
+  right: 9px;
+  transform: translateY(-50%);
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 750;
+  background: transparent;
+  border: 0;
+}
+.device-setup-dialog__error,
+.device-setup-dialog__success { margin: 5px 0; font-size: 11px; line-height: 1.5; }
+.device-setup-dialog__error { color: var(--red); }
+.device-setup-dialog__success { color: var(--green); }
+.device-setup-dialog__actions { margin-top: 13px; }
+.device-setup-dialog__actions button {
+  min-height: 39px;
+  padding: 0 14px;
+  font-size: 11px;
+  font-weight: 750;
+  border-radius: 7px;
+}
+.device-setup-dialog__test { color: var(--green); background: #fff; border: 1px solid #abc9bb; }
+.device-setup-dialog__save { color: #fff; background: var(--green); border: 1px solid var(--green); }
+.device-setup-dialog__section-title { color: var(--green); font-size: 12px; font-weight: 800; margin: 1px 0 7px; }
+.device-setup-dialog__discovery { margin-top: 22px; border-top: 1px solid #dce8e1; padding-top: 18px; }
+.device-setup-dialog__discovery h3 { margin: 0 0 8px; font-size: 15px; }
+.device-setup-dialog__discovery-group { display: grid; gap: 9px; margin-top: 16px; }
+.device-setup-dialog__discovery-group h4 { margin: 0; font-size: 13px; }
+.device-setup-dialog__discovery-group label { font-size: 12px; font-weight: 750; }
+.device-setup-dialog__discovery select {
+  width: 100%; min-height: 39px; padding: 0 10px; border: 1px solid #bfd2c7;
+  border-radius: 7px; background: #fff; color: var(--ink);
+}
+.device-setup-dialog__discovery button {
+  min-height: 35px; padding: 0 11px; border-radius: 7px; border: 1px solid #abc9bb;
+  background: #fff; color: var(--green); font-size: 11px; font-weight: 750;
+}
+.device-setup-dialog__discovery-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.device-setup-dialog__candidates { display: grid; gap: 7px; }
+.device-setup-dialog__candidates p { margin: 0; font-size: 11px; }
+.device-setup-dialog__found {
+  display: grid; gap: 5px; margin-top: 16px; padding: 12px; border: 1px solid #abc9bb;
+  border-radius: 8px; background: #f4faf6; font-size: 12px;
+}
+.device-setup-dialog__found button { justify-self: start; margin-top: 5px; }
 
 .workspace {
   background: var(--canvas);

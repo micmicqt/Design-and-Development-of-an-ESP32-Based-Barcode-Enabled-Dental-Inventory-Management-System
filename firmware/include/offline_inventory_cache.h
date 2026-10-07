@@ -64,6 +64,7 @@ enum class ReadLineResult : uint8_t { kLine, kEnd, kError, kTooLong };
 // the full snapshot in RAM.
 class CacheStorage {
  public:
+  virtual bool trustedRuntimeReads() const { return false; }
   virtual ~CacheStorage() {}
   virtual bool available() const = 0;
   virtual bool exists(const char* path) = 0;
@@ -76,6 +77,10 @@ class CacheStorage {
   virtual bool beginRead(const char* path) = 0;
   virtual ReadLineResult readLine(char* line, size_t capacity) = 0;
   virtual void endRead() = 0;
+  // A cooperative adapter yields before this point and rechecks the durable
+  // journal interlock. Promotion itself remains a non-preemptible sequence.
+  virtual bool beginReplacement() { return true; }
+  virtual void endReplacement() {}
 };
 
 enum class BeginResult : uint8_t {
@@ -104,6 +109,7 @@ enum class CommitResult : uint8_t {
   kValidationFailed,
   kReplacementFailed,
   kStorageUnavailable,
+  kInterlocked,
 };
 
 inline const char* stockStatusName(StockStatus status) {
@@ -725,6 +731,18 @@ class OfflineInventoryCache {
   uint32_t receivedItems() const { return transferReceived_; }
   bool transferActive() const { return transferActive_; }
 
+  // Runtime recovery must never promote, remove, or rewrite cache files.
+  bool validateActiveReadOnly() {
+    if (transferActive_) return false;
+    CacheMetadata active = {};
+    if (!validateComplete(kActiveCachePath, active)) return false;
+    if (installed_.available &&
+        (installed_.itemCount != active.itemCount ||
+         strcmp(installed_.generation, active.generation) != 0)) return false;
+    installed_ = active; // Publish metadata only; no filesystem mutation.
+    return true;
+  }
+
   bool loadAtBoot() {
     resetRuntimeState();
     if (!storage_.available()) return false;
@@ -904,6 +922,11 @@ class OfflineInventoryCache {
     CacheMetadata previousBackup = {};
     const bool activeIsValid = validateComplete(kActiveCachePath, previousActive);
     const bool backupIsValid = validateComplete(kBackupCachePath, previousBackup);
+    if (!storage_.beginReplacement()) return CommitResult::kInterlocked;
+    struct ReplacementScope {
+      CacheStorage& storage;
+      ~ReplacementScope() { storage.endReplacement(); }
+    } replacementScope{storage_};
     if (activeIsValid) {
       if (storage_.exists(kBackupCachePath) &&
           !storage_.remove(kBackupCachePath)) {

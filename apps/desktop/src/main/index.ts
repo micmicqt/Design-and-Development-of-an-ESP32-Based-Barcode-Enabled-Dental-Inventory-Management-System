@@ -1,8 +1,8 @@
-import { app, BrowserWindow, Menu, session } from 'electron'
+import { app, BrowserWindow, Menu, safeStorage, session } from 'electron'
 import { join } from 'node:path'
-import { resolveApplicationPaths } from './application/application-paths'
-import { createAuthSessionController } from './application/auth-session'
-import { createAuthenticationService } from './application/create-authentication-service'
+import { prepareStableUserDataPath, resolveApplicationPaths } from './application/application-paths'
+import { createAuthSessionController, type AuthSessionController } from './application/auth-session'
+import { createAuthenticationService, createFirstRunAdminService } from './application/create-authentication-service'
 import { initializeDatabase, type SqliteDatabase } from './database'
 import {
   ProductImageStore,
@@ -10,17 +10,15 @@ import {
   registerDentalImageSchemePrivileges
 } from './images'
 import { createInventoryService } from './inventory'
-import {
-  resolveEsp32BaseUrl,
-  resolveEsp32DeviceToken
-} from './hardware/hardware-configuration'
+import { DeviceConfigurationStore, type DeviceConfiguration } from './hardware/device-configuration-store'
+import { createBluetoothSelectionController } from './hardware/bluetooth-selection'
 import { Esp32HttpGateway } from './hardware/esp32-http-gateway'
-import type { DesktopHardwareGateway } from './hardware/hardware-gateway'
 import { createOfflineInventoryCacheCoordinator } from './hardware/offline-inventory-cache'
 import { createOfflineSyncCoordinator } from './hardware/offline-sync-coordinator'
 import { createHardwareTransactionCoordinator } from './hardware/hardware-transaction-coordinator'
 import { createRtcRecoveryCoordinator } from './hardware/rtc-recovery-coordinator'
 import { registerAuthIpcHandlers } from './ipc/register-auth-handlers'
+import { registerDeviceSetupIpcHandlers } from './ipc/register-device-setup-handlers'
 import { registerHardwareIpcHandlers } from './ipc/register-hardware-handlers'
 import { registerInventoryIpcHandlers } from './ipc/register-inventory-handlers'
 
@@ -29,12 +27,13 @@ let disposeIpcHandlers: (() => void) | null = null
 let disposeImageProtocol: (() => void) | null = null
 let database: SqliteDatabase | null = null
 let imageStore: ProductImageStore | null = null
-let hardwareGateway: DesktopHardwareGateway | null = null
 
-const WINDOW_TITLE = 'Any Time Dental — Dental Inventory Management System'
+const WINDOW_TITLE = 'Any Time Dental Inventory System'
 
-// Keep the internal app name stable so existing userData and database paths do not move.
-app.setName('Dental Inventory System')
+// Visible branding can change without moving the existing clinic database or
+// product images. This must run before app.whenReady() and database startup.
+app.setName('Any Time Dental Inventory System')
+app.setPath('userData', prepareStableUserDataPath(app.getPath('appData')))
 registerDentalImageSchemePrivileges()
 
 function getDevelopmentDatabasePath(): string | undefined {
@@ -51,15 +50,21 @@ function closeApplicationResources(): void {
   disposeImageProtocol = null
   imageStore?.clearSelections()
   imageStore = null
-  hardwareGateway = null
   database?.close()
   database = null
 }
 
-function configureApplicationSecurity(): void {
-  session.defaultSession.setPermissionCheckHandler(() => false)
-  session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
-    callback(false)
+function bluetoothPermissionAllowed(contents: Electron.WebContents | null, permission: string,
+                                   authSession: AuthSessionController): boolean {
+  return permission === 'bluetooth' && contents !== null && mainWindow !== null &&
+    contents === mainWindow.webContents && authSession.isAuthenticated()
+}
+
+function configureApplicationSecurity(authSession: AuthSessionController): void {
+  session.defaultSession.setPermissionCheckHandler((contents, permission) =>
+    bluetoothPermissionAllowed(contents, String(permission), authSession))
+  session.defaultSession.setPermissionRequestHandler((contents, permission, callback) => {
+    callback(bluetoothPermissionAllowed(contents, String(permission), authSession))
   })
 
   app.on('web-contents-created', (_event, contents) => {
@@ -110,7 +115,8 @@ async function startDesktopApplication(): Promise<void> {
   await app.whenReady()
 
   Menu.setApplicationMenu(null)
-  configureApplicationSecurity()
+  const authSession = createAuthSessionController()
+  configureApplicationSecurity(authSession)
   const applicationPaths = resolveApplicationPaths(
     app.getPath('userData'),
     getDevelopmentDatabasePath()
@@ -119,75 +125,70 @@ async function startDesktopApplication(): Promise<void> {
   imageStore = new ProductImageStore(applicationPaths.productImagesDirectory)
   await imageStore.initialize()
 
-  const authSession = createAuthSessionController()
+  const bluetoothSelection = createBluetoothSelectionController(authSession)
   const getMainWindow = (): BrowserWindow | null => mainWindow
   const inventoryService = createInventoryService(database)
-  const esp32BaseUrl = resolveEsp32BaseUrl()
-  const esp32DeviceToken = resolveEsp32DeviceToken()
-  if (esp32BaseUrl !== null && esp32DeviceToken === null) {
-    console.warn(
-      '[RTC recovery] skipped: DEVICE_TOKEN_UNCONFIGURED; set the matching token in ignored apps/desktop/.env.local.'
-    )
-  }
-  hardwareGateway =
-    esp32BaseUrl === null
-      ? null
-      : new Esp32HttpGateway({
-          baseUrl: esp32BaseUrl,
-          deviceToken: esp32DeviceToken
-        })
-  const transactionCoordinator = createHardwareTransactionCoordinator({
-    inventoryService,
-    gateway: hardwareGateway
-  })
-  const offlineInventoryCacheCoordinator =
-    hardwareGateway === null
-      ? null
-      : createOfflineInventoryCacheCoordinator({
-          inventoryService,
-          gateway: hardwareGateway
-        })
-  const offlineSyncCoordinator =
-    hardwareGateway === null || offlineInventoryCacheCoordinator === null
-      ? null
-      : createOfflineSyncCoordinator({
-          inventoryService,
-          gateway: hardwareGateway,
-          offlineInventoryCacheCoordinator
-        })
-  const rtcRecoveryCoordinator =
-    hardwareGateway === null
-      ? null
-      : createRtcRecoveryCoordinator({ gateway: hardwareGateway })
+  const deviceConfigurationStore = new DeviceConfigurationStore(app.getPath('userData'), safeStorage)
 
   disposeImageProtocol = registerDentalImageProtocol(session.defaultSession, imageStore)
   mainWindow = createMainWindow()
+  bluetoothSelection.attach(mainWindow)
 
   const disposeAuthHandlers = registerAuthIpcHandlers(
     createAuthenticationService(database),
+    createFirstRunAdminService(database),
     authSession,
     getMainWindow
   )
-  const disposeInventoryHandlers = registerInventoryIpcHandlers({
-    inventoryService,
-    imageStore,
-    authSession,
-    getMainWindow,
-    offlineInventoryCacheCoordinator
-  })
-  const disposeHardwareHandlers = registerHardwareIpcHandlers({
-    gateway: hardwareGateway,
-    inventoryService,
-    transactionCoordinator,
-    offlineInventoryCacheCoordinator,
-    offlineSyncCoordinator,
-    rtcRecoveryCoordinator,
-    authSession,
-    getMainWindow
+  let disposeInventoryHandlers: (() => void) | null = null
+  let disposeHardwareHandlers: (() => void) | null = null
+  let pendingHardwareMutations = 0
+  function activateHardware(configuration: {
+    baseUrl: string
+    deviceToken: string | null
+  } | null): void {
+    // The renderer owns the sole polling loops. Switching IPC registrations
+    // routes subsequent calls to a fresh immutable gateway/coordinator set;
+    // any call already running finishes against its original device.
+    const nextGateway = configuration === null ? null : new Esp32HttpGateway(configuration)
+    const transactionCoordinator = createHardwareTransactionCoordinator({
+      inventoryService, gateway: nextGateway
+    })
+    const offlineInventoryCacheCoordinator = nextGateway === null ? null :
+      createOfflineInventoryCacheCoordinator({ inventoryService, gateway: nextGateway })
+    const offlineSyncCoordinator = nextGateway === null || offlineInventoryCacheCoordinator === null
+      ? null : createOfflineSyncCoordinator({
+          inventoryService, gateway: nextGateway, offlineInventoryCacheCoordinator
+        })
+    const rtcRecoveryCoordinator = nextGateway === null ? null :
+      createRtcRecoveryCoordinator({ gateway: nextGateway })
+
+    disposeHardwareHandlers?.()
+    disposeInventoryHandlers?.()
+    disposeInventoryHandlers = registerInventoryIpcHandlers({
+      inventoryService, imageStore: imageStore!, authSession, getMainWindow,
+      offlineInventoryCacheCoordinator
+    })
+    disposeHardwareHandlers = registerHardwareIpcHandlers({
+      gateway: nextGateway, inventoryService, transactionCoordinator,
+      offlineInventoryCacheCoordinator, offlineSyncCoordinator,
+      rtcRecoveryCoordinator, authSession, getMainWindow,
+      unconfigured: configuration === null,
+      onMutationPendingChange: (pending) => { pendingHardwareMutations = pending }
+    })
+  }
+  activateHardware(deviceConfigurationStore.resolve().configuration)
+  const disposeDeviceSetupHandlers = registerDeviceSetupIpcHandlers({
+    store: deviceConfigurationStore, authSession, getMainWindow,
+    canActivate: () => pendingHardwareMutations === 0,
+    activate: (configuration: DeviceConfiguration) => activateHardware(configuration),
+    selectBluetooth: (id) => bluetoothSelection.select(id)
   })
   disposeIpcHandlers = () => {
-    disposeHardwareHandlers()
-    disposeInventoryHandlers()
+    disposeDeviceSetupHandlers()
+    bluetoothSelection.cancel()
+    disposeHardwareHandlers?.()
+    disposeInventoryHandlers?.()
     disposeAuthHandlers()
   }
 
@@ -196,6 +197,7 @@ async function startDesktopApplication(): Promise<void> {
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = createMainWindow()
+      bluetoothSelection.attach(mainWindow)
       await loadMainWindow(mainWindow)
     }
   })
@@ -210,7 +212,7 @@ app.on('before-quit', () => {
 })
 
 void startDesktopApplication().catch((error: unknown) => {
-  console.error('Unable to start Dental Inventory System.', error)
+  console.error('Unable to start Any Time Dental Inventory System.', error)
   closeApplicationResources()
   app.quit()
 })

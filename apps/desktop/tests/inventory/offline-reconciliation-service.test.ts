@@ -209,6 +209,17 @@ describe("InventoryService offline reconciliation", () => {
           .prepare("SELECT COUNT(*) AS count FROM offline_reconciliation_receipts")
           .get(),
       ).toEqual({ count: 1 });
+      // A legacy collision survives another close/reopen, including a lost ACK.
+      inventory = createInventoryService(database, { createTransactionId: () => "collision-after-reopen" });
+      const collision = { ...event, timestamp: "2026-10-07 01:07:22", resultingStock: 4 };
+      const collidingApplied = inventory.reconcileOfflineEvent(collision);
+      database.close();
+      database = initializeDatabase({ databasePath });
+      inventory = createInventoryService(database, { createTransactionId: () => "never-insert" });
+      expect(inventory.reconcileOfflineEvent(collision)).toEqual({ status: "ALREADY_APPLIED", receipt: collidingApplied.receipt });
+      expect(inventory.reconcileOfflineEvent(event).status).toBe("ALREADY_APPLIED");
+      expect(inventory.findProductByBarcode("reopen-001")?.currentStock).toBe(4);
+      expect(inventory.listMovementHistory()).toHaveLength(2);
     } finally {
       if (database.open) database.close();
       rmSync(directory, { recursive: true, force: true });
@@ -230,6 +241,71 @@ describe("InventoryService offline reconciliation", () => {
     );
     expect(inventory.findProductByBarcode("000123")?.currentStock).toBe(6);
     expect(inventory.listMovementHistory()).toHaveLength(1);
+  });
+
+  it("distinguishes later legacy reuse and replays each immutable payload exactly once", () => {
+    const original = pendingEvent();
+    const reused = pendingEvent({ timestamp: "2026-10-07 01:07:22", resultingStock: 11 });
+    const third = pendingEvent({ timestamp: "2026-10-07 03:06:23", resultingStock: 12 });
+    for (const event of [original, reused, third]) {
+      const applied = inventory.reconcileOfflineEvent(event);
+      expect(applied.status).toBe("APPLIED");
+      expect(applied.receipt.eventId).toBe(event.eventId); // physical ACK identity is unchanged
+      expect(inventory.reconcileOfflineEvent(event)).toEqual({ status: "ALREADY_APPLIED", receipt: applied.receipt });
+    }
+    // Older identical payload is still a duplicate after accepting later payloads.
+    expect(inventory.reconcileOfflineEvent(original).status).toBe("ALREADY_APPLIED");
+    expect(inventory.findProductByBarcode("000123")?.currentStock).toBe(8);
+    expect(inventory.listMovementHistory()).toHaveLength(3);
+    const identities = database.prepare("SELECT receipt_id, identity_kind FROM offline_event_identities").all();
+    expect(identities).toEqual([
+      { receipt_id: original.eventId, identity_kind: "NORMAL" },
+      { receipt_id: expect.stringMatching(/^lc-[0-9a-f]{60}$/), identity_kind: "LEGACY_COLLISION" },
+      { receipt_id: expect.stringMatching(/^lc-[0-9a-f]{60}$/), identity_kind: "LEGACY_COLLISION" },
+    ]);
+    expect(new Set(identities.map((row) => (row as { receipt_id: string }).receipt_id)).size).toBe(3);
+  });
+
+  it.each([
+    { event: pendingEvent({ eventId: "off-ABCDEF123456-8000000000000000" }), later: true },
+    { event: pendingEvent(), later: false },
+  ])("keeps corrected IDs and older changed legacy payloads strict ($later)", ({ event, later }) => {
+    inventory.reconcileOfflineEvent(event);
+    expect(() => inventory.reconcileOfflineEvent({ ...event,
+      timestamp: later ? "2026-10-07 01:07:22" : "2026-09-08 10:11:12", resultingStock: 12,
+    })).toThrowError(expect.objectContaining({ code: "EVENT_ID_CONFLICT" }));
+    expect(inventory.findProductByBarcode("000123")?.currentStock).toBe(6);
+    expect(inventory.listMovementHistory()).toHaveLength(1);
+  });
+
+  it("still validates product identity for a later legacy collision", () => {
+    inventory.reconcileOfflineEvent(pendingEvent());
+    expect(() => inventory.reconcileOfflineEvent(pendingEvent({
+      timestamp: "2026-10-07 01:07:22", barcode: "00123",
+    }))).toThrowError(expect.objectContaining({ code: "PRODUCT_IDENTITY_CONFLICT" }));
+    expect(inventory.findProductByBarcode("000123")?.currentStock).toBe(6);
+    expect(inventory.listMovementHistory()).toHaveLength(1);
+  });
+
+  it("applies a validated later legacy reuse to its different product, never cached stock or the historical product", () => {
+    const historical = inventory.reconcileOfflineEvent(pendingEvent());
+    const newProduct = inventory.createProduct({ barcode: "9556006060346", itemName: "Lotion",
+      category: "General", initialStock: 10, lowStockThreshold: 2 });
+    const reused = pendingEvent({ timestamp: "2026-10-07 01:07:22", productId: String(newProduct.id),
+      barcode: newProduct.barcode, resultingStock: 11, stockStatus: "HIGH", cacheGeneration: `v1-${"b".repeat(64)}` });
+    const applied = inventory.reconcileOfflineEvent(reused);
+    expect(applied.receipt).toMatchObject({ previousStock: 10, newTotal: 11, barcode: newProduct.barcode });
+    expect(inventory.reconcileOfflineEvent(reused)).toEqual({ status: "ALREADY_APPLIED", receipt: applied.receipt });
+    expect(inventory.reconcileOfflineEvent(pendingEvent()).receipt).toEqual(historical.receipt);
+    expect(inventory.findProductByBarcode("000123")?.currentStock).toBe(6);
+    expect(inventory.listMovementHistory()).toHaveLength(2);
+  });
+
+  it("rolls back stock/history/receipt if fingerprint insertion fails", () => {
+    database.exec(`CREATE TRIGGER fail_identity BEFORE INSERT ON offline_event_identities
+      BEGIN SELECT RAISE(ABORT, 'injected identity failure'); END;`);
+    expect(() => inventory.reconcileOfflineEvent(pendingEvent())).toThrow(/injected identity failure/);
+    expectNoOfflineMutation();
   });
 
   it.each([

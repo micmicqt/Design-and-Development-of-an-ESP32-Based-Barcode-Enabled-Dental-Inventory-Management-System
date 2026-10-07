@@ -6,6 +6,7 @@ import {
   type HardwareTransactionCoordinatorError,
   type HardwareTransactionInventoryService
 } from '../../src/main/hardware/hardware-transaction-coordinator'
+import { HardwareGatewayError } from '../../src/main/hardware/esp32-http-gateway'
 import type { HardwareTransactionEventGateway } from '../../src/main/hardware/hardware-gateway'
 import type {
   HardwareTransactionEvent,
@@ -112,9 +113,94 @@ describe('hardware transaction coordinator', () => {
 
     await expect(
       coordinator.processTransaction({ eventId: event.eventId, quantity: 2 })
-    ).rejects.toThrow('simulated SQLite failure')
+    ).rejects.toMatchObject<Partial<HardwareTransactionCoordinatorError>>({
+      code: 'DATABASE_FAILURE'
+    })
     expect(gateway.deliverTransactionResult).not.toHaveBeenCalled()
     expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  })
+
+  it('does not enter SQLite when the pending ESP32 head cannot be verified', async () => {
+    const gateway = createGateway()
+    const inventory = createInventory()
+    vi.mocked(gateway.getNextTransactionEvent).mockRejectedValueOnce(new Error('private LAN URL'))
+    const coordinator = createHardwareTransactionCoordinator({ inventoryService: inventory, gateway })
+
+    await expect(
+      coordinator.processTransaction({ eventId: event.eventId, quantity: 2 })
+    ).rejects.toMatchObject<Partial<HardwareTransactionCoordinatorError>>({
+      code: 'HARDWARE_UNAVAILABLE'
+    })
+    expect(inventory.processHardwareTransaction).not.toHaveBeenCalled()
+    expect(gateway.deliverTransactionResult).not.toHaveBeenCalled()
+    expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  })
+
+  it('keeps timeout, empty head, and genuine mismatch distinct before SQLite', async () => {
+    const gateway = createGateway()
+    const inventory = createInventory()
+    const coordinator = createHardwareTransactionCoordinator({ inventoryService: inventory, gateway })
+    vi.mocked(gateway.getNextTransactionEvent)
+      .mockRejectedValueOnce(new HardwareGatewayError(
+        'UNAVAILABLE', 'private URL', 'REQUEST_TIMEOUT'
+      ))
+      .mockRejectedValueOnce(new HardwareGatewayError(
+        'UNAVAILABLE', 'private URL', 'REQUEST_TIMEOUT'
+      ))
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ ...event, eventId: 'evt-different' })
+
+    await expect(coordinator.processTransaction({ eventId: event.eventId, quantity: 2 }))
+      .rejects.toMatchObject({ code: 'HARDWARE_UNAVAILABLE', failureCategory: 'TRANSPORT_TIMEOUT' })
+    await expect(coordinator.processTransaction({ eventId: event.eventId, quantity: 2 }))
+      .rejects.toMatchObject({ code: 'EVENT_NOT_PENDING' })
+    await expect(coordinator.processTransaction({ eventId: event.eventId, quantity: 2 }))
+      .rejects.toMatchObject({ code: 'EVENT_MISMATCH' })
+    expect(inventory.processHardwareTransaction).not.toHaveBeenCalled()
+    expect(gateway.deliverTransactionResult).not.toHaveBeenCalled()
+    expect(gateway.acknowledgeTransactionEvent).not.toHaveBeenCalled()
+  })
+
+  it('retries a timed-out read once and still commits only the matching authoritative head', async () => {
+    const gateway = createGateway()
+    const inventory = createInventory()
+    vi.mocked(gateway.getNextTransactionEvent)
+      .mockRejectedValueOnce(new HardwareGatewayError(
+        'UNAVAILABLE', 'response delayed', 'REQUEST_TIMEOUT'
+      ))
+      .mockResolvedValue(event)
+    const coordinator = createHardwareTransactionCoordinator({ inventoryService: inventory, gateway })
+
+    await expect(coordinator.processTransaction({ eventId: event.eventId, quantity: 2 }))
+      .resolves.toEqual({ receipt: deliveredReceipt, acknowledged: true })
+    expect(gateway.getNextTransactionEvent).toHaveBeenCalledTimes(3)
+    expect(inventory.processHardwareTransaction).toHaveBeenCalledExactlyOnceWith({ event, quantity: 2 })
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(event.eventId)
+  })
+
+  it('logs only safe event correlation when opt-in diagnostics are enabled', async () => {
+    const previous = process.env.DENTAL_HARDWARE_EVENT_DEBUG
+    process.env.DENTAL_HARDWARE_EVENT_DEBUG = '1'
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
+    try {
+      const gateway = createGateway()
+      const inventory = createInventory()
+      vi.mocked(gateway.getNextTransactionEvent).mockResolvedValueOnce({
+        ...event, eventId: 'evt-different', barcode: 'SECRET-BARCODE'
+      })
+      const coordinator = createHardwareTransactionCoordinator({ inventoryService: inventory, gateway })
+      await expect(coordinator.processTransaction({ eventId: event.eventId, quantity: 2 }))
+        .rejects.toMatchObject({ code: 'EVENT_MISMATCH' })
+      const output = JSON.stringify(debug.mock.calls)
+      expect(output).toContain('evt-different')
+      expect(output).toContain('DIFFERENT_EVENT')
+      expect(output).not.toContain('SECRET-BARCODE')
+      expect(output).not.toContain('0004806016001569')
+    } finally {
+      debug.mockRestore()
+      if (previous === undefined) delete process.env.DENTAL_HARDWARE_EVENT_DEBUG
+      else process.env.DENTAL_HARDWARE_EVENT_DEBUG = previous
+    }
   })
 
   it('keeps a committed receipt pending when result delivery fails and retries without mutation', async () => {

@@ -155,9 +155,10 @@ export function registerInventoryIpcHandlers(
     getMainWindow,
     offlineInventoryCacheCoordinator = null
   } = options
+  let disposed = false
 
   function refreshOfflineCacheAfterMutation(): void {
-    if (offlineInventoryCacheCoordinator === null) return
+    if (disposed || offlineInventoryCacheCoordinator === null) return
     try {
       void offlineInventoryCacheCoordinator.refresh().catch(() => {
         // The desktop database is authoritative. A cache transport failure must
@@ -175,7 +176,13 @@ export function registerInventoryIpcHandlers(
 
       try {
         const barcode = validateBarcodeLookupPayload(rawBarcode)
+        const startedAt = performance.now()
         const product = inventoryService.findProductByBarcode(barcode)
+        if (process.env.DENTAL_HARDWARE_TIMING_DEBUG === '1') {
+          console.debug(
+            `[hardware timing] local barcode lookup ${Math.round(performance.now() - startedAt)}ms`
+          )
+        }
         return ok(product === null ? null : toProductDto(product, imageStore))
       } catch (error: unknown) {
         return sanitizedFailure(error)
@@ -343,6 +350,7 @@ export function registerInventoryIpcHandlers(
   )
 
   return () => {
+    disposed = true
     ipcMain.removeHandler(IPC_CHANNELS.productsFindByBarcode)
     ipcMain.removeHandler(IPC_CHANNELS.productsList)
     ipcMain.removeHandler(IPC_CHANNELS.productsCreate)

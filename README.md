@@ -1,6 +1,35 @@
-# Dental Inventory System
+# Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System
 
 Phase 7 safe, exactly-once offline synchronization for the capstone **Design and Development of an ESP32-Based Barcode-Enabled Dental Inventory Management System**.
+
+## Current integrated architecture
+
+The **ATmega328P main controller** owns the GM65 scanner, RESTOCK/CHECKOUT
+buttons, 20x4 I2C LCD, DS3231 RTC, encoded status outputs, and MicroSD SPI.
+The **ESP32 connectivity bridge** provides optional Wi-Fi STA plus the local
+`Design` access point, HTTP API, controller transport, online/offline routing,
+and the remote-sector FatFs/cache/journal layer. The **Electron + React +
+TypeScript desktop application** owns authoritative SQLite inventory/history
+and exactly-once reconciliation.
+
+The system supports online quantity-confirmed transactions, durable one-unit
+offline transactions, barcode registration, stock feedback, device setup, and
+oldest-first pending synchronization followed by authoritative cache publication.
+See [the current storage guide](docs/atmega-step5-storage-migration.md),
+[identity and feedback notes](docs/offline-event-identity-and-feedback.md), and
+[Windows packaging guide](apps/desktop/PACKAGING.md). Earlier phase-specific
+instructions below are historical where superseded by these current guides.
+
+Fresh installations create the first administrator through the application's
+first-run setup. No default account, developer database, or credentials are
+bundled. Existing accounts and AppData storage remain unchanged. The credential
+CLI below is an optional development/maintenance tool, not a clinic deployment
+prerequisite.
+
+Before building ESP32 firmware, copy `firmware/include/secrets.example.h` to the
+ignored `firmware/include/secrets.h` and configure deployment-local values.
+`DENTAL_AP_PASSWORD` supplies the hotspot password; the SSID remains `Design`.
+Never publish that file, local `.env` files, device settings, or database copies.
 
 This repository currently provides:
 
@@ -39,6 +68,7 @@ or create an offline pending event.
 apps/desktop/       Electron main/preload processes and React renderer
 packages/protocol/  Shared protocol types, JSON Schema, and validator
 firmware/           ESP32 PlatformIO firmware and host-native protocol tests
+firmware-atmega/    Bare-metal Uno/ATmega main-controller firmware and tests
 docs/               Hardware validation gate and unresolved questions
 ```
 
@@ -135,6 +165,12 @@ Then:
 React communicates only through narrow authentication, inventory, hardware-status, pending-event inspection, and parameter-free synchronization methods exposed by the preload. It cannot provide reconciliation event data or access SQLite, Node.js, the filesystem, generic Electron APIs, or hardware sockets directly.
 
 ### Local ESP32 status connection
+
+During the incremental ATmega migration, Step 5 makes the ATmega the physical
+MicroSD SPI owner on D10-D13 while the ESP32 retains the proven FAT/file and
+desktop protocol layers over a bounded sector bridge. Existing cache, journal,
+timestamp, idempotency, and synchronization semantics remain unchanged. See
+[the ATmega Step 5 storage guide](docs/atmega-step5-storage-migration.md).
 
 Phase 7 Step 3 drains the durable journal one event at a time. Each event is
 atomically reconciled (or recognized by its Step 7.2 receipt) before Electron

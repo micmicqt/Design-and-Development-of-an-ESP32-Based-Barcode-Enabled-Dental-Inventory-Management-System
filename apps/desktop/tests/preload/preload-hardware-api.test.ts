@@ -1,18 +1,21 @@
 // @vitest-environment node
 
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DesktopApi } from '../../src/shared/ipc-contract'
 import { IPC_CHANNELS } from '../../src/shared/ipc-contract'
 
 const electronMock = vi.hoisted(() => ({
   exposeInMainWorld: vi.fn(),
   invoke: vi.fn(),
-  getPathForFile: vi.fn()
+  getPathForFile: vi.fn(),
+  on: vi.fn(),
+  removeListener: vi.fn()
 }))
 
 vi.mock('electron', () => ({
   contextBridge: { exposeInMainWorld: electronMock.exposeInMainWorld },
-  ipcRenderer: { invoke: electronMock.invoke },
+  ipcRenderer: { invoke: electronMock.invoke, on: electronMock.on,
+    removeListener: electronMock.removeListener },
   webUtils: { getPathForFile: electronMock.getPathForFile }
 }))
 
@@ -29,6 +32,67 @@ describe('preload hardware API', () => {
   })
 
   beforeEach(() => electronMock.invoke.mockReset())
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('exposes only narrow device setup IPC and no filesystem or secret getter', async () => {
+    electronMock.invoke.mockResolvedValue({ ok: true })
+    await api.deviceSetup.getConfiguration()
+    await api.deviceSetup.testConnection('http://device')
+    await api.deviceSetup.saveConfiguration('http://device', 'replacement-token')
+    await api.deviceSetup.listSerialPorts()
+    await api.deviceSetup.identifyUsbDevice('COM5')
+    await api.deviceSetup.selectBluetoothDevice('selected-id')
+    expect(electronMock.invoke.mock.calls).toEqual([
+      [IPC_CHANNELS.deviceSetupGet],
+      [IPC_CHANNELS.deviceSetupTest, 'http://device'],
+      [IPC_CHANNELS.deviceSetupSave, { address: 'http://device', token: 'replacement-token' }],
+      [IPC_CHANNELS.deviceSetupListSerialPorts],
+      [IPC_CHANNELS.deviceSetupIdentifyUsb, 'COM5'],
+      [IPC_CHANNELS.deviceSetupSelectBluetooth, 'selected-id']
+    ])
+    expect(Object.isFrozen(api.deviceSetup)).toBe(true)
+    expect(api.deviceSetup).not.toHaveProperty('decrypt')
+    expect(api.deviceSetup).not.toHaveProperty('readFile')
+  })
+
+  it('reads only the fixed BLE discovery characteristic and disconnects afterward', async () => {
+    const disconnect = vi.fn()
+    const readValue = vi.fn().mockResolvedValue(new DataView(new TextEncoder().encode(
+      '@ATD:DEVICE:1:ATD-1234ABCD:1:192.168.1.105:0.1.0'
+    ).buffer))
+    const getCharacteristic = vi.fn().mockResolvedValue({ readValue })
+    const getPrimaryService = vi.fn().mockResolvedValue({ getCharacteristic })
+    const requestDevice = vi.fn().mockResolvedValue({ gatt: {
+      connect: vi.fn().mockResolvedValue({ getPrimaryService }), disconnect
+    } })
+    vi.stubGlobal('navigator', { bluetooth: { requestDevice } })
+    const onCandidates = vi.fn()
+    await expect(api.deviceSetup.scanBluetooth(onCandidates)).resolves.toMatchObject({
+      ok: true, value: { deviceId: 'ATD-1234ABCD', ipAddress: '192.168.1.105' }
+    })
+    expect(requestDevice).toHaveBeenCalledWith({ filters: [{ services: [
+      '4e6a1000-8eab-4c73-9c6e-1f749d86a0d1'
+    ] }] })
+    expect(getPrimaryService).toHaveBeenCalledWith('4e6a1000-8eab-4c73-9c6e-1f749d86a0d1')
+    expect(getCharacteristic).toHaveBeenCalledWith('4e6a1001-8eab-4c73-9c6e-1f749d86a0d1')
+    expect(disconnect).toHaveBeenCalledOnce()
+  })
+
+  it('exposes only fixed first-run administrator IPC channels', async () => {
+    electronMock.invoke.mockResolvedValueOnce(true)
+    await expect(api.auth.needsSetup()).resolves.toBe(true)
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(IPC_CHANNELS.authGetSetupState)
+
+    electronMock.invoke.mockClear()
+    electronMock.invoke.mockResolvedValueOnce({ ok: true })
+    await expect(api.auth.createFirstAdmin({
+      username: 'clinic-admin', password: 'a secure clinic password'
+    })).resolves.toEqual({ ok: true })
+    expect(electronMock.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.authCreateFirstAdmin,
+      { username: 'clinic-admin', password: 'a secure clinic password' }
+    )
+  })
 
   it('exposes only a parameter-free hardware status invocation', async () => {
     const expected = {

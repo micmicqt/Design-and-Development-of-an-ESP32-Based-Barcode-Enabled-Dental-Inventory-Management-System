@@ -1,6 +1,5 @@
 #include "scanner_uart.h"
 
-// The scanner API and PC0/PC1 interrupt implementation are co-located with the
-// controller software UART in uart_link.cpp. Both channels share Timer1's two
-// compare vectors through one earliest-deadline scheduler; separate vector
-// definitions here would be unsafe.
+// The scanner API and USART0 interrupt implementation are co-located with the
+// controller transport in uart_link.cpp. Timer1/PCINT2 belong to the independent
+// D6/D7 controller software UART.

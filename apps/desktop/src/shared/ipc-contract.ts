@@ -33,6 +33,8 @@ export type MovementAction = (typeof MOVEMENT_ACTIONS)[number]
 
 export const IPC_CHANNELS = {
   authGetSession: 'auth:get-session',
+  authGetSetupState: 'auth:get-setup-state',
+  authCreateFirstAdmin: 'auth:create-first-admin',
   authLogin: 'auth:login',
   authLogout: 'auth:logout',
   productsList: 'products:list',
@@ -54,12 +56,54 @@ export const IPC_CHANNELS = {
   hardwareProcessTransaction: 'hardware:process-transaction',
   hardwareRetryTransactionResultDelivery: 'hardware:retry-transaction-result-delivery',
   hardwareRetryTransactionAcknowledgement: 'hardware:retry-transaction-acknowledgement',
-  hardwareCaptureRegistrationBarcode: 'hardware:capture-registration-barcode'
+  hardwareCaptureRegistrationBarcode: 'hardware:capture-registration-barcode',
+  deviceSetupGet: 'device-setup:get',
+  deviceSetupTest: 'device-setup:test',
+  deviceSetupSave: 'device-setup:save',
+  deviceSetupListSerialPorts: 'device-setup:list-serial-ports',
+  deviceSetupIdentifyUsb: 'device-setup:identify-usb',
+  deviceSetupSelectBluetooth: 'device-setup:select-bluetooth'
 } as const
 
-export type HardwareConnectionStatus = 'CONNECTED' | 'OFFLINE'
+export type HardwareConnectionStatus = 'CONNECTED' | 'CHECKING' | 'OFFLINE' | 'NOT_CONFIGURED'
+
+export interface DeviceConfigurationSummary {
+  address: string | null
+  tokenConfigured: boolean
+  source: 'saved' | 'environment' | 'none'
+}
+
+export type DeviceConnectionTest =
+  | { status: 'CONNECTED' }
+  | { status: 'TIMEOUT' | 'UNAVAILABLE' }
+
+export interface SerialPortSummary {
+  path: string
+  manufacturer: string | null
+  product: string | null
+}
+
+export interface DiscoveredInventoryDevice {
+  deviceId: string
+  name: 'Any Time Dental Inventory Device'
+  firmware: string
+  wifiConnected: boolean
+  ipAddress: string | null
+}
+
+export interface BluetoothCandidate {
+  id: string
+  name: string
+}
 
 export type HardwareMode = 'idle' | 'restock' | 'checkout' | 'busy'
+export type OfflineJournalState =
+  | 'ready' | 'empty' | 'temporarily_unavailable' | 'recovering'
+  | 'corrupt' | 'full' | 'generation_mismatch'
+export type OfflineJournalReason =
+  | 'none' | 'remote_sector_read_failed' | 'not_initialized' | 'invalid_header'
+  | 'invalid_record' | 'crc_mismatch' | 'write_uncertain'
+  | 'capacity_reached' | 'cache_generation_mismatch'
 export type HardwareRtcState = 'unavailable' | 'needs_sync' | 'ready'
 export type HardwareRtcReason =
   | 'none'
@@ -80,6 +124,10 @@ export interface HardwareStatusDto {
   /** Omitted when connected firmware predates durable offline journaling. */
   pendingSyncItems?: number
   offlineReady?: boolean
+  offlineJournalState?: OfflineJournalState
+  offlineJournalReason?: OfflineJournalReason
+  offlineAckState?: 'IDLE' | 'QUEUED' | 'RUNNING' | 'VERIFYING' | 'SUCCEEDED' | 'FAILED'
+  offlineAckEventId?: string | null
 }
 
 export type HardwareTransactionMode = 'restock' | 'checkout'
@@ -234,6 +282,10 @@ export interface LoginCredentials {
   password: string
 }
 
+export type FirstAdminSetupResult =
+  | { ok: true }
+  | { ok: false; code: 'INVALID_CREDENTIALS' | 'ALREADY_CONFIGURED' | 'UNAVAILABLE' }
+
 export interface AuthSession {
   authenticated: boolean
   username: string | null
@@ -258,6 +310,7 @@ export const IPC_ERROR_CODES = [
   'IMAGE_INVALID_TYPE',
   'IMAGE_TOO_LARGE',
   'IMAGE_UNAVAILABLE',
+  'DEVICE_DISCOVERY_FAILED',
   'INTERNAL_ERROR'
 ] as const
 
@@ -342,6 +395,8 @@ export interface MovementHistoryDto {
 export interface DesktopApi {
   auth: {
     getSession: () => Promise<AuthSession>
+    needsSetup: () => Promise<boolean>
+    createFirstAdmin: (credentials: LoginCredentials) => Promise<FirstAdminSetupResult>
     login: (credentials: LoginCredentials) => Promise<LoginResult>
     logout: () => Promise<AuthSession>
   }
@@ -376,5 +431,14 @@ export interface DesktopApi {
     retryTransactionAcknowledgement: (eventId: string) => Promise<IpcResult<HardwareTransactionOutcome>>
     /** Triggers one isolated scanner capture that cannot create a stock transaction. */
     captureRegistrationBarcode: () => Promise<IpcResult<{ barcode: string }>>
+  }
+  deviceSetup: {
+    getConfiguration: () => Promise<IpcResult<DeviceConfigurationSummary>>
+    testConnection: (address: string) => Promise<IpcResult<DeviceConnectionTest>>
+    saveConfiguration: (address: string, token: string) => Promise<IpcResult<DeviceConfigurationSummary>>
+    listSerialPorts: () => Promise<IpcResult<SerialPortSummary[]>>
+    identifyUsbDevice: (port: string) => Promise<IpcResult<DiscoveredInventoryDevice>>
+    scanBluetooth: (onCandidates: (candidates: BluetoothCandidate[]) => void) => Promise<IpcResult<DiscoveredInventoryDevice>>
+    selectBluetoothDevice: (id: string) => Promise<void>
   }
 }

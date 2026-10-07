@@ -7,14 +7,24 @@ import type {
 } from '../../src/shared/ipc-contract'
 import type { OfflineInventoryCacheCoordinator } from '../../src/main/hardware/offline-inventory-cache'
 import {
-  createOfflineSyncCoordinator,
+  createOfflineSyncCoordinator as createProductionOfflineSyncCoordinator,
+  type CreateOfflineSyncCoordinatorOptions,
   type OfflineSyncCoordinatorError,
   type OfflineSyncGateway,
   type OfflineSyncInventoryService
 } from '../../src/main/hardware/offline-sync-coordinator'
 import { OfflineReconciliationConflictError } from '../../src/main/inventory'
+import { HardwareGatewayError } from '../../src/main/hardware/esp32-http-gateway'
 
 const cacheGeneration = `v1-${'a'.repeat(64)}`
+
+function createOfflineSyncCoordinator(options: CreateOfflineSyncCoordinatorOptions) {
+  return createProductionOfflineSyncCoordinator({
+    ...options,
+    // Keep the production recovery interval while making mocked tests instant.
+    waitForAcknowledgementRecovery: async () => undefined
+  })
+}
 
 function pendingEvent(sequence: number): OfflinePendingEvent {
   return {
@@ -93,6 +103,33 @@ function createCacheCoordinator(): OfflineInventoryCacheCoordinator {
 }
 
 describe('offline sync coordinator', () => {
+  it.each(['transaction_active', 'storage_recovering', 'foreground_wait', 'temporarily_unavailable'] as const)(
+    'retries explicit %s without treating it as disconnected or mutating stock', async (reason) => {
+      const gateway = createGateway()
+      vi.mocked(gateway.getNextOfflineEvent).mockRejectedValueOnce(
+        new HardwareGatewayError('UNAVAILABLE', 'safe', reason, 409))
+      const inventoryService = createInventoryService()
+      const coordinator = createOfflineSyncCoordinator({ gateway, inventoryService,
+        offlineInventoryCacheCoordinator: createCacheCoordinator() })
+      await expect(coordinator.synchronize()).resolves.toMatchObject({ status: 'COMPLETE' })
+      expect(gateway.getNextOfflineEvent).toHaveBeenCalledTimes(2)
+      expect(inventoryService.reconcileOfflineEvent).not.toHaveBeenCalled()
+    })
+  it.each([
+    new HardwareGatewayError('UNAVAILABLE', 'safe', 'REQUEST_TIMEOUT'),
+    new HardwareGatewayError('UNAVAILABLE', 'safe', 'unauthorized', 401),
+    new HardwareGatewayError('INVALID_RESPONSE', 'safe')
+  ])('preserves the first fetch failure category and never applies or ACKs', async (error) => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextOfflineEvent).mockRejectedValue(error)
+    const inventoryService = createInventoryService()
+    const coordinator = createOfflineSyncCoordinator({ gateway, inventoryService,
+      offlineInventoryCacheCoordinator: createCacheCoordinator() })
+    await expect(coordinator.synchronize()).rejects.toMatchObject({ code: 'HARDWARE_UNAVAILABLE' })
+    expect(gateway.getNextOfflineEvent).toHaveBeenCalledOnce()
+    expect(inventoryService.reconcileOfflineEvent).not.toHaveBeenCalled()
+    expect(gateway.acknowledgeOfflineEvent).not.toHaveBeenCalled()
+  })
   it('sequentially commits and ACKs each FIFO head before refreshing the final cache', async () => {
     const first = pendingEvent(1)
     const second = pendingEvent(2)
@@ -219,6 +256,7 @@ describe('offline sync coordinator', () => {
     vi.mocked(gateway.getNextOfflineEvent)
       .mockResolvedValueOnce(event)
       .mockResolvedValueOnce(event)
+      .mockResolvedValueOnce(event)
       .mockResolvedValueOnce(null)
     vi.mocked(gateway.acknowledgeOfflineEvent)
       .mockRejectedValueOnce(new Error('response lost'))
@@ -255,6 +293,308 @@ describe('offline sync coordinator', () => {
     })
     expect(inventoryService.reconcileOfflineEvent).toHaveBeenCalledExactlyOnceWith(event)
     expect(gateway.acknowledgeOfflineEvent).toHaveBeenCalledTimes(2)
+  })
+
+  it('waits after an ambiguous ACK, tolerates a failed read, then confirms the later FIFO head', async () => {
+    const first = pendingEvent(1)
+    const second = pendingEvent(2)
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextOfflineEvent)
+      .mockResolvedValueOnce(first)
+      .mockRejectedValueOnce(new Error('device is still finishing the ACK'))
+      .mockResolvedValueOnce(second)
+      .mockResolvedValueOnce(null)
+    vi.mocked(gateway.acknowledgeOfflineEvent)
+      .mockRejectedValueOnce(new Error('ACK response timed out'))
+      .mockResolvedValueOnce({
+        acknowledged: true,
+        eventId: second.eventId,
+        pendingSyncItems: 0,
+        alreadyAcknowledged: false
+      })
+    const inventoryService = createInventoryService()
+    const wait = vi.fn(async (_milliseconds: number) => undefined)
+    const coordinator = createProductionOfflineSyncCoordinator({
+      inventoryService,
+      gateway,
+      offlineInventoryCacheCoordinator: createCacheCoordinator(),
+      waitForAcknowledgementRecovery: wait
+    })
+
+    await expect(coordinator.synchronize()).resolves.toMatchObject({
+      status: 'COMPLETE',
+      counts: { appliedEvents: 2, acknowledgedEvents: 2 }
+    })
+    expect(wait).toHaveBeenCalledTimes(2)
+    expect(wait).toHaveBeenNthCalledWith(1, 2_000)
+    expect(wait).toHaveBeenNthCalledWith(2, 2_000)
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenNthCalledWith(1, first.eventId)
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenNthCalledWith(2, second.eventId)
+    expect(inventoryService.reconcileOfflineEvent).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(gateway.getNextOfflineEvent).mock.invocationCallOrder[2])
+      .toBeLessThan(vi.mocked(inventoryService.reconcileOfflineEvent).mock.invocationCallOrder[1] ?? 0)
+  })
+
+  it('keeps an accepted-but-in-progress ACK pending until the exact FIFO head advances', async () => {
+    const first = pendingEvent(1)
+    const second = pendingEvent(2)
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextOfflineEvent)
+      .mockResolvedValueOnce(first)
+      .mockRejectedValueOnce(new Error('ACK retirement in progress'))
+      .mockRejectedValueOnce(new Error('ACK retirement in progress'))
+      .mockRejectedValueOnce(new Error('ACK retirement in progress'))
+      .mockResolvedValueOnce(second)
+      .mockResolvedValueOnce(null)
+    vi.mocked(gateway.acknowledgeOfflineEvent)
+      .mockRejectedValueOnce(new Error('HTTP 202: accepted but not retired'))
+      .mockResolvedValueOnce({
+        acknowledged: true,
+        eventId: second.eventId,
+        pendingSyncItems: 0,
+        alreadyAcknowledged: false
+      })
+    const inventoryService = createInventoryService()
+    const coordinator = createOfflineSyncCoordinator({
+      inventoryService,
+      gateway,
+      offlineInventoryCacheCoordinator: createCacheCoordinator()
+    })
+
+    await expect(coordinator.synchronize()).resolves.toMatchObject({
+      status: 'ACKNOWLEDGEMENT_PENDING', eventId: first.eventId
+    })
+    expect(inventoryService.reconcileOfflineEvent).toHaveBeenCalledExactlyOnceWith(first)
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenCalledExactlyOnceWith(first.eventId)
+    await expect(coordinator.synchronize()).resolves.toMatchObject({
+      status: 'COMPLETE', counts: { appliedEvents: 2, acknowledgedEvents: 2 }
+    })
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenCalledTimes(2)
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenNthCalledWith(2, second.eventId)
+  })
+
+  it('monitors the exact async ACK through status until durable success without rereading the head', async () => {
+    const event = pendingEvent(1)
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextOfflineEvent)
+      .mockResolvedValueOnce(event).mockResolvedValueOnce(null)
+    vi.mocked(gateway.acknowledgeOfflineEvent).mockRejectedValueOnce(
+      Object.assign(new Error('processing'), {
+        code: 'UNAVAILABLE', diagnosticCode: 'ACK_IN_PROGRESS'
+      })
+    )
+    const baseStatus = {
+      device: 'dental-inventory-esp32' as const, online: true,
+      mode: 'idle' as const, rtc: true, sd: true, offlineReady: true
+    }
+    vi.mocked(gateway.getStatus)
+      .mockResolvedValueOnce({ ...baseStatus, pendingSyncItems: 1,
+        offlineAckState: 'QUEUED', offlineAckEventId: event.eventId })
+      .mockResolvedValueOnce({ ...baseStatus, pendingSyncItems: 1,
+        offlineAckState: 'RUNNING', offlineAckEventId: event.eventId })
+      .mockResolvedValueOnce({ ...baseStatus, pendingSyncItems: 0,
+        offlineAckState: 'SUCCEEDED', offlineAckEventId: event.eventId })
+    const inventoryService = createInventoryService()
+    const wait = vi.fn().mockResolvedValue(undefined)
+    const coordinator = createProductionOfflineSyncCoordinator({
+      inventoryService, gateway, offlineInventoryCacheCoordinator: createCacheCoordinator(),
+      waitForAcknowledgementRecovery: wait
+    })
+
+    await expect(coordinator.synchronize()).resolves.toMatchObject({
+      status: 'COMPLETE', counts: { appliedEvents: 1, acknowledgedEvents: 1 }
+    })
+    expect(wait).toHaveBeenCalledTimes(2)
+    expect(wait).toHaveBeenNthCalledWith(1, 2_000)
+    expect(gateway.getNextOfflineEvent).toHaveBeenCalledTimes(2)
+    expect(inventoryService.reconcileOfflineEvent).toHaveBeenCalledExactlyOnceWith(event)
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenCalledExactlyOnceWith(event.eventId)
+  })
+
+  it.each(['FAILED', 'MISMATCH', 'TIMEOUT'] as const)(
+    'keeps the durable SQLite result pending when async ACK monitoring ends in %s',
+    async (caseName) => {
+      const event = pendingEvent(1)
+      const gateway = createGateway()
+      vi.mocked(gateway.getNextOfflineEvent).mockResolvedValueOnce(event)
+      vi.mocked(gateway.acknowledgeOfflineEvent).mockRejectedValueOnce(
+        Object.assign(new Error('processing'), {
+          code: 'UNAVAILABLE', diagnosticCode: 'ACK_IN_PROGRESS'
+        })
+      )
+      const baseStatus = {
+        device: 'dental-inventory-esp32' as const, online: true,
+        mode: 'idle' as const, rtc: true, sd: true, pendingSyncItems: 1,
+        offlineReady: true
+      }
+      vi.mocked(gateway.getStatus).mockResolvedValueOnce({ ...baseStatus,
+        offlineAckState: 'RUNNING', offlineAckEventId: event.eventId })
+      if (caseName === 'FAILED') {
+        vi.mocked(gateway.getStatus).mockResolvedValueOnce({ ...baseStatus,
+          offlineAckState: 'FAILED', offlineAckEventId: event.eventId })
+      } else if (caseName === 'MISMATCH') {
+        vi.mocked(gateway.getStatus).mockResolvedValueOnce({ ...baseStatus,
+          offlineAckState: 'SUCCEEDED', offlineAckEventId: pendingEvent(2).eventId })
+      } else {
+        vi.mocked(gateway.getStatus).mockResolvedValue({ ...baseStatus,
+          offlineAckState: 'RUNNING', offlineAckEventId: event.eventId })
+      }
+      const inventoryService = createInventoryService()
+      const coordinator = createProductionOfflineSyncCoordinator({
+        inventoryService, gateway, offlineInventoryCacheCoordinator: createCacheCoordinator(),
+        waitForAcknowledgementRecovery: async () => undefined,
+        acknowledgementMonitorWindowMs: 4_000
+      })
+      await expect(coordinator.synchronize()).resolves.toMatchObject({
+        status: 'ACKNOWLEDGEMENT_PENDING', eventId: event.eventId
+      })
+      expect(inventoryService.reconcileOfflineEvent).toHaveBeenCalledExactlyOnceWith(event)
+      expect(gateway.getNextOfflineEvent).toHaveBeenCalledExactlyOnceWith()
+    }
+  )
+
+  it('survives a temporary status network failure during the same ACK job', async () => {
+    const event = pendingEvent(1)
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextOfflineEvent)
+      .mockResolvedValueOnce(event).mockResolvedValueOnce(null)
+    vi.mocked(gateway.acknowledgeOfflineEvent).mockRejectedValueOnce(
+      Object.assign(new Error('processing'), {
+        code: 'UNAVAILABLE', diagnosticCode: 'ACK_IN_PROGRESS'
+      })
+    )
+    vi.mocked(gateway.getStatus)
+      .mockRejectedValueOnce(new Error('NETWORK_FAILURE'))
+      .mockResolvedValueOnce({
+        device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: true,
+        sd: true, pendingSyncItems: 0, offlineReady: true,
+        offlineAckState: 'SUCCEEDED', offlineAckEventId: event.eventId
+      })
+    const inventoryService = createInventoryService()
+    const coordinator = createOfflineSyncCoordinator({
+      inventoryService, gateway, offlineInventoryCacheCoordinator: createCacheCoordinator()
+    })
+    await expect(coordinator.synchronize()).resolves.toMatchObject({ status: 'COMPLETE' })
+    expect(inventoryService.reconcileOfflineEvent).toHaveBeenCalledExactlyOnceWith(event)
+    expect(gateway.getNextOfflineEvent).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not retry an ACK when a later recovery check proves it already retired', async () => {
+    const first = pendingEvent(1)
+    const second = pendingEvent(2)
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextOfflineEvent)
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second)
+      .mockResolvedValueOnce(null)
+    vi.mocked(gateway.acknowledgeOfflineEvent)
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValueOnce({
+        acknowledged: true,
+        eventId: second.eventId,
+        pendingSyncItems: 0,
+        alreadyAcknowledged: false
+      })
+    const inventoryService = createInventoryService()
+    const coordinator = createOfflineSyncCoordinator({
+      inventoryService,
+      gateway,
+      offlineInventoryCacheCoordinator: createCacheCoordinator()
+    })
+
+    await expect(coordinator.synchronize()).resolves.toMatchObject({
+      status: 'ACKNOWLEDGEMENT_PENDING', eventId: first.eventId
+    })
+    await expect(coordinator.synchronize()).resolves.toMatchObject({
+      status: 'COMPLETE', counts: { appliedEvents: 2, acknowledgedEvents: 2 }
+    })
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenCalledTimes(2)
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenNthCalledWith(2, second.eventId)
+    expect(inventoryService.reconcileOfflineEvent).toHaveBeenNthCalledWith(1, first)
+    expect(inventoryService.reconcileOfflineEvent).toHaveBeenNthCalledWith(2, second)
+  })
+
+  it('keeps the committed event in ACK-only recovery when every delayed read is unavailable', async () => {
+    const event = pendingEvent(1)
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextOfflineEvent)
+      .mockResolvedValueOnce(event)
+      .mockRejectedValue(new Error('network unavailable'))
+    vi.mocked(gateway.acknowledgeOfflineEvent).mockRejectedValueOnce(new Error('timeout'))
+    const inventoryService = createInventoryService()
+    const wait = vi.fn(async (_milliseconds: number) => undefined)
+    const coordinator = createProductionOfflineSyncCoordinator({
+      inventoryService,
+      gateway,
+      offlineInventoryCacheCoordinator: createCacheCoordinator(),
+      waitForAcknowledgementRecovery: wait
+    })
+
+    await expect(coordinator.synchronize()).resolves.toMatchObject({
+      status: 'ACKNOWLEDGEMENT_PENDING',
+      counts: { appliedEvents: 1, acknowledgedEvents: 0 },
+      eventId: event.eventId
+    })
+    expect(wait).toHaveBeenCalledTimes(3)
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenCalledExactlyOnceWith(event.eventId)
+    expect(inventoryService.reconcileOfflineEvent).toHaveBeenCalledExactlyOnceWith(event)
+  })
+
+  it.each([
+    'off-AAAAAAAAAAAA-0000000000000002',
+    'off-20500DE58C14-0000000000000001'
+  ])('never treats an unrelated or earlier head as proof of retirement: %s', async (headId) => {
+    const event = pendingEvent(2)
+    const wrongHead = { ...pendingEvent(1), eventId: headId }
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextOfflineEvent)
+      .mockResolvedValueOnce(event)
+      .mockResolvedValue(wrongHead)
+    vi.mocked(gateway.acknowledgeOfflineEvent).mockRejectedValueOnce(new Error('timeout'))
+    const inventoryService = createInventoryService()
+    const coordinator = createOfflineSyncCoordinator({
+      inventoryService,
+      gateway,
+      offlineInventoryCacheCoordinator: createCacheCoordinator()
+    })
+
+    await expect(coordinator.synchronize()).resolves.toMatchObject({
+      status: 'ACKNOWLEDGEMENT_PENDING', eventId: event.eventId
+    })
+    expect(gateway.getNextOfflineEvent).toHaveBeenCalledTimes(4)
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenCalledExactlyOnceWith(event.eventId)
+    expect(inventoryService.reconcileOfflineEvent).toHaveBeenCalledExactlyOnceWith(event)
+  })
+
+  it('coalesces retry calls while one ACK is unresolved', async () => {
+    const event = pendingEvent(1)
+    let failAck: ((reason: Error) => void) | undefined
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextOfflineEvent)
+      .mockResolvedValueOnce(event)
+      .mockResolvedValueOnce(event)
+    vi.mocked(gateway.acknowledgeOfflineEvent).mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { failAck = reject })
+    )
+    const inventoryService = createInventoryService()
+    const coordinator = createOfflineSyncCoordinator({
+      inventoryService,
+      gateway,
+      offlineInventoryCacheCoordinator: createCacheCoordinator()
+    })
+
+    const first = coordinator.synchronize()
+    const overlapping = coordinator.synchronize()
+    expect(overlapping).toBe(first)
+    for (let turn = 0; turn < 5 && !failAck; turn += 1) await Promise.resolve()
+    expect(failAck).toBeDefined()
+    failAck?.(new Error('response lost'))
+    await expect(first).resolves.toMatchObject({
+      status: 'ACKNOWLEDGEMENT_PENDING', eventId: event.eventId
+    })
+    expect(gateway.acknowledgeOfflineEvent).toHaveBeenCalledExactlyOnceWith(event.eventId)
+    expect(inventoryService.reconcileOfflineEvent).toHaveBeenCalledExactlyOnceWith(event)
   })
 
   it('uses the durable replay receipt for ACK recovery after a coordinator restart', async () => {
@@ -352,7 +692,32 @@ describe('offline sync coordinator', () => {
       .mockResolvedValueOnce(event)
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(event)
+      .mockResolvedValueOnce(null)
     vi.mocked(gateway.getStatus)
+      .mockResolvedValueOnce({
+        device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: true,
+        sd: true, pendingSyncItems: 1, offlineReady: true
+      })
+      .mockResolvedValueOnce({
+        device: 'dental-inventory-esp32',
+        online: true,
+        mode: 'idle',
+        rtc: true,
+        sd: true,
+        pendingSyncItems: 1,
+        offlineReady: true
+      })
+      .mockResolvedValueOnce({
+        device: 'dental-inventory-esp32',
+        online: true,
+        mode: 'idle',
+        rtc: true,
+        sd: true,
+        pendingSyncItems: 1,
+        offlineReady: true
+      })
       .mockResolvedValueOnce({
         device: 'dental-inventory-esp32',
         online: true,

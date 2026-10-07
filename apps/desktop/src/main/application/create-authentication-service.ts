@@ -1,8 +1,9 @@
-import { verifyAdminCredentials } from '../auth'
+import { hasConfiguredAdmin, initializeAdminCredentials, verifyAdminCredentials } from '../auth'
 import type { SqliteDatabase } from '../database'
 import {
   authenticationServiceFromVerifier,
-  type AuthenticationService
+  type AuthenticationService,
+  type FirstRunAdminService
 } from './authentication-service'
 
 /**
@@ -15,4 +16,11 @@ export function createAuthenticationService(database: SqliteDatabase): Authentic
   return authenticationServiceFromVerifier((credentials) =>
     verifyAdminCredentials(database, credentials)
   )
+}
+
+export function createFirstRunAdminService(database: SqliteDatabase): FirstRunAdminService {
+  return {
+    needsSetup: () => !hasConfiguredAdmin(database),
+    createFirstAdmin: (credentials) => initializeAdminCredentials(database, credentials)
+  }
 }

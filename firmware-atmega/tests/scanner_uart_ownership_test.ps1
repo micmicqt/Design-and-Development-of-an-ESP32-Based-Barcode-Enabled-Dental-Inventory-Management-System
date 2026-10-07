@@ -3,14 +3,24 @@ $project = Split-Path -Parent $PSScriptRoot
 $implementation = Get-Content (Join-Path $project 'src/uart_link.cpp') -Raw
 $scannerStub = Get-Content (Join-Path $project 'src/scanner_uart.cpp') -Raw
 $header = Get-Content (Join-Path $project 'include/scanner_uart.h') -Raw
-if (($implementation + $scannerStub + $header) -match 'USART_RX_vect|RXEN0|TXEN0|UDR0|UBRR0') {
-  throw 'Scanner still depends on USART0/D0/D1'
+if ($implementation -notmatch 'ISR\(USART_RX_vect\)' -or
+    $implementation -notmatch 'scannerRxQueue\.push') {
+  throw 'Scanner USART0 receive path is missing'
 }
-if ($implementation -notmatch 'UCSR0B\s*=\s*0U') { throw 'USART0 is not explicitly left disabled' }
-if ($implementation -notmatch 'PCINT1_vect' -or $implementation -notmatch 'PCINT8') {
-  throw 'Scanner A0/PC0 receive interrupt is missing'
+if ($implementation -notmatch 'ISR\(USART_UDRE_vect\)' -or
+    $implementation -notmatch 'scannerTxQueue\.push') {
+  throw 'Scanner USART0 transmit path is missing'
 }
-if ($implementation -notmatch 'kScannerTxPortBit' -or $implementation -notmatch 'startScannerTx') {
-  throw 'Scanner A1/PC1 transmit path is missing'
+$scannerInitialize = [regex]::Match($implementation, 'namespace scanner_uart \{(?s).*?void initialize\(\) \{(?<body>.*?)\n\}').Groups['body'].Value
+if ($scannerInitialize -notmatch 'UBRR0H|UBRR0L' -or
+    $scannerInitialize -notmatch 'RXCIE0|RXEN0|TXEN0|UCSZ01|UCSZ00') {
+  throw 'Scanner USART0 9600 8N1 initialization is missing'
 }
-Write-Output 'ATmega scanner A0/A1 ownership: 5 active-source checks PASSED'
+if ($scannerInitialize -match 'PORTC|DDRC|PCMSK1|PCIE1' -or
+    $implementation -match 'PCINT1_vect|PCINT8') {
+  throw 'Temporary A0/A1 scanner initialization remains active'
+}
+if ($scannerStub -notmatch 'USART0') {
+  throw 'Scanner transport documentation is stale'
+}
+Write-Output 'ATmega scanner D0/D1 USART0 ownership: 7 active-source checks PASSED'

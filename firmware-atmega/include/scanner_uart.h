@@ -4,8 +4,7 @@
 
 namespace dental_atmega {
 namespace scanner_uart {
-// Full-duplex bare-metal software UART: GM65 TX -> PC0/A0 RX and
-// PC1/A1 TX -> GM65 RX. USART0 PD0/PD1 is not configured by this module.
+// GM65 hardware USART0: scanner TX -> PD0/D0 RXD, PD1/D1 TXD -> scanner RX.
 void initialize();
 // RX ISR queues bytes with fixed storage and framing/overrun status.
 bool tryRead(uint8_t& byte, bool& error);

@@ -4,7 +4,8 @@ import type {
   OfflineInventoryCacheGateway,
   OfflineInventoryCacheInstallResult,
   OfflineInventoryCacheProduct,
-  OfflineInventoryCacheSnapshot
+  OfflineInventoryCacheSnapshot,
+  Esp32StatusResponse
 } from './hardware-gateway'
 
 function toCacheProduct(product: ProductRecord): OfflineInventoryCacheProduct {
@@ -54,7 +55,7 @@ export interface OfflineInventoryCacheCoordinator {
 
 export interface OfflineInventoryCacheCoordinatorOptions {
   inventoryService: InventoryService
-  gateway: OfflineInventoryCacheGateway
+  gateway: OfflineInventoryCacheGateway & { getStatus: () => Promise<Esp32StatusResponse> }
   /** Injectable monotonic-enough wall clock used only to throttle retries. */
   now?: () => number
   /** Failed background attempts wait this long; explicit mutations still retry immediately. */
@@ -62,6 +63,9 @@ export interface OfflineInventoryCacheCoordinatorOptions {
 }
 
 const DEFAULT_FAILURE_RETRY_DELAY_MS = 30_000
+export class OfflineCacheRefreshDeferredError extends Error {
+  constructor(readonly reason: string) { super('Offline cache publication is deferred until journal retirement is confirmed.') }
+}
 
 /**
  * Coalesces concurrent refresh signals and performs one trailing refresh when
@@ -92,16 +96,35 @@ export function createOfflineInventoryCacheCoordinator(
       trailingRefreshRequested = false
       refreshRequired = false
       try {
+        const snapshot = buildOfflineInventoryCacheSnapshot(options.inventoryService)
+        // A heartbeat may begin the final refresh just before Sync requests it.
+        // Coalesce an identical trailing snapshot rather than installing twice;
+        // a real SQLite mutation changes generation and still publishes again.
+        if (latestResult?.generation === snapshot.generation) return latestResult
+        {
+          const status = await options.gateway.getStatus()
+          const ackActive = status.offlineAckState === 'QUEUED' ||
+            status.offlineAckState === 'RUNNING' || status.offlineAckState === 'VERIFYING'
+          if (status.pendingSyncItems !== 0 || ackActive) {
+            const reason = ackActive ? 'retirement_in_progress' :
+              status.pendingSyncItems === undefined ? 'journal_not_confirmed_empty' : 'pending_records'
+            console.info(`[Offline cache] stage=deferred reason=${reason}`)
+            throw new OfflineCacheRefreshDeferredError(reason)
+          }
+        }
+        console.info('[Offline cache] stage=publication_start')
         latestResult = await options.gateway.installOfflineInventoryCache(
-          buildOfflineInventoryCacheSnapshot(options.inventoryService)
+          snapshot
         )
         lastResult = latestResult
         retryNotBefore = 0
         latestError = undefined
+        console.info('[Offline cache] stage=publication_complete')
       } catch (error: unknown) {
         refreshRequired = true
         retryNotBefore = now() + failureRetryDelayMs
         latestError = error
+        if (!(error instanceof OfflineCacheRefreshDeferredError)) console.warn('[Offline cache] stage=publication_failed')
       }
     } while (trailingRefreshRequested)
 

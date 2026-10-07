@@ -187,6 +187,7 @@ inline bool validScannerBarcode(const char* barcode) {
 }
 
 enum class JournalReadLineResult : uint8_t {
+  kYielded, // Read-only preview gave priority to a foreground transaction.
   kTerminatedLine,
   kUnterminatedLine,
   kEnd,
@@ -199,6 +200,9 @@ class PendingJournalStorage {
  public:
   virtual ~PendingJournalStorage() {}
   virtual bool available() const = 0;
+  // A failed stat/open is not proof that an authoritative file is absent.
+  virtual bool ioFailed() const { return false; }
+  virtual void clearIoFailure() {}
   virtual bool exists(const char* path) = 0;
   virtual bool remove(const char* path) = 0;
   virtual bool rename(const char* from, const char* to) = 0;
@@ -209,6 +213,17 @@ class PendingJournalStorage {
   virtual bool beginRead(const char* path) = 0;
   virtual JournalReadLineResult readLine(char* line, size_t capacity) = 0;
   virtual void endRead() = 0;
+  // Only a serialized, failure-invalidated adapter may reuse boot-validated
+  // runtime metadata. Other adapters retain full-scan validation.
+  virtual bool trustedRuntimeReads() const { return false; }
+  virtual uint64_t readPosition() const { return UINT64_MAX; }
+  virtual bool beginReadAt(const char*, uint64_t) { return false; }
+  // Production reserves in ESP32 NVS; generic adapters keep legacy fixtures.
+  virtual bool reserveEventSequence(uint64_t floor, uint64_t& sequence) {
+    if (floor == UINT64_MAX) return false;
+    sequence = floor + 1ULL; return true;
+  }
+  virtual void appendReadbackTiming(bool) {}
 };
 
 struct OfflineJournalRecord {
@@ -236,6 +251,7 @@ struct PendingJournalMetadata {
 };
 
 enum class JournalPeekResult : uint8_t {
+  kYielded,
   kFound,
   kEmpty,
   kJournalUnavailable,
@@ -250,6 +266,11 @@ enum class JournalAcknowledgementResult : uint8_t {
   kJournalUnavailable,
   kInvalidJournal,
   kWriteFailed,
+};
+
+enum class JournalAcknowledgementStage : uint8_t {
+  kSourceScan, kTempCleanup, kTempHeader, kCopyRows,
+  kTempVerify, kPromote, kInstalledVerify
 };
 
 enum class JournalCompactionResult : uint8_t {
@@ -323,12 +344,13 @@ enum class CacheLookupResult : uint8_t {
   kInvalidCache,
 };
 
-// Streams and validates the complete immutable Step 2A cache while retaining
-// only the exact matching product. No full catalog is loaded into RAM.
+// Validates the complete immutable cache. The production adapter can retain a
+// bounded four-product catalog; larger catalogs keep the streaming fallback.
 class OfflineCacheLookup {
  public:
   explicit OfflineCacheLookup(cache::CacheStorage& storage)
       : storage_(storage) {}
+  void invalidate() { indexed_ = false; }
 
   CacheLookupResult find(const cache::CacheMetadata& expectedMetadata,
                          const char* barcode,
@@ -339,6 +361,16 @@ class OfflineCacheLookup {
             expectedMetadata.generation)) {
       return CacheLookupResult::kCacheUnavailable;
     }
+    if (!validScannerBarcode(barcode)) return CacheLookupResult::kNotFound;
+    if (storage_.trustedRuntimeReads() && indexed_ &&
+        indexedMetadata_.itemCount == expectedMetadata.itemCount &&
+        strcmp(indexedMetadata_.generation, expectedMetadata.generation) == 0) {
+      for (uint32_t i = 0; i < indexedMetadata_.itemCount; ++i) {
+        if (!strcmp(index_[i].barcode, barcode)) { product = index_[i]; return CacheLookupResult::kFound; }
+      }
+      return CacheLookupResult::kNotFound;
+    }
+    indexed_ = false;
     if (!validScannerBarcode(barcode) ||
         !storage_.beginRead(cache::kActiveCachePath)) {
       return validScannerBarcode(barcode)
@@ -372,6 +404,11 @@ class OfflineCacheLookup {
               cache::parseProductCsv(line_, candidate_);
       if (valid) {
         runningCrc = cache::updateCrc32Line(runningCrc, line_);
+        if (storage_.trustedRuntimeReads() && storedMetadata.itemCount <= 4U) {
+          for (uint32_t previous = 0U; previous < index; ++previous)
+            if (!strcmp(index_[previous].barcode, candidate_.barcode) || !strcmp(index_[previous].id, candidate_.id)) valid = false;
+          index_[index] = candidate_;
+        }
         if (strcmp(candidate_.barcode, barcode) == 0) {
           if (found) {
             valid = false;
@@ -399,6 +436,9 @@ class OfflineCacheLookup {
       product = cache::CacheProduct{};
       return CacheLookupResult::kInvalidCache;
     }
+    if (storage_.trustedRuntimeReads() && storedMetadata.itemCount <= 4U) {
+      indexedMetadata_ = storedMetadata; indexed_ = true;
+    }
     return found ? CacheLookupResult::kFound : CacheLookupResult::kNotFound;
   }
 
@@ -409,6 +449,9 @@ class OfflineCacheLookup {
   // contract. Keep the streaming scratch record with this long-lived lookup
   // object instead of consuming the Arduino loop task's small stack.
   cache::CacheProduct candidate_ = {};
+  cache::CacheProduct index_[4] = {};
+  cache::CacheMetadata indexedMetadata_ = {};
+  bool indexed_ = false;
 };
 
 namespace detail {
@@ -599,14 +642,66 @@ class PendingJournal {
  public:
   explicit PendingJournal(PendingJournalStorage& storage) : storage_(storage) {}
 
+  // Optional bounded progress hook for the physical ACK worker. It is invoked
+  // between storage operations, never from an ISR or while holding a lock.
+  using AcknowledgementProgress =
+      void (*)(JournalAcknowledgementStage, void*);
+  void setAcknowledgementProgress(AcknowledgementProgress callback,
+                                  void* context) {
+    acknowledgementProgress_ = callback;
+    acknowledgementContext_ = context;
+  }
+
   const PendingJournalMetadata& metadata() const { return metadata_; }
   bool uncertain() const { return uncertain_; }
+  bool temporarilyUnavailable() const {
+    return transportFailure_ || !storage_.available() || storage_.ioFailed();
+  }
+  const char* stateName(const char* generation = nullptr) const {
+    if (temporarilyUnavailable()) return "temporarily_unavailable";
+    if (uncertain_) return "corrupt";
+    if (!metadata_.available) return "temporarily_unavailable";
+    if (metadata_.storedCount >= kMaximumPendingRecords) return "full";
+    if (generation && metadata_.storedCount &&
+        strcmp(metadata_.cacheGeneration, generation) != 0)
+      return "generation_mismatch";
+    return metadata_.pendingCount == 0U ? "empty" : "ready";
+  }
+  const char* reasonName() const {
+    if (temporarilyUnavailable()) return "remote_sector_read_failed";
+    return uncertain_ ? integrityReason_ : metadata_.available ? "none" : "not_initialized";
+  }
+  // Recovery probes only the installed active journal. A torn tail or an
+  // ambiguous earlier write requires the normal boot repair path, not an
+  // automatic runtime rewrite of pending records.
+  bool validateActiveReadOnly(const char* deviceIdentifier) {
+    if ((uncertain_ && !appendValidationPending_) ||
+        !validDeviceIdentifier(deviceIdentifier)) return false;
+    storage_.clearIoFailure();
+    if (deviceIdentifier_[0] != '\0' &&
+        strcmp(deviceIdentifier_, deviceIdentifier) != 0) return false;
+    snprintf(deviceIdentifier_, sizeof(deviceIdentifier_), "%s", deviceIdentifier);
+    ScanState active = {};
+    const ScanResult result = scan(kPendingJournalPath, nullptr, nullptr, active);
+    if (result == ScanResult::kUnavailable) return false;
+    if (result != ScanResult::kValid) { uncertain_ = true; return false; }
+    if (metadata_.available && !scanStateMatchesMetadata(active) &&
+        !(appendValidationPending_ &&
+          active.storedCount == metadata_.storedCount + 1U &&
+          active.maximumSequence == appendRecord_.sequence &&
+          active.acknowledgedSequence == metadata_.acknowledgedSequence &&
+          active.compactedSequence == metadata_.compactedSequence)) return false;
+    accept(active, false);
+    return true;
+  }
   bool blocksCacheReplacement() const {
-    return uncertain_ || (metadata_.available && metadata_.pendingCount > 0U);
+    return uncertain_ || transportFailure_ || storage_.ioFailed() ||
+        (metadata_.available && metadata_.pendingCount > 0U);
   }
 
   bool compatibleWith(const cache::CacheMetadata& cacheMetadata) const {
-    return metadata_.available && cacheMetadata.available &&
+    return !uncertain_ && !temporarilyUnavailable() &&
+           metadata_.available && cacheMetadata.available &&
            metadata_.storedCount < kMaximumPendingRecords &&
            (metadata_.storedCount == 0U ||
             strcmp(metadata_.cacheGeneration,
@@ -619,14 +714,24 @@ class PendingJournal {
   // returning the same oldest durable synchronization identity.
   JournalPeekResult peekOldest(OfflineJournalRecord& record) {
     memset(&record, 0, sizeof(record));
+    if (temporarilyUnavailable()) return JournalPeekResult::kJournalUnavailable;
     if (uncertain_) return JournalPeekResult::kInvalidJournal;
     if (!metadata_.available || !storage_.available()) {
       return JournalPeekResult::kJournalUnavailable;
+    }
+    if (runtimeMatches()) {
+      if (!metadata_.pendingCount) return JournalPeekResult::kEmpty;
+      record = runtimeOldest_;
+      return JournalPeekResult::kFound;
     }
 
     ScanState state = {};
     const ScanResult result =
         scan(kPendingJournalPath, nullptr, nullptr, state, &record);
+    if (result == ScanResult::kYielded) {
+      memset(&record, 0, sizeof(record));
+      return JournalPeekResult::kYielded;
+    }
     if (result == ScanResult::kUnavailable) {
       memset(&record, 0, sizeof(record));
       return JournalPeekResult::kJournalUnavailable;
@@ -634,6 +739,7 @@ class PendingJournal {
     if (result != ScanResult::kValid ||
         !scanStateMatchesMetadata(state)) {
       memset(&record, 0, sizeof(record));
+      uncertain_ = true;
       return JournalPeekResult::kInvalidJournal;
     }
     if (state.pendingCount == 0U) {
@@ -647,11 +753,18 @@ class PendingJournal {
   // the CRC-protected journal until the desktop confirms an authoritative
   // cache refresh, so a partial drain still has the complete stock overlay.
   JournalAcknowledgementResult acknowledgeOldest(const char* eventId) {
+    acknowledgementActive_ = true;
+    struct ProgressScope {
+      explicit ProgressScope(bool& active) : active_(active) {}
+      ~ProgressScope() { active_ = false; }
+      bool& active_;
+    } progressScope(acknowledgementActive_);
     if (uncertain_) return JournalAcknowledgementResult::kInvalidJournal;
     if (!metadata_.available || !storage_.available()) {
       return JournalAcknowledgementResult::kJournalUnavailable;
     }
 
+    reportAcknowledgementStage(JournalAcknowledgementStage::kSourceScan);
     ScanState original = {};
     OfflineJournalRecord oldest = {};
     const ScanResult originalResult =
@@ -683,6 +796,7 @@ class PendingJournal {
     const bool rewriteReportedSuccess = rewritePrefix(
         kPendingJournalPath, original.storedCount,
         original.compactedSequence, oldest.sequence);
+    reportAcknowledgementStage(JournalAcknowledgementStage::kInstalledVerify);
     ScanState installed = {};
     const ScanResult installedResult =
         scan(kPendingJournalPath, nullptr, nullptr, installed);
@@ -773,6 +887,7 @@ class PendingJournal {
 
   JournalLoadResult loadOrCreate(const char* deviceIdentifier) {
     reset();
+    storage_.clearIoFailure();
     if (!storage_.available()) return JournalLoadResult::kStorageUnavailable;
     if (!validDeviceIdentifier(deviceIdentifier)) return JournalLoadResult::kInvalid;
     snprintf(deviceIdentifier_, sizeof(deviceIdentifier_), "%s",
@@ -782,6 +897,10 @@ class PendingJournal {
     const bool temporaryExisted =
         storage_.exists(kPendingJournalTemporaryPath);
     const bool backupExisted = storage_.exists(kPendingJournalBackupPath);
+    if (storage_.ioFailed()) {
+      transportFailure_ = true;
+      return JournalLoadResult::kStorageUnavailable;
+    }
 
     ScanState active = {};
     const ScanResult activeResult =
@@ -793,6 +912,9 @@ class PendingJournal {
         backupExisted
             ? scan(kPendingJournalBackupPath, nullptr, nullptr, backup)
             : ScanResult::kUnavailable;
+    if ((activeExisted && activeResult == ScanResult::kUnavailable) ||
+        (backupExisted && backupResult == ScanResult::kUnavailable))
+      return JournalLoadResult::kStorageUnavailable;
     const bool activeRecoverable = activeResult == ScanResult::kValid ||
                                    activeResult == ScanResult::kTornTail;
     const bool backupRecoverable = backupResult == ScanResult::kValid ||
@@ -901,9 +1023,30 @@ class PendingJournal {
         !cache::validGeneration(cacheGeneration)) {
       return OverlayResult::kJournalUnavailable;
     }
+    if (runtimeMatches()) {
+      if (metadata_.storedCount && strcmp(metadata_.cacheGeneration, cacheGeneration))
+        return OverlayResult::kGenerationMismatch;
+      if (runtimeComplete_) {
+        for (uint8_t i = 0U; i < runtimeCount_; ++i) {
+          const auto& entry = runtimeOverlay_[i];
+          const bool id = strcmp(entry.id, product.id) == 0;
+          const bool barcode = strcmp(entry.barcode, product.barcode) == 0;
+          if (id != barcode) return OverlayResult::kStockInvalid;
+          if (!id) continue;
+          if (!entry.valid || entry.base != product.currentStock ||
+              product.lowStockThreshold < entry.minimumThreshold ||
+              product.lowStockThreshold > entry.maximumThreshold)
+            return OverlayResult::kStockInvalid;
+          currentStock = entry.stock;
+          return OverlayResult::kSuccess;
+        }
+        return OverlayResult::kSuccess;
+      }
+    }
     ScanState state = {};
     const ScanResult result = scan(kPendingJournalPath, &product,
                                    cacheGeneration, state);
+    if (result == ScanResult::kUnavailable) return OverlayResult::kJournalUnavailable;
     if (result == ScanResult::kTornTail) {
       if (!repairPrefix(kPendingJournalPath, state.storedCount,
                         state.compactedSequence,
@@ -912,8 +1055,9 @@ class PendingJournal {
         return OverlayResult::kInvalidJournal;
       }
       state = ScanState{};
-      if (scan(kPendingJournalPath, &product, cacheGeneration, state) !=
-          ScanResult::kValid) {
+      const ScanResult repaired = scan(kPendingJournalPath, &product, cacheGeneration, state);
+      if (repaired == ScanResult::kUnavailable) return OverlayResult::kJournalUnavailable;
+      if (repaired != ScanResult::kValid) {
         invalidate();
         return OverlayResult::kInvalidJournal;
       }
@@ -979,7 +1123,8 @@ class PendingJournal {
     }
 
     appendRecord_ = OfflineJournalRecord{};
-    appendRecord_.sequence = metadata_.maximumSequence + 1ULL;
+    if (!storage_.reserveEventSequence(metadata_.maximumSequence, appendRecord_.sequence) ||
+        appendRecord_.sequence <= metadata_.maximumSequence) return JournalAppendResult::kWriteFailed;
     snprintf(appendRecord_.timestamp, sizeof(appendRecord_.timestamp), "%s",
              timestamp);
     snprintf(appendRecord_.productId, sizeof(appendRecord_.productId), "%s",
@@ -1018,9 +1163,53 @@ class PendingJournal {
         storage_.appendFile(kPendingJournalPath, &terminator, 1U);
     const bool writeReportedSuccess =
         bodyWriteReportedSuccess && terminatorWriteReportedSuccess;
+    // Healthy append: both body and newline were independently flushed. Read
+    // back ONLY the new CRC-protected row at the validated old EOF. Ambiguous
+    // writes still take the existing complete recovery/verification path.
+    storage_.appendReadbackTiming(true);
+    struct ReadbackScope {
+      PendingJournalStorage& storage;
+      ~ReadbackScope() { storage.appendReadbackTiming(false); }
+    } readbackScope{storage_};
+    if (writeReportedSuccess && runtimeMatches() && runtimeEnd_ != UINT64_MAX &&
+        storage_.beginReadAt(kPendingJournalPath, runtimeEnd_)) {
+      const bool valid = storage_.readLine(line_, sizeof(line_)) == JournalReadLineResult::kTerminatedLine &&
+          parseRecord(line_, deviceIdentifier_, scanRecord_) &&
+          scanRecord_.sequence == appendRecord_.sequence &&
+          strcmp(scanRecord_.eventId, appendRecord_.eventId) == 0 &&
+          strcmp(scanRecord_.timestamp, appendRecord_.timestamp) == 0 &&
+          strcmp(scanRecord_.productId, appendRecord_.productId) == 0 &&
+          strcmp(scanRecord_.barcode, appendRecord_.barcode) == 0 &&
+          strcmp(scanRecord_.cacheGeneration, appendRecord_.cacheGeneration) == 0 &&
+          scanRecord_.action == appendRecord_.action &&
+          scanRecord_.resultingStock == appendRecord_.resultingStock &&
+          scanRecord_.resultingStatus == appendRecord_.resultingStatus &&
+          storage_.readLine(line_, sizeof(line_)) == JournalReadLineResult::kEnd;
+      const uint64_t end = storage_.readPosition();
+      storage_.endRead();
+      if (valid && !storage_.ioFailed()) {
+        updateRuntimeOverlay(appendRecord_);
+        if (!metadata_.pendingCount) runtimeOldest_ = appendRecord_;
+        ++metadata_.pendingCount; ++metadata_.storedCount;
+        metadata_.maximumSequence = appendRecord_.sequence;
+        snprintf(metadata_.cacheGeneration, sizeof(metadata_.cacheGeneration), "%s", cacheGeneration);
+        runtimeMetadata_ = metadata_; runtimeEnd_ = end;
+        committedRecord = appendRecord_;
+        return JournalAppendResult::kCommitted;
+      }
+      runtimeValid_ = false;
+    }
     ScanState installed = {};
     const ScanResult result = scan(kPendingJournalPath, nullptr, nullptr,
                                    installed);
+    if (result == ScanResult::kUnavailable) {
+      // The newline may have committed. Do not permit another append until a
+      // read-only recovery resolves the durable bytes and sequence cursor.
+      appendValidationPending_ = true;
+      uncertain_ = true;
+      integrityReason_ = "write_uncertain";
+      return JournalAppendResult::kValidationFailed;
+    }
     if (result == ScanResult::kValid &&
         installed.pendingCount == previousCount + 1U &&
         installed.storedCount == previousStoredCount + 1U &&
@@ -1064,6 +1253,7 @@ class PendingJournal {
 
  private:
   enum class ScanResult : uint8_t {
+    kYielded,
     kValid,
     kTornTail,
     kUnavailable,
@@ -1252,8 +1442,11 @@ class PendingJournal {
                   const char* expectedGeneration, ScanState& state,
                   OfflineJournalRecord* oldestRecord = nullptr) {
     state = ScanState{};
+    const bool runtimeScan = storage_.trustedRuntimeReads() && strcmp(path, kPendingJournalPath) == 0;
+    if (runtimeScan) { runtimeValid_ = false; runtimeCount_ = 0U; runtimeComplete_ = true; runtimeOldest_ = {}; }
     if (target != nullptr) state.currentStock = target->currentStock;
     if (!storage_.available() || !storage_.beginRead(path)) {
+      transportFailure_ = true;
       return ScanResult::kUnavailable;
     }
 
@@ -1270,6 +1463,12 @@ class PendingJournal {
     }
     if (!valid) {
       storage_.endRead();
+      if (lineResult == JournalReadLineResult::kYielded) return ScanResult::kYielded;
+      if (lineResult == JournalReadLineResult::kError) {
+        transportFailure_ = true;
+        return ScanResult::kUnavailable;
+      }
+      integrityReason_ = "invalid_header";
       return ScanResult::kInvalid;
     }
 
@@ -1277,6 +1476,15 @@ class PendingJournal {
     state.maximumSequence = state.compactedSequence;
     while (true) {
       lineResult = storage_.readLine(line_, sizeof(line_));
+      if (lineResult == JournalReadLineResult::kYielded) {
+        storage_.endRead();
+        return ScanResult::kYielded;
+      }
+      if (lineResult == JournalReadLineResult::kError) {
+        storage_.endRead();
+        transportFailure_ = true;
+        return ScanResult::kUnavailable;
+      }
       if (lineResult == JournalReadLineResult::kEnd) break;
       if (lineResult == JournalReadLineResult::kUnterminatedLine ||
           lineResult == JournalReadLineResult::kTooLongUnterminated) {
@@ -1289,15 +1497,28 @@ class PendingJournal {
         return ScanResult::kInvalid;
       }
       scanRecord_ = OfflineJournalRecord{};
+      const char* checksum = strrchr(line_, ',');
+      uint32_t expectedCrc = 0U;
+      const bool crcValid = checksum && detail::parseHex32(checksum + 1U, expectedCrc) &&
+          expectedCrc == (cache::updateCrc32(0xFFFFFFFFUL, line_,
+              static_cast<size_t>(checksum - line_)) ^ 0xFFFFFFFFUL);
       if (!parseRecord(line_, deviceIdentifier_, scanRecord_) ||
           previousSequence == UINT64_MAX ||
-          scanRecord_.sequence != previousSequence + 1ULL) {
+          (scanRecord_.sequence != previousSequence + 1ULL &&
+           (scanRecord_.sequence < 0x8000000000000000ULL ||
+            scanRecord_.sequence <= previousSequence))) {
         storage_.endRead();
+        integrityReason_ = crcValid ? "invalid_record" : "crc_mismatch";
         return ScanResult::kInvalid;
       }
       if (scanRecord_.sequence > state.acknowledgedSequence &&
           state.pendingCount == 0U && oldestRecord != nullptr) {
         *oldestRecord = scanRecord_;
+      }
+      if (runtimeScan) {
+        if (scanRecord_.sequence > state.acknowledgedSequence && state.pendingCount == 0U)
+          runtimeOldest_ = scanRecord_;
+        updateRuntimeOverlay(scanRecord_);
       }
       previousSequence = scanRecord_.sequence;
       if (state.storedCount == 0U) {
@@ -1350,11 +1571,18 @@ class PendingJournal {
       }
       state.maximumSequence = scanRecord_.sequence;
     }
+    const uint64_t endPosition = storage_.readPosition();
     storage_.endRead();
     if (state.acknowledgedSequence > state.maximumSequence ||
         (state.storedCount == 0U &&
          state.compactedSequence != state.acknowledgedSequence)) {
       return ScanResult::kInvalid;
+    }
+    if (runtimeScan) {
+      runtimeMetadata_ = {true, state.pendingCount, state.storedCount,
+          state.maximumSequence, state.compactedSequence, state.acknowledgedSequence, {}, false};
+      snprintf(runtimeMetadata_.cacheGeneration, sizeof(runtimeMetadata_.cacheGeneration), "%s", state.cacheGeneration);
+      runtimeEnd_ = endPosition; runtimeValid_ = true;
     }
     return ScanResult::kValid;
   }
@@ -1371,15 +1599,21 @@ class PendingJournal {
              "%s", state.cacheGeneration);
     metadata_.recoveredTornTail = recoveredTornTail;
     uncertain_ = false;
+    transportFailure_ = appendValidationPending_ = false;
+    integrityReason_ = "none";
   }
 
   void reset() {
+    runtimeValid_ = false;
     metadata_ = PendingJournalMetadata{};
     uncertain_ = false;
+    transportFailure_ = appendValidationPending_ = false;
+    integrityReason_ = "invalid_record";
     deviceIdentifier_[0] = '\0';
   }
 
   void invalidate() {
+    runtimeValid_ = false;
     metadata_ = PendingJournalMetadata{};
     uncertain_ = true;
   }
@@ -1398,15 +1632,18 @@ class PendingJournal {
   bool rewritePrefix(const char* sourcePath, uint32_t recordCount,
                      uint64_t compactedSequence,
                      uint64_t acknowledgedSequence) {
+    reportAcknowledgementStage(JournalAcknowledgementStage::kTempCleanup);
     if (storage_.exists(kPendingJournalTemporaryPath) &&
         !storage_.remove(kPendingJournalTemporaryPath)) {
       return false;
     }
+    reportAcknowledgementStage(JournalAcknowledgementStage::kTempHeader);
     if (!writeEmptyJournal(kPendingJournalTemporaryPath, compactedSequence,
                            acknowledgedSequence) ||
         !storage_.beginRead(sourcePath)) {
       return false;
     }
+    reportAcknowledgementStage(JournalAcknowledgementStage::kCopyRows);
     uint64_t sourceCompactedSequence = 0ULL;
     uint64_t sourceAcknowledgedSequence = 0ULL;
     bool copied =
@@ -1432,6 +1669,7 @@ class PendingJournal {
     }
     storage_.endRead();
     if (!copied) return false;
+    reportAcknowledgementStage(JournalAcknowledgementStage::kTempVerify);
     ScanState candidate = {};
     if (scan(kPendingJournalTemporaryPath, nullptr, nullptr, candidate) !=
             ScanResult::kValid ||
@@ -1440,6 +1678,7 @@ class PendingJournal {
         candidate.acknowledgedSequence != acknowledgedSequence) {
       return false;
     }
+    reportAcknowledgementStage(JournalAcknowledgementStage::kPromote);
     return promoteTemporary();
   }
 
@@ -1531,14 +1770,76 @@ class PendingJournal {
   }
 
   PendingJournalStorage& storage_;
+  void reportAcknowledgementStage(JournalAcknowledgementStage stage) {
+    if (acknowledgementActive_ && acknowledgementProgress_ != nullptr)
+      acknowledgementProgress_(stage, acknowledgementContext_);
+  }
+  AcknowledgementProgress acknowledgementProgress_ = nullptr;
+  void* acknowledgementContext_ = nullptr;
+  bool acknowledgementActive_ = false;
   PendingJournalMetadata metadata_ = {};
   bool uncertain_ = false;
+  bool transportFailure_ = false;
+  bool appendValidationPending_ = false;
+  const char* integrityReason_ = "invalid_record";
   char deviceIdentifier_[kDeviceIdentifierCapacity] = {};
   char line_[kJournalLineCapacity] = {};
   // Journal rows carry a maximum-size barcode. Separate persistent scratch
   // records avoid nested ~1.2 KiB automatic allocations during append->scan.
   OfflineJournalRecord appendRecord_ = {};
   OfflineJournalRecord scanRecord_ = {};
+  // Bounded ESP32-side derived index. All rows (including retained ACK rows)
+  // are validated on boot/recovery; >32 distinct products uses the scan fallback.
+  struct RuntimeOverlay {
+    char id[cache::kProductIdCapacity] = {};
+    char barcode[65] = {}; // Physical scanner bound; larger cache barcodes fall back.
+    uint64_t base = 0, stock = 0, minimumThreshold = 0, maximumThreshold = cache::kMaximumStockValue;
+    bool valid = true;
+  } runtimeOverlay_[32];
+  PendingJournalMetadata runtimeMetadata_ = {};
+  OfflineJournalRecord runtimeOldest_ = {};
+  uint64_t runtimeEnd_ = UINT64_MAX;
+  uint8_t runtimeCount_ = 0;
+  bool runtimeValid_ = false, runtimeComplete_ = true;
+  bool runtimeMatches() const {
+    return storage_.trustedRuntimeReads() && storage_.available() && !storage_.ioFailed() &&
+        !uncertain_ && !transportFailure_ && runtimeValid_ && metadata_.available &&
+        runtimeMetadata_.maximumSequence == metadata_.maximumSequence &&
+        runtimeMetadata_.compactedSequence == metadata_.compactedSequence &&
+        runtimeMetadata_.acknowledgedSequence == metadata_.acknowledgedSequence &&
+        runtimeMetadata_.storedCount == metadata_.storedCount &&
+        runtimeMetadata_.pendingCount == metadata_.pendingCount &&
+        strcmp(runtimeMetadata_.cacheGeneration, metadata_.cacheGeneration) == 0;
+  }
+  void updateRuntimeOverlay(const OfflineJournalRecord& record) {
+    if (strlen(record.barcode) >= sizeof(runtimeOverlay_[0].barcode)) {
+      runtimeComplete_ = false; return;
+    }
+    uint8_t i = 0;
+    for (; i < runtimeCount_; ++i) {
+      if (!strcmp(runtimeOverlay_[i].id, record.productId) || !strcmp(runtimeOverlay_[i].barcode, record.barcode)) break;
+    }
+    if (i == runtimeCount_) {
+      if (runtimeCount_ == 32U) { runtimeComplete_ = false; return; }
+      auto& entry = runtimeOverlay_[runtimeCount_++]; entry = RuntimeOverlay{};
+      snprintf(entry.id, sizeof(entry.id), "%s", record.productId);
+      snprintf(entry.barcode, sizeof(entry.barcode), "%s", record.barcode);
+      entry.valid = record.delta == 1 ? record.resultingStock > 0U : record.resultingStock < cache::kMaximumStockValue;
+      entry.base = entry.stock = record.delta == 1 ? record.resultingStock - 1U : record.resultingStock + 1U;
+    }
+    auto& entry = runtimeOverlay_[i];
+    if (strcmp(entry.id, record.productId) || strcmp(entry.barcode, record.barcode) ||
+        (record.delta == 1 ? entry.stock >= cache::kMaximumStockValue || entry.stock + 1U != record.resultingStock
+                           : entry.stock == 0U || entry.stock - 1U != record.resultingStock)) entry.valid = false;
+    entry.stock = record.resultingStock;
+    if (record.resultingStatus == cache::StockStatus::kHigh) {
+      if (!entry.stock) entry.valid = false;
+      else if (entry.maximumThreshold > entry.stock - 1U) entry.maximumThreshold = entry.stock - 1U;
+    } else if (record.resultingStatus == cache::StockStatus::kLow) {
+      if (!entry.stock) entry.valid = false;
+      if (entry.minimumThreshold < entry.stock) entry.minimumThreshold = entry.stock;
+    } else if (entry.stock) entry.valid = false;
+  }
 };
 
 }  // namespace offline

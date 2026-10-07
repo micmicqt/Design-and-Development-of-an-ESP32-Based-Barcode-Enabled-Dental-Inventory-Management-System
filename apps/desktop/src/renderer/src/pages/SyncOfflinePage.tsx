@@ -2,13 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import type {
   OfflinePendingEvent,
   OfflineSyncCounts,
-  OfflineSyncOutcome
+  OfflineSyncOutcome,
+  OfflineJournalState
 } from '../../../shared/ipc-contract'
 
 type PendingPreviewState =
   | { state: 'loading' }
   | { state: 'loaded'; event: OfflinePendingEvent | null }
-  | { state: 'unavailable' }
+  | { state: 'unavailable'; message?: string }
 
 type SynchronizationState =
   | { state: 'idle' }
@@ -20,7 +21,14 @@ function formatPendingCount(pendingCount: number | undefined): string {
   return pendingCount === undefined ? 'Not reported' : String(pendingCount)
 }
 
-function formatOfflineReadiness(offlineReady: boolean | undefined): string {
+function formatOfflineReadiness(offlineReady: boolean | undefined,
+                                journalState?: OfflineJournalState): string {
+  if (journalState === 'ready' || journalState === 'empty') return 'Ready'
+  if (journalState === 'recovering') return 'Recovering'
+  if (journalState === 'temporarily_unavailable') return 'Temporarily unavailable'
+  if (journalState === 'corrupt') return 'Integrity check failed'
+  if (journalState === 'full') return 'Full — synchronize pending records'
+  if (journalState === 'generation_mismatch') return 'Inventory snapshot mismatch'
   if (offlineReady === undefined) return 'Not reported'
   return offlineReady ? 'Ready' : 'Not ready'
 }
@@ -50,37 +58,90 @@ function SyncCounts({ counts }: { counts: OfflineSyncCounts }) {
 
 export function SyncOfflinePage({
   pendingCount,
-  offlineReady
+  offlineReady,
+  offlineJournalState,
+  offlineAckState
 }: {
   pendingCount: number | undefined
   offlineReady: boolean | undefined
+  offlineJournalState?: OfflineJournalState
+  offlineAckState?: 'IDLE' | 'QUEUED' | 'RUNNING' | 'VERIFYING' | 'SUCCEEDED' | 'FAILED'
 }) {
   const [preview, setPreview] = useState<PendingPreviewState>({ state: 'loading' })
   const [synchronization, setSynchronization] = useState<SynchronizationState>({ state: 'idle' })
+  const [finishingAcknowledgement, setFinishingAcknowledgement] = useState(false)
   const synchronizationInFlight = useRef(false)
+  const previewGeneration = useRef(0)
+  // Display-only observation, never supplied as an authorization/count to IPC.
+  const lastJournal = useRef({ pendingCount, offlineReady, offlineJournalState })
+  useEffect(() => {
+    if (pendingCount !== undefined || offlineJournalState !== undefined)
+      lastJournal.current = { pendingCount, offlineReady, offlineJournalState }
+  }, [pendingCount, offlineReady, offlineJournalState])
+  const journal = pendingCount === undefined && offlineJournalState === undefined
+    ? lastJournal.current : { pendingCount, offlineReady, offlineJournalState }
+  const journalIsLastKnown = journal !== undefined && pendingCount === undefined &&
+    offlineJournalState === undefined && lastJournal.current.pendingCount !== undefined
 
   useEffect(() => {
+    if (synchronizationInFlight.current) return undefined
     let active = true
+    const generation = ++previewGeneration.current
 
     void window.desktopApi.hardware
       .getNextOfflineEvent()
       .then((result) => {
-        if (!active) return
-        setPreview(result.ok ? { state: 'loaded', event: result.value } : { state: 'unavailable' })
+        if (!active || generation !== previewGeneration.current) return
+        setPreview(result.ok ? { state: 'loaded', event: result.value } :
+          { state: 'unavailable', message: result.error.message })
       })
       .catch(() => {
-        if (active) setPreview({ state: 'unavailable' })
+        if (active && generation === previewGeneration.current) setPreview({ state: 'unavailable' })
       })
 
     return () => {
       active = false
     }
-  }, [])
+  }, [offlineJournalState, pendingCount])
+
+  useEffect(() => {
+    if (synchronization.state !== 'syncing') return undefined
+    let active = true
+    let inFlight = false
+    const poll = async () => {
+      if (inFlight) return
+      inFlight = true
+      try {
+        const status = await window.desktopApi.hardware.getStatus()
+        if (!active) return
+        const expectedId = preview.state === 'loaded' ? preview.event?.eventId : undefined
+        if (status.offlineAckEventId === expectedId) {
+          setFinishingAcknowledgement(
+            status.offlineAckState === 'QUEUED' ||
+            status.offlineAckState === 'RUNNING' ||
+            status.offlineAckState === 'VERIFYING'
+          )
+        }
+      } catch {
+        // Keep the last in-progress message through a transient status loss.
+      } finally {
+        inFlight = false
+      }
+    }
+    void poll()
+    const timer = setInterval(() => void poll(), 2_000)
+    return () => {
+      active = false
+      clearInterval(timer)
+    }
+  }, [synchronization.state, preview])
 
   async function synchronizeOfflineInventory(): Promise<void> {
     if (synchronizationInFlight.current) return
 
     synchronizationInFlight.current = true
+    ++previewGeneration.current
+    setFinishingAcknowledgement(false)
     setSynchronization({ state: 'syncing' })
 
     try {
@@ -92,6 +153,8 @@ export function SyncOfflinePage({
 
       setSynchronization({ state: 'finished', outcome: result.value })
       if (result.value.status === 'COMPLETE' || result.value.status === 'CACHE_REFRESH_FAILED') {
+        lastJournal.current = { pendingCount: 0, offlineReady,
+          offlineJournalState: 'empty' }
         setPreview({ state: 'loaded', event: null })
       }
     } catch {
@@ -101,15 +164,20 @@ export function SyncOfflinePage({
       })
     } finally {
       synchronizationInFlight.current = false
+      setFinishingAcknowledgement(false)
     }
   }
 
   const finishedOutcome = synchronization.state === 'finished' ? synchronization.outcome : null
   const displayedPendingCount =
-    finishedOutcome?.status === 'COMPLETE' || finishedOutcome?.status === 'CACHE_REFRESH_FAILED'
+    journal.offlineJournalState !== undefined
+      ? journal.pendingCount
+      : finishedOutcome?.status === 'COMPLETE' || finishedOutcome?.status === 'CACHE_REFRESH_FAILED'
       ? 0
-      : pendingCount
+      : journal.pendingCount
   const retryingCacheOnly = finishedOutcome?.status === 'CACHE_REFRESH_FAILED'
+  const kioskAcknowledgementActive = offlineAckState === 'QUEUED' ||
+    offlineAckState === 'RUNNING' || offlineAckState === 'VERIFYING'
 
   return (
     <section className="sync-offline-page" aria-label="Offline synchronization">
@@ -120,9 +188,10 @@ export function SyncOfflinePage({
         </div>
         <div>
           <span>Offline journal</span>
-          <strong>{formatOfflineReadiness(offlineReady)}</strong>
+          <strong>{formatOfflineReadiness(journal.offlineReady, journal.offlineJournalState)}</strong>
         </div>
       </div>
+      {journalIsLastKnown && <p role="status">Last known journal status. Current refresh unavailable; synchronization rechecks the device.</p>}
 
       <div className="sync-offline-notice" role="status">
         <strong>Safe, sequential synchronization</strong>
@@ -140,8 +209,11 @@ export function SyncOfflinePage({
         <div className="sync-offline-message" role="alert">
           <strong>Pending transaction preview is unavailable.</strong>
           <span>
-            Reconnect the kiosk and retry. No pending record is acknowledged by this preview.
+            {synchronization.state === 'syncing' || kioskAcknowledgementActive
+              ? 'The kiosk is finishing device acknowledgement; no conclusion is drawn from the preview.'
+              : preview.message ?? 'Retry the preview.'}
           </span>
+          <span>No pending record is acknowledged by this preview.</span>
         </div>
       )}
 
@@ -209,7 +281,7 @@ export function SyncOfflinePage({
         <button
           className="primary-button primary-button--inline"
           type="button"
-          disabled={synchronization.state === 'syncing'}
+          disabled={synchronization.state === 'syncing' || kioskAcknowledgementActive}
           onClick={() => void synchronizeOfflineInventory()}
         >
           {synchronization.state === 'syncing'
@@ -224,10 +296,12 @@ export function SyncOfflinePage({
 
       {synchronization.state === 'syncing' && (
         <div className="sync-offline-reconciliation-result" role="status">
-          <strong>Synchronization in progress</strong>
-          <span>
-            Processing one event at a time: local commit, device acknowledgement, then retirement.
-          </span>
+          <strong>{finishingAcknowledgement
+            ? 'Finishing device acknowledgement'
+            : 'Reconciling inventory'}</strong>
+          <span>{finishingAcknowledgement
+            ? 'The inventory change is saved. The kiosk is securely updating its offline journal.'
+            : 'Processing one event at a time: local commit, device acknowledgement, then retirement.'}</span>
         </div>
       )}
 

@@ -27,7 +27,8 @@ class PingClient {
       outcome_ = LinkOutcome::kNone;
     }
     if (state_ == LinkState::kSending &&
-        transmitter.tryWrite(static_cast<uint8_t>(dental_link::kPing[position_]))) {
+        transmitter.tryWrite(static_cast<uint8_t>(
+            dental_link::text::at(dental_link::kPing, position_)))) {
       if (++position_ == sizeof(dental_link::kPing) - 1U) {
         state_ = LinkState::kWaiting;
         stateSince_ = now;
@@ -35,16 +36,18 @@ class PingClient {
     }
   }
 
-  void receive(uint32_t now, uint8_t byte) {
+  dental_link::Frame receive(uint32_t now, uint8_t byte) {
     expire(now);
-    if (state_ != LinkState::kWaiting) return;
-    if (parser_.receive(byte) == dental_link::Frame::kPong) {
+    const dental_link::Frame frame = parser_.receive(byte);
+    if (state_ == LinkState::kWaiting && frame == dental_link::Frame::kPong) {
       ++verifiedCount_;
       finish(now, LinkOutcome::kVerified);
     }
+    return frame;
   }
 
   void receiveError() { parser_.rejectUntilNewline(); }
+  const char* payload() const { return parser_.payload(); }
   LinkState state() const { return state_; }
   LinkOutcome outcome() const { return outcome_; }
   uint16_t verifiedCount() const { return verifiedCount_; }
@@ -65,7 +68,8 @@ class PingClient {
     parser_.reset();
   }
 
-  dental_link::LineParser parser_;
+  // PONG, bounded BTN replies and advisory 20-column LCD rows; never barcodes.
+  dental_link::BasicLineParser<26U> parser_;
   uint32_t stateSince_;
   uint16_t verifiedCount_ = 0U;
   uint16_t timeoutCount_ = 0U;

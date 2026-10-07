@@ -8,12 +8,25 @@
 namespace {
 struct WorkflowSpy {
   bool ready = true;
+  bool waiting = false;
+  bool storageUnavailable = false;
+  bool rejectMode = false;
+  unsigned modeCalls = 0U;
   unsigned calls = 0U;
   dental_link::Frame mode = dental_link::Frame::kNone;
   char barcode[65] = {};
-  bool readyForTransaction() const { return ready; }
+  bool readyForTransaction() const { return ready && !waiting; }
+  bool beginTransactionMode(dental_link::Frame operation, uint32_t) {
+    if (!readyForTransaction()) return false;
+    if (rejectMode) return false;
+    ++modeCalls; mode = operation; waiting = true; return true;
+  }
+  bool modeStorageUnavailable() const { return storageUnavailable; }
+  bool readyForBarcode(dental_link::Frame operation) const {
+    return waiting && mode == operation;
+  }
   void handleTransactionBarcode(dental_link::Frame operation, const char* text, uint32_t) {
-    ++calls; mode = operation; strcpy(barcode, text); ready = false;
+    ++calls; mode = operation; strcpy(barcode, text); ready = false; waiting = false;
   }
 };
 struct Writer {
@@ -22,6 +35,7 @@ struct Writer {
 };
 struct Fixture {
   dental::controller_link::PingResponder responder;
+  dental::controller_link::ForwardedOperationRouter router;
   dental::registration::BarcodeCapture capture;
   WorkflowSpy workflow;
   Writer writer;
@@ -30,8 +44,14 @@ struct Fixture {
     for (; *text; ++text) {
       const dental_link::Frame frame = responder.receive(*text, writer);
       if (frame == dental_link::Frame::kScan || frame == dental_link::Frame::kRestock ||
-          frame == dental_link::Frame::kCheckout) {
-        if (dental::controller_link::routeForwardedFrame(frame, responder.barcode(), now, capture, workflow) ==
+          frame == dental_link::Frame::kCheckout ||
+          frame == dental_link::Frame::kRestockMode ||
+          frame == dental_link::Frame::kCheckoutMode) {
+        if (router.route(frame,
+                         frame == dental_link::Frame::kRestockMode ||
+                                 frame == dental_link::Frame::kCheckoutMode
+                             ? nullptr : responder.barcode(),
+                         now, capture, workflow) ==
             dental::controller_link::ScanRoute::kRegistration) ++registrationRoutes;
       }
     }
@@ -42,6 +62,32 @@ void validScanOnce() {
   Fixture f; f.feed("RESTOCK:4806016001569\n");
   assert(f.workflow.calls == 1U && strcmp(f.workflow.barcode, "4806016001569") == 0);
   assert(f.workflow.mode == dental_link::Frame::kRestock);
+}
+void separatedRestockAndCheckout() {
+  Fixture restock;
+  restock.feed("BTN:RESTOCK\n");
+  assert(restock.workflow.modeCalls == 1U && restock.workflow.calls == 0U &&
+         restock.workflow.waiting);
+  restock.feed("SCAN:4806016001569\n");
+  assert(restock.workflow.calls == 1U &&
+         restock.workflow.mode == dental_link::Frame::kRestock &&
+         strcmp(restock.workflow.barcode, "4806016001569") == 0);
+
+  Fixture checkout;
+  checkout.feed("BTN:CHECKOUT\n");
+  assert(checkout.workflow.modeCalls == 1U && checkout.workflow.calls == 0U &&
+         checkout.workflow.waiting);
+  checkout.feed("SCAN:0012345678905\n");
+  assert(checkout.workflow.calls == 1U &&
+         checkout.workflow.mode == dental_link::Frame::kCheckout &&
+         strcmp(checkout.workflow.barcode, "0012345678905") == 0);
+}
+void duplicateModeAndScanDoNotRestart() {
+  Fixture f;
+  f.feed("BTN:CHECKOUT\nBTN:CHECKOUT\n");
+  assert(f.workflow.modeCalls == 1U && f.workflow.calls == 0U);
+  f.feed("SCAN:00123\nSCAN:00123\n");
+  assert(f.workflow.calls == 1U);
 }
 void zeroesAndWhitespace() {
   Fixture f; f.feed("CHECKOUT: 0012345678905 \r\n");
@@ -83,6 +129,12 @@ void registrationIsolation() {
   assert(strcmp(f.capture.barcode(), "0012345678905") == 0);
   f.workflow.ready = false; f.feed("SCAN:123\n");
   assert(f.registrationRoutes == 1U && f.workflow.calls == 0U);
+}
+void physicalModeCannotPopulateRegistration() {
+  Fixture f; assert(f.capture.start(0UL, false));
+  f.feed("BTN:RESTOCK\nSCAN:0012345678905\n");
+  assert(f.workflow.modeCalls == 0U && f.workflow.calls == 0U &&
+         f.registrationRoutes == 0U && f.capture.active());
 }
 void registrationFailureAndTimeout() {
   Fixture f; assert(f.capture.start(0UL, false)); f.feed("SCAN:12,34\n");
@@ -132,10 +184,72 @@ void repeatedBarcodeAfterRearmIsDistinctOperation() {
   f.workflow.ready = true; f.feed("CHECKOUT:00123\n");
   assert(f.workflow.calls == 2U && f.workflow.mode == dental_link::Frame::kCheckout);
 }
+void explicitModeRepliesAndIdempotentRetry() {
+  using dental::controller_link::ScanRoute;
+  Fixture f;
+  const auto first = f.router.route(dental_link::Frame::kCheckoutMode,
+      nullptr, 1UL, f.capture, f.workflow);
+  assert(first == ScanRoute::kModeAccepted);
+  assert(strcmp(dental::controller_link::modeReply(first,
+      dental_link::Frame::kCheckoutMode), "BTN:OK:CHECKOUT\n") == 0);
+  const auto retry = f.router.route(dental_link::Frame::kCheckoutMode,
+      nullptr, 2UL, f.capture, f.workflow);
+  assert(retry == ScanRoute::kModeDuplicate && f.workflow.modeCalls == 1U);
+  assert(strcmp(dental::controller_link::modeReply(retry,
+      dental_link::Frame::kCheckoutMode), "BTN:OK:CHECKOUT\n") == 0);
+  const auto conflict = f.router.route(dental_link::Frame::kRestockMode,
+      nullptr, 3UL, f.capture, f.workflow);
+  assert(conflict == ScanRoute::kModeBusy && f.workflow.modeCalls == 1U);
+  assert(strcmp(dental::controller_link::modeReply(conflict,
+      dental_link::Frame::kRestockMode), "BTN:BUSY\n") == 0);
+  f.router.route(dental_link::Frame::kScan, "00123", 4UL, f.capture, f.workflow);
+  assert(f.workflow.calls == 1U);
+}
+void registrationAndRejectionReply() {
+  using dental::controller_link::ScanRoute;
+  Fixture f; assert(f.capture.start(0UL, false));
+  const auto busy = f.router.route(dental_link::Frame::kRestockMode,
+      nullptr, 1UL, f.capture, f.workflow);
+  assert(busy == ScanRoute::kModeRegistrationBusy && f.workflow.modeCalls == 0U);
+  assert(strcmp(dental::controller_link::modeReply(busy,
+      dental_link::Frame::kRestockMode), "BTN:BUSY\n") == 0);
+  dental_link::LineParser parser;
+  dental_link::Frame frame = dental_link::Frame::kNone;
+  for (const char* p = "BTN:CHECKOUT\n"; *p; ++p) frame = parser.receive(*p);
+  assert(frame == dental_link::Frame::kCheckoutMode);
+  for (const char* p = "BTN:OK:CHECKOUT\n"; *p; ++p) frame = parser.receive(*p);
+  assert(frame == dental_link::Frame::kCheckoutAccepted);
+  for (const char* p = "BTN:CHECKOUT:GARBAGE\n"; *p; ++p) frame = parser.receive(*p);
+  assert(frame == dental_link::Frame::kRejected);
+}
+void storageFailureGetsExplicitTypedReply() {
+  using dental::controller_link::ScanRoute;
+  Fixture f;
+  f.workflow.rejectMode = true;
+  f.workflow.storageUnavailable = true;
+  const auto route = f.router.route(dental_link::Frame::kRestockMode,
+      nullptr, 1UL, f.capture, f.workflow);
+  assert(route == ScanRoute::kModeStorageUnavailable);
+  assert(strcmp(dental::controller_link::modeReply(route,
+      dental_link::Frame::kRestockMode), "BTN:REJECT:STORAGE\n") == 0);
+  dental_link::LineParser parser;
+  dental_link::Frame reply = dental_link::Frame::kNone;
+  for (const char* p = dental_link::kModeStorageUnavailable; *p; ++p)
+    reply = parser.receive(*p);
+  assert(reply == dental_link::Frame::kModeStorageUnavailable);
+  assert(f.router.route(dental_link::Frame::kScan, "00123", 2UL,
+                        f.capture, f.workflow) == ScanRoute::kIgnored);
+  assert(f.workflow.calls == 0U);
+}
+
 int main() {
-  validScanOnce(); zeroesAndWhitespace(); malformed(); oversized(); pingPong();
+  validScanOnce(); separatedRestockAndCheckout(); duplicateModeAndScanDoNotRestart();
+  zeroesAndWhitespace(); malformed(); oversized(); pingPong();
   directScannerDisabled(); idleAndFeedbackIgnored(); registrationIsolation();
-  registrationFailureAndTimeout(); maximumAndDefensiveValidation(); freshCaptureAndParserQuarantine();
+  physicalModeCannotPopulateRegistration(); registrationFailureAndTimeout();
+  maximumAndDefensiveValidation(); freshCaptureAndParserQuarantine();
   bareScanNeverCreatesTransaction(); physicalOperationCannotBecomeRegistration(); repeatedBarcodeAfterRearmIsDistinctOperation();
-  puts("ATmega operation routing/registration: 14 focused scenarios PASSED");
+  explicitModeRepliesAndIdempotentRetry(); registrationAndRejectionReply();
+  storageFailureGetsExplicitTypedReply();
+  puts("ATmega operation routing/registration: 20 focused scenarios PASSED");
 }

@@ -6,6 +6,7 @@ out/
 release/
 coverage/
 *.tsbuildinfo
+apps/desktop/electron.vite.config.*.mjs
 
 # PlatformIO and local Python tooling
 .pio/
@@ -19,14 +20,25 @@ firmware/.pio/
 .env.*
 !.env.example
 firmware/include/secrets.h
+secrets.h
 *.pem
 *.key
+*.p12
+*.pfx
+device-configuration.json*
 
 # Runtime data
 .runtime/
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
 logs/
 /images/
 
@@ -39,3 +51,9 @@ Thumbs.db
 # Temporary review artifacts
 .tmp*/
 tmp/
+
+# Local-only standalone hardware probes and unrelated workspace entries
+/sd-standalone-probe/
+/Inventory
+/System/
+/University/

@@ -12,9 +12,10 @@ PlatformIO Atmel AVR 5.1.0, AVR-GCC/avr-libc, bare-metal C++11 (no Arduino runti
 or third-party libraries). Target Arduino Uno R3's **onboard ATmega328P**,
 explicitly `F_CPU = 16000000UL`.
 The AVR runtime supplies reset/startup and calls `main()`. Startup drives only
-the four status pins OFF. Step 2 initializes the D6/D7 software UART, Timer1
-and Timer0. Step 3C supersedes the temporary USART0 scanner wiring with a
-full-duplex A0/A1 software UART; D0/D1 are now free from GM65 ownership.
+the four status pins OFF. Final deployment assigns USART0 D0/D1 to GM65 and
+the Timer1/PCINT2 software UART D6/D7 to the ESP32 controller link. Timer0
+supplies the millisecond clock. The previous A0/A1 scanner and D0/D1 controller
+routing was a physically tested prototype, not the final PCB assignment.
 The final schematic configures D2/D3 as active-HIGH button inputs with external
 10 kOhm pull-down resistors; AVR internal pull-ups remain disabled.
 The status APIs write both bits of each group together, preserving other bits.
@@ -36,35 +37,48 @@ framework is linked, and no fuse/bootloader programming is required.
 | Group | Input A | Input B | OFF | YELLOW | RED | GREEN |
 | --- | --- | --- | --- | --- | --- | --- |
 | Small | PD5 / D5 | PD4 / D4 | 00 | 01 | 10 | 11 |
-| Big | PB0 / D8 | PB1 / D9 | 00 | 10 | not defined | 11 |
+| Big | PB0 / D8 | PB1 / D9 | 00 | not defined | 10 | 11 |
 
 These are inputs to the existing external 7400-series logic, not independent LED
 drivers. The supplied truth-table **rows** are authoritative, not older schematic
 labels. Big 01 is reserved/unused and never emitted by the normal API. Invalid
-enum values fail to OFF. No HIGH/LOW/EMPTY or SUCCESS/error semantic assignments
-are introduced in this foundation step.
+enum values fail to OFF. The Step 1 foundation initially left runtime meaning
+unassigned. The current feedback path uses the small group for persistent
+database-derived HIGH=GREEN, LOW=YELLOW, and EMPTY=RED; the big group gives a
+brief GREEN transaction-success or RED error indication. Both start OFF.
+The older graphic's big "Yellow" label is superseded by the physically
+confirmed red LED; its 10 input row is unchanged.
+Stock status is transported only after an online committed result or a durable
+offline journal append, not inferred from a barcode by the ATmega. This runtime
+LED path still requires physical acceptance on the final D4/D5 and D8/D9 wiring.
+The bounded advisory controller frames `STOCK:H`, `STOCK:L`, and `STOCK:E`
+carry the already-authoritative HIGH/LOW/EMPTY status. They do not arm a scan,
+change stock, or acknowledge an event.
 
 ## Step 2: controller UART
 
 ATmega controller software UART: **D6/PD6 RX, D7/PD7 TX, 9600 baud, 8N1**.
-Scanner software UART: **A0/PC0 RX, A1/PC1 TX, 9600 baud, 8N1**. Hardware
-USART0 D0/PD0 and D1/PD1 is explicitly disabled by application startup and is
-free from GM65 ownership for Uno USB/bootloader or later debug use.
-Timer1 runs freely at 2 MHz (prescaler 8). Compare A advances the earliest due
-TX channel; Compare B samples the earliest due RX channel. PD6 uses PCINT22/
-PCINT2 and A0 uses PCINT8/PCINT1 for independent falling start edges. Each
-channel carries its own phase and next deadline, so controller and scanner TX/
-RX frames can overlap rather than assuming alternating use. Fixed 208-tick/
-104-tick sampling yields approximately 9615 baud (+0.16%). Controller queues
-have 16 slots (15 usable); scanner RX has 64 slots (63 usable), and scanner TX
-has 16. Full TX returns false, RX overflow/framing errors quarantine parser
-input, false starts are discarded, and ISR work remains bounded.
-Timer0 CTC supplies the 1 kHz timeout clock. Timer1/PCINT22 are reserved for this
-link; no timer compare output pins/PWM are enabled. Future drivers must preserve
-these resources and keep interrupt latency comfortably below a half bit (52 us).
+This reuses the physically verified Step 2 Timer1/PCINT2 design with the later
+bounded timed sender/receiver and fixed 16-slot RX/TX queues (15 usable).
+Timer1 runs freely at 2 MHz (prescaler 8): Compare A advances controller TX,
+Compare B samples controller RX, and PCINT2/PCINT22 detects the D6 start edge.
+A full TX ring returns false so the existing producer retries the same byte.
+Framing and queue-overflow errors quarantine input through the next newline.
+Timer0 CTC supplies the 1 kHz timeout clock.
+
+GM65 uses **hardware USART0 D0/PD0 RX, D1/PD1 TX, 9600 baud, 8N1**.
+Normal-speed `UBRR0=103` produces approximately 9615 baud (+0.16%). Its
+RX interrupt preserves FE/DOR/UPE error status in the existing fixed scanner
+queue; the TX interrupt drains a bounded queue without blocking. Production
+currently sends no GM65 command.
 Main polls at most eight received bytes and attempts one nonblocking TX enqueue
 per iteration. Bidirectional communication has been physically verified;
-future interrupt-heavy drivers still require timing/latency verification.
+the final routing has not yet been physically exercised with the Step 5 remote
+sector workload. The software UART depends on Timer1 compare interrupts
+arriving within each 104 us bit cell. SPI and TWI polling leave interrupts
+enabled; masked D4/D5 PORTD updates are atomic so they cannot erase a D7 TX
+edge. Simultaneous scanner USART RX, SD traffic, and controller RX/TX still
+require stress testing on the soldered PCB before deployment acceptance.
 
 Normal mode initiates `PING\n` after two seconds and verifies only `PONG\n`
 while awaiting a response, retrying two seconds after completion/failure. Sending
@@ -76,7 +90,7 @@ Case-sensitive lines contain at most 73 printable ASCII characters excluding
 terminators (nine-byte CHECKOUT prefix plus 64 barcode bytes). Optional CRLF is
 accepted; empty lines are ignored. Binary, malformed or oversized frames are
 discarded through LF, with fixed 74-byte storage.
-Software-UART stop-bit/framing and queue-overrun errors quarantine the current frame. Partial frames
+Software-UART framing and queue-overflow errors quarantine the current frame. Partial frames
 expire with their attempt; responses outside a waiting state are ignored. This
 is a bring-up protocol, not authenticated or transaction-grade transport.
 
@@ -85,7 +99,7 @@ is a bring-up protocol, not authenticated or transaction-grade transport.
 Final ownership is **UART1 RX GPIO16 / TX GPIO17** for ATmega communication.
 This supersedes the earlier GPIO34/25 link and legacy GM65 UART2 mapping.
 ESP32 debug UART0 remains unchanged and its direct GM65 UART stays disabled.
-GM65 ownership is now implemented on ATmega A0/A1; no scanner pins are assigned
+GM65 ownership is now implemented on ATmega D0/D1; no scanner pins are assigned
 back to ESP32.
 Step 3B reconnects ESP32 workflows through typed RESTOCK/CHECKOUT frames;
 SCAN remains registration-only. No direct scanner UART is restored. A disabled controller link returns
@@ -102,9 +116,10 @@ Required direction through the confirmed voltage/interface path:
 - ATmega D7/PD7 TX → level shifter HV1 → LV1 → ESP32 GPIO16 RX.
 - Common GND. Never connect ATmega's 5V TX directly to ESP32 RX.
 
-Uno D0/D1 are shared with the USB interface, not either software UART. The GM65
-no longer connects to them, so scanner wiring need not be isolated for normal
-Uno USB/bootloader uploads. The ESP32 link on D6/D7 also does not share them.
+Uno D0/D1 are shared with the Uno USB interface and bootloader and now belong
+to GM65 at runtime. For normal COM10 bootloader uploads, isolate the scanner
+RX/TX wires if they interfere; do not move the ESP32 link back to D0/D1.
+Do not change the normal `arduino` upload protocol.
 The level shifter must preserve valid logic levels and edges at 9600 baud.
 
 ### Completed physical round-trip verification
@@ -118,43 +133,46 @@ ATmega link TX: PONG
 ATmega link RX: ACK
 ```
 
-The temporary PING/PONG/ACK test proved both D7 to GPIO16 and GPIO17 to D6
-through the level shifter. Final Step 2 firmware removes the one-second
+The temporary PING/PONG/ACK test historically proved both level-shifter
+directions on D7/D6. Final deployment restores that pin ownership; the
+newer Step 5 workload on this routing still requires physical validation.
+Final Step 2 firmware removes the one-second
 diagnostic schedule, ACK frame, raw hex logs and diagnostic support.
 Only the normal bounded PING/PONG requester/responder remains enabled.
 No inventory/peripheral functionality was migrated by this test.
 
-## Step 3C: full-duplex scanner UART on A0/A1
+## Historical Step 3C: prototype scanner UART on A0/A1 (superseded)
 
-Step 3C moves both GM65 directions off the Uno USB USART pins:
+The physically tested Step 3C prototype moved both GM65 directions off the Uno USB USART pins:
 
 - GM65 TX -> Uno A0 / PC0 (scanner RX into ATmega).
 - Uno A1 / PC1 -> GM65 RX (scanner TX from ATmega).
-- D0/PD0 and D1/PD1 have no scanner dependency.
+- D0/PD0 and D1/PD1 had no scanner dependency in that prototype.
 
-A0 reception is physically verified. A1 transmission is implemented in
-firmware and designated by the final schematic, but the A1 -> GM65 RX path has
-not yet been physically verified because the exact scanner RX electrical
-compatibility remains unconfirmed. Production firmware sends no GM65 command.
+At that prototype checkpoint A0 reception was physically verified. A1
+transmission was implemented but not physically verified. The final deployment
+instead uses USART0 D0/D1; its scanner RX/TX wiring still needs PCB verification.
+Production firmware sends no GM65 command.
 
-The A0/A1 link is bare-metal 9600 8N1 and shares the Timer1 earliest-deadline
-scheduler described above with D6/D7. PCINT1 detects A0's start edge. No Arduino
+The historical A0/A1 link was bare-metal 9600 8N1 and owned the Timer1
+compare scheduler. PCINT1 detected A0's start edge. No Arduino
 SoftwareSerial, dynamic allocation, busy delay or long interrupt-disabled
 section is used. The existing scanner parser still accepts printable ASCII,
 preserves exact/leading-zero barcodes, supports CR/LF/CRLF, caps text at 64
 characters, rejects malformed/oversized/framing/overflow input without silent
-truncation and recovers after its bounded timeout. A1 implements fixed-queue
-8N1 transmission but no new GM65 command or trigger is sent in this step.
+truncation and recovers after its bounded timeout. The final USART0 transport
+retains the same scanner parser and fixed-queue transmit API; no new GM65
+command or trigger is sent.
 
 The repository contains no current schematic/netlist or exact GM65 adapter
 part/revision documenting an RX protection divider, series resistor or level
 shifter. Consequently it does not establish resistor values or prove that a
-direct 5 V A1 HIGH is safe for this exact scanner RX. The generic GM65 manual
+direct 5 V output is safe for this exact scanner RX. The generic GM65 manual
 describes a 5 V-powered TTL interface, but does not specify UART VIH/VIL or
-absolute-maximum pin voltage. Before physically connecting A1, identify the
+absolute-maximum pin voltage. Before physically connecting D1, identify the
 exact module/adapter, inspect its input conditioning, and confirm whether its RX
 is 5 V tolerant. Measure GM65 TX HIGH and confirm it meets the ATmega328P's
-5 V digital-input threshold before connecting it directly to A0. Preserve any
+5 V digital-input threshold before connecting it directly to D0. Preserve any
 conditioning shown on the actual final schematic; do not add/remove a resistor
 from this repository's incomplete information.
 
@@ -186,26 +204,26 @@ Both buttons passed with released LOW, pressed HIGH, DDRD bits 2/3 clear and
 PORTD bits 2/3 clear. D0/D1 were not used by the GM65. This verifies A0 receive
 only; it does not claim physical verification of the A1 transmit path.
 
-### Final Step 3C / Step 4A ATmega pin map
+### Final deployment ATmega pin map (software complete; PCB physical test pending)
 
 | Uno pin | AVR pin | Current ownership |
 |---|---|---|
-| D0 | PD0 | Free / USART0 RX |
-| D1 | PD1 | Free / USART0 TX |
+| D0 | PD0 | GM65 scanner RX / USART0 RXD |
+| D1 | PD1 | GM65 scanner TX / USART0 TXD |
 | D2 | PD2 | RESTOCK, active-HIGH external-pulldown input |
 | D3 | PD3 | CHECKOUT, active-HIGH external-pulldown input |
 | D4 | PD4 | Small-status logic B |
 | D5 | PD5 | Small-status logic A |
-| D6 | PD6 | ESP32 controller-link RX |
-| D7 | PD7 | ESP32 controller-link TX |
+| D6 | PD6 | ESP32 controller-link software RX from GPIO17 |
+| D7 | PD7 | ESP32 controller-link software TX to GPIO16 |
 | D8 | PB0 | Big-status logic A |
 | D9 | PB1 | Big-status logic B |
-| D10 | PB2 | Reserved for future MicroSD CS |
-| D11 | PB3 | SPI MOSI |
-| D12 | PB4 | SPI MISO |
-| D13 | PB5 | SPI SCK |
-| A0 | PC0 | GM65 RX into ATmega; physically verified |
-| A1 | PC1 | GM65 TX from ATmega; implemented, physical verification pending |
+| D10 | PB2 | MicroSD CS (ATmega-owned) |
+| D11 | PB3 | MicroSD SPI MOSI (ATmega-owned) |
+| D12 | PB4 | MicroSD SPI MISO (ATmega-owned) |
+| D13 | PB5 | MicroSD SPI SCK (ATmega-owned) |
+| A0 | PC0 | Released from scanner; no UART initialization |
+| A1 | PC1 | Released from scanner; no UART initialization |
 | A4 | PC4 | Shared LCD + DS3231 I2C SDA |
 | A5 | PC5 | Shared LCD + DS3231 I2C SCL |
 
@@ -232,7 +250,7 @@ all-space scans, binary/control bytes, malformed and oversized input are
 rejected, never truncated. CR or LF completes a scan; CRLF completes it once.
 A one-second inter-byte timeout rejects a partial scan until its next delimiter.
 
-Completed scans use **`SCAN:<barcode>\n`** over D7/D6 at 9600 8N1. An empty LF
+Completed scans used **`SCAN:<barcode>\n`** over the historical D1/D0 controller link. An empty LF
 precedes each frame to resynchronize any earlier partial controller-link input.
 One scan is buffered for forwarding; additional scans while busy are dropped,
 not combined. PING and SCAN bytes never interleave. TX attempts one byte per
@@ -248,8 +266,8 @@ Step 3A physical verification passed using a real GM65 barcode scan, observed as
 ATmega scanner RX: 4806016001569
 ```
 
-This confirms GM65 TX -> ATmega USART0 D0 RX -> bounded capture -> D7/D6
-controller link -> ESP32 GPIO16/GPIO17 -> exact barcode reception.
+This historical Step 3A arrangement was superseded by the Step 3C prototype,
+which in turn is superseded by the final deployment pin map above.
 Physical leading-zero verification was not performed; leading-zero preservation
 is covered by automated tests only. No new diagnostic behavior was added.
 
@@ -266,7 +284,7 @@ Physical testing individually completed ONLINE RESTOCK/D2 and CHECKOUT/D3
 transactions and verified barcode reception and the controller link. Button
 behavior became unreliable with both GM65 UART directions connected. This
 was a historical Step 3B observation under the superseded D0/D1 arrangement;
-Step 3C replaces it with A0/A1 without changing transaction logic.
+Step 3C temporarily replaced it with A0/A1 without changing transaction logic.
 
 **D2/PD2 RESTOCK** uses +5 V -> pushbutton -> D2, with R7 10 kOhm from
 D2 to GND. **D3/PD3 CHECKOUT** uses +5 V -> pushbutton -> D3, with R8
@@ -335,17 +353,17 @@ or leading-zero physical verification.
 
 ### Step 3B historical physical procedure (superseded by Step 3C)
 
-This records only the transaction behavior verified at that checkpoint. Do not
-restore its scanner wiring; use A0/A1 as the current source of truth.
+This records only the transaction behavior verified at that checkpoint. The
+final deployment pin map above supersedes its scanner/controller wiring.
 
 1. The temporary button-to-GND arrangement used by the original Step 3B test
    is superseded. For any repeat test, wire RESTOCK as +5 V -> button -> D2
    with R7 10 kOhm from D2 to GND, and CHECKOUT as +5 V -> button -> D3
-   with R8 10 kOhm from D3 to GND. Use the current Step 3C A0/A1 scanner
-   assignment and preserve controller D7/D6 -> GPIO16/17 level-shifter wiring.
+   with R8 10 kOhm from D3 to GND. The A0/A1 scanner and D1/D0 controller
+   wiring below describes the historical prototype only; use the final pin map.
    Only after uploads are explicitly authorized, build/upload both Uno and
-   ESP32 firmware. Open ESP32 USB Serial at 115200; D0/D1 remain free from the
-   scanner and available to the Uno bootloader/USB USART.
+   ESP32 firmware. Isolate scanner wires from D0/D1 if they interfere with the
+   Uno bootloader upload, then open ESP32 USB Serial at 115200.
 2. With Electron authenticated and hardware healthy, briefly press/release
    ATmega D2 RESTOCK, then scan a known barcode within ten seconds. Expect one
    `ATmega RESTOCK RX: <barcode>` line, LED feedback and one desktop event/dialog.
@@ -373,9 +391,8 @@ restore its scanner wiring; use A0/A1 as the current source of truth.
 
 ### Step 3A historical physical procedure
 
-The old USART0 wiring procedure is intentionally retired. Repeat scanner tests
-only with the current A0/PC0 receive and A1/PC1 transmit assignment. D0/D1 must
-remain free from GM65 ownership.
+This old procedure is retained as a historical record only. New tests must use
+the final USART0 GM65 assignment and D6/D7 controller link above.
 6. Verify inventory/history/pending-event counts do not change. This is receive/
    forward bring-up only, not a stock transaction or desktop registration flow.
 
@@ -445,7 +462,8 @@ Inventory`, `ATmega Controller` and `LCD READY` at startup, then showed
 The RTC remained on the independent ESP32 GPIO21/GPIO22 bus and was not
 migrated. This establishes ATmega LCD ownership and basic workflow display
 integration at the Step 4A checkpoint; Step 4B below supersedes the temporary
-RTC wiring. Final transaction-result screens remain deferred.
+RTC wiring. Brief committed/offline-save/error LCD feedback is now carried by
+bounded display-only controller frames; its physical timing remains unverified.
 
 ### Wiring and future repeat procedure
 
@@ -458,12 +476,12 @@ RTC wiring. Final transaction-result screens remain deferred.
    changing its supply. Backpack pull-ups belong only to this ATmega bus;
    internal AVR weak pull-ups are not a substitute for external bus pull-ups.
    Do not join independent 5 V supply outputs or connect this bus to ESP32.
-3. Preserve GM65 TX -> A0 and A1 -> GM65 RX only after the electrical checks in
-   Step 3C above. Keep D0/D1 disconnected from GM65. Preserve the D2/D3
-   active-HIGH buttons with their external 10 kOhm pull-downs, the D6/D7
-   level-shifted controller link, status outputs and ESP32 SD.
+3. This is the historical Step 4A procedure. For final deployment, preserve
+   GM65 on D0/D1, D2/D3 active-HIGH buttons with external pull-downs, the
+   D6/D7 level-shifted controller link, status outputs and ATmega SD.
 4. Only when upload is explicitly authorized, use `pio run -e uno -t upload` on
-   COM10. No scanner wire now competes with D0/D1. Update ESP32 firmware only
+   COM10, with scanner wiring isolated from D0/D1 if necessary during the
+   upload. Reconnect it only after upload completes. Update ESP32 firmware only
    with separate explicit authorization; power off before rewiring.
 5. Boot and verify the three startup lines and blank fourth row; adjust LCD
    contrast if necessary. Open ESP32 USB Serial at 115200 only, not Uno Serial.
@@ -528,7 +546,7 @@ STOP completion remain inside the existing wrap-safe 20 ms deadline. This
 prevents the LCD and RTC clients from consuming one another's completion while
 preserving Step 4A's 100 kHz bus and cooperative main loop.
 
-RTC bridge frames on the existing fixed-buffer D6/D7 link are:
+RTC bridge frames on the existing fixed-buffer controller link are:
 
 ```text
 RTC_STATUS?                     -> RTC_STATUS:<state>:<reason>
@@ -679,15 +697,15 @@ Use an existing host C++ compiler, for example the workspace's ignored Zig setup
 & .\.runtime\firmware-tests\forwarded_scan_routing_test.exe
 ```
 
-Current focused coverage: eight requester, eight software-UART and eight ESP32
+Current focused coverage includes the requester, bounded UART primitives,
+controller software-UART configuration/backpressure, scanner USART0 and ESP32
 baseline responder scenarios plus five scanner integration scenarios and fourteen
 ATmega scanner capture/forwarding scenarios.
 Step 3B adds eighteen button/state scenarios and fourteen operation-routing/
 registration scenarios, and preserves the
 existing firmware event/cache/journal/RTC/registration regression coverage.
-Software-UART coverage includes D6/D7 ownership,
-all 256 byte encodings, start/stop bits, false starts, framing errors, queue
-bounds, timer wrap and a software PING/PONG path. Host tests do not prove actual
-ISR latency margins or electrical timing; the physical round-trip passed, but
-future peripheral integration requires timing verification. Generated `.pio/`, `.vscode/` and `.runtime/`
+Controller software-UART coverage includes all 256 byte encodings, start/stop bits,
+false starts, framing errors, queue bounds and timer wrap. Controller tests
+cover D6/D7 ownership, 9600 8N1 configuration, bounded backpressure and
+the unchanged PING/PONG protocol. Generated `.pio/`, `.vscode/` and `.runtime/`
 files remain ignored.

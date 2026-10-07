@@ -3,8 +3,13 @@
 #include "physical_workflow.h"
 #include "twi_master.h"
 #include "../../firmware-common/include/rtc_link_protocol.h"
-#include <stdio.h>
 #include <string.h>
+#ifdef __AVR__
+#include <avr/pgmspace.h>
+#define DENTAL_LCD_LITERAL(value) PSTR(value)
+#else
+#define DENTAL_LCD_LITERAL(value) value
+#endif
 
 namespace dental_atmega {
 namespace lcd {
@@ -123,65 +128,210 @@ class Display {
 };
 
 enum class Screen : uint8_t {
-  kClock, kRtcNeedsSync, kRtcUnavailable, kRestockWait, kCheckoutWait
+  kReset, kClock, kRtcNeedsSync, kRtcUnavailable, kRestockWait, kCheckoutWait,
+  kLinkError, kStorageError, kModeRejected, kModeBusy, kInitializing,
+  kRestockCommitted, kCheckoutCommitted, kRestockOffline, kCheckoutOffline,
+  kScanError, kScanDismissed, kUnknownBarcode
 };
+inline Screen feedbackScreen(dental_link::Frame frame) {
+  switch (frame) {
+    case dental_link::Frame::kRestockCommittedFeedback: return Screen::kRestockCommitted;
+    case dental_link::Frame::kCheckoutCommittedFeedback: return Screen::kCheckoutCommitted;
+    case dental_link::Frame::kRestockOfflineFeedback: return Screen::kRestockOffline;
+    case dental_link::Frame::kCheckoutOfflineFeedback: return Screen::kCheckoutOffline;
+    case dental_link::Frame::kScanErrorFeedback: return Screen::kScanError;
+    case dental_link::Frame::kScanDismissedFeedback: return Screen::kScanDismissed;
+    case dental_link::Frame::kUnknownBarcodeFeedback: return Screen::kUnknownBarcode;
+    default: return Screen::kClock;
+  }
+}
 inline Screen screenFor(PhysicalState state, dental_link::rtc::State rtcState) {
+  if (state == PhysicalState::kDeliveryError) return Screen::kLinkError;
+  if (state == PhysicalState::kStorageUnavailable) return Screen::kStorageError;
+  if (state == PhysicalState::kModeRejected) return Screen::kModeRejected;
+  if (state == PhysicalState::kModeBusy) return Screen::kModeBusy;
+  if (state == PhysicalState::kInitializing) return Screen::kInitializing;
   if (state == PhysicalState::kWaitingRestockScan) return Screen::kRestockWait;
   if (state == PhysicalState::kWaitingCheckoutScan) return Screen::kCheckoutWait;
   return rtcState == dental_link::rtc::State::kReady ? Screen::kClock :
       rtcState == dental_link::rtc::State::kNeedsSync ? Screen::kRtcNeedsSync :
       Screen::kRtcUnavailable;
 }
+// Equivalent to unsigned decimal with minimum zero-padded width. The caller
+// supplies a 20-column row; even uint16_t year + uint8_t fields fit. No varargs,
+// temporary string, shared scratch, or pointers retained by this formatter.
+inline uint8_t decimal(uint16_t value, uint8_t width, char* out) {
+  uint16_t divisor = 1U;
+  uint8_t digits = 1U;
+  while (value / divisor >= 10U) { divisor *= 10U; ++digits; }
+  uint8_t position = 0U;
+  while (position + digits < width) out[position++] = '0';
+  do {
+    out[position++] = static_cast<char>('0' + value / divisor);
+    value %= divisor; divisor /= 10U;
+  } while (divisor != 0U);
+  return position;
+}
 inline void screenLine(Screen screen, uint8_t row,
                        const dental_link::rtc::DateTime& time, char* out) {
-  char formatted[21] = {};
-  const char* text = "";
-  if (row == 0U) text = "Dental Inventory";
-  else if (screen == Screen::kClock && row == 1U) {
-    snprintf(formatted, sizeof(formatted), "%04u-%02u-%02u",
-        static_cast<unsigned>(time.year), static_cast<unsigned>(time.month),
-        static_cast<unsigned>(time.day));
-    text = formatted;
-  } else if (screen == Screen::kClock && row == 2U) {
-    snprintf(formatted, sizeof(formatted), "%02u:%02u:%02u",
-        static_cast<unsigned>(time.hour), static_cast<unsigned>(time.minute),
-        static_cast<unsigned>(time.second));
-    text = formatted;
-  } else if (screen == Screen::kClock && row == 3U) text = "SYSTEM READY";
+  memset(out, ' ', kColumns);
+  if (screen == Screen::kClock && (row == 1U || row == 2U)) {
+    uint8_t position = decimal(row == 1U ? time.year : time.hour,
+                               row == 1U ? 4U : 2U, out);
+    out[position++] = row == 1U ? '-' : ':';
+    position += decimal(row == 1U ? time.month : time.minute, 2U, out + position);
+    out[position++] = row == 1U ? '-' : ':';
+    decimal(row == 1U ? time.day : time.second, 2U, out + position);
+    return;
+  }
+  const char* text = DENTAL_LCD_LITERAL("");
+  if (screen == Screen::kReset) {
+    if (row == 1U) text = DENTAL_LCD_LITERAL("    SYSTEM RESET");
+    else if (row == 2U) text = DENTAL_LCD_LITERAL("  INITIALIZING...");
+  } else if (row == 0U) text = DENTAL_LCD_LITERAL("Any Time Dental");
+  else if (screen == Screen::kClock && row == 3U) text = DENTAL_LCD_LITERAL("SYSTEM READY");
   else if (screen == Screen::kRtcNeedsSync && row == 1U)
-    text = "RTC NEEDS SYNC";
+    text = DENTAL_LCD_LITERAL("RTC NEEDS SYNC");
   else if (screen == Screen::kRtcUnavailable && row == 1U)
-    text = "RTC UNAVAILABLE";
+    text = DENTAL_LCD_LITERAL("RTC UNAVAILABLE");
   else if (row == 1U && (screen == Screen::kRestockWait ||
                          screen == Screen::kCheckoutWait))
-    text = "ATmega Controller";
+    text = DENTAL_LCD_LITERAL("READY TO SCAN");
   else if (screen == Screen::kRestockWait && row == 2U)
-    text = "RESTOCK WAIT";
+    text = DENTAL_LCD_LITERAL("RESTOCK MODE");
   else if (screen == Screen::kCheckoutWait && row == 2U)
-    text = "CHECKOUT WAIT";
+    text = DENTAL_LCD_LITERAL("CHECKOUT MODE");
+  else if (screen == Screen::kLinkError && row == 1U)
+    text = DENTAL_LCD_LITERAL("CONTROLLER LINK ERROR");
+  else if (screen == Screen::kLinkError && row == 2U)
+    text = DENTAL_LCD_LITERAL("NO CONTROLLER REPLY");
+  else if (screen == Screen::kStorageError && row == 1U)
+    text = DENTAL_LCD_LITERAL("STORAGE UNAVAILABLE");
+  else if (screen == Screen::kModeRejected && row == 1U)
+    text = DENTAL_LCD_LITERAL("MODE REJECTED");
+  else if (screen == Screen::kModeBusy && row == 1U)
+    text = DENTAL_LCD_LITERAL("CONTROLLER BUSY");
+  else if (screen == Screen::kInitializing && row == 1U)
+    text = DENTAL_LCD_LITERAL("SYSTEM INITIALIZING");
+  else if (screen == Screen::kInitializing && row == 2U)
+    text = DENTAL_LCD_LITERAL("PLEASE WAIT");
+  else if (screen == Screen::kRestockCommitted && row == 1U)
+    text = DENTAL_LCD_LITERAL("RESTOCK SUCCESS");
+  else if (screen == Screen::kCheckoutCommitted && row == 1U)
+    text = DENTAL_LCD_LITERAL("CHECKOUT SUCCESS");
+  else if (screen == Screen::kRestockOffline && row == 1U)
+    text = DENTAL_LCD_LITERAL("OFFLINE RESTOCK");
+  else if (screen == Screen::kCheckoutOffline && row == 1U)
+    text = DENTAL_LCD_LITERAL("OFFLINE CHECKOUT");
+  else if (screen == Screen::kScanError && row == 1U)
+    text = DENTAL_LCD_LITERAL("TRANSACTION ERROR");
+  else if (screen == Screen::kScanDismissed && row == 1U)
+    text = DENTAL_LCD_LITERAL("SCAN DISMISSED");
+  else if (screen == Screen::kUnknownBarcode && row == 1U)
+    text = DENTAL_LCD_LITERAL("ITEM NOT FOUND");
+  else if ((screen == Screen::kRestockCommitted ||
+            screen == Screen::kCheckoutCommitted) && row == 2U)
+    text = DENTAL_LCD_LITERAL("Inventory updated");
+  else if ((screen == Screen::kRestockOffline ||
+            screen == Screen::kCheckoutOffline) && row == 2U)
+    text = DENTAL_LCD_LITERAL("Saved for sync");
+  else if ((screen == Screen::kScanError ||
+            screen == Screen::kScanDismissed ||
+            screen == Screen::kUnknownBarcode) && row == 2U)
+    text = DENTAL_LCD_LITERAL("No stock changed");
   else if ((screen == Screen::kRtcNeedsSync ||
             screen == Screen::kRtcUnavailable) && row == 3U)
-    text = "SYSTEM READY";
-  memset(out, ' ', kColumns);
-  for (uint8_t i = 0U; i < kColumns && text[i]; ++i) out[i] = text[i];
+    text = DENTAL_LCD_LITERAL("SYSTEM READY");
+  for (uint8_t i = 0U; i < kColumns; ++i) {
+#ifdef __AVR__
+    const char character = static_cast<char>(pgm_read_byte(text + i));
+#else
+    const char character = text[i];
+#endif
+    if (!character) break;
+    out[i] = character;
+  }
 }
 
 // Latest screen wins; one row at a time, no screen clears/flicker on updates.
 // Failure is retained in Display::state/error and never gates PhysicalWorkflow.
 class WorkflowScreen {
  public:
+  static constexpr uint32_t kFeedbackMs = 2500UL;
+  static constexpr uint32_t kStartupResetMs = 1200UL;
+  explicit WorkflowScreen(bool showStartupReset = true)
+      : startupResetActive_(showStartupReset) {}
+  void feedback(uint32_t now, dental_link::Frame frame) {
+    const Screen incoming = feedbackScreen(frame);
+    if (incoming == Screen::kClock) return;
+    customActive_ = false;
+    feedback_ = incoming;
+    feedbackSince_ = now;
+    feedbackActive_ = true;
+  }
+  // Advisory bounded rows only; never select a workflow or mutate stock.
+  void displayFrame(uint32_t now, const char* payload) {
+    if (!payload) return;
+    if ((dental_link::text::compare(payload, DENTAL_LCD_LITERAL("P:R")) == 0 ||
+         dental_link::text::compare(payload, DENTAL_LCD_LITERAL("P:C")) == 0 ||
+         dental_link::text::compare(payload, DENTAL_LCD_LITERAL("S:R")) == 0 ||
+         dental_link::text::compare(payload, DENTAL_LCD_LITERAL("S:C")) == 0)) {
+      customActive_ = true; customProcessing_ = payload[0] == 'P';
+      feedbackActive_ = false; customRows_ = 0U;
+      memset(customText_, ' ', sizeof(customText_));
+      if (customProcessing_) {
+        setCustomConstant(0U, payload[2] == 'R' ? DENTAL_LCD_LITERAL("OFFLINE RESTOCK") : DENTAL_LCD_LITERAL("OFFLINE CHECKOUT"));
+        setCustomConstant(1U, DENTAL_LCD_LITERAL("PROCESSING..."));
+        setCustomConstant(3U, DENTAL_LCD_LITERAL("PLEASE WAIT"));
+      }
+      started_ = false; feedbackSince_ = now;
+      return;
+    }
+    if (!customActive_ || payload[0] < '0' || payload[0] > '3' || payload[1] != ':') return;
+    const size_t length = strlen(payload + 2);
+    if (length > kColumns) return;
+    for (size_t i = 0; i < length; ++i)
+      if (payload[2 + i] < 0x20 || payload[2 + i] > 0x7E) return;
+    const uint8_t row = payload[0] - '0';
+    memset(customText_[row], ' ', kColumns);
+    memcpy(customText_[row], payload + 2, length);
+    customRows_ |= static_cast<uint8_t>(1U << row);
+    started_ = false;
+    if (customRows_ == 15U) feedbackSince_ = now;
+  }
   template <typename Lcd>
   void service(uint32_t now, PhysicalState state,
-               dental_link::rtc::State rtcState,
-               const dental_link::rtc::DateTime& rtcTime, Lcd& display) {
+                dental_link::rtc::State rtcState,
+                const dental_link::rtc::DateTime& rtcTime, Lcd& display) {
     display.service(now);
     if (!display.available()) { started_ = false; return; }
     if (display.busy()) return;
-    const Screen desired = screenFor(state, rtcState);
-    if (!started_ || desired != screen_) {
+    if (customActive_ && !customProcessing_ &&
+        static_cast<uint32_t>(now - feedbackSince_) >= kFeedbackMs) {
+      customActive_ = false; started_ = false;
+    }
+    Screen desired = screenFor(state, rtcState);
+    if (feedbackActive_) {
+      if (static_cast<uint32_t>(now - feedbackSince_) >= kFeedbackMs)
+        feedbackActive_ = false;
+      else if (state == PhysicalState::kIdle ||
+               state == PhysicalState::kDispatching ||
+               state == PhysicalState::kCooldown)
+        desired = feedback_;
+    }
+    if (startupResetActive_) {
+      // Render once after LCD initialization, then keep it visible without
+      // blocking UART, RTC, scanner, buttons, or shared-TWI servicing.
+      if (startupResetRendered_ &&
+          static_cast<uint32_t>(now - startupResetSince_) >= kStartupResetMs)
+        startupResetActive_ = false;
+      else
+        desired = Screen::kReset;
+    }
+    if (!started_ || (!customActive_ && desired != screen_)) {
       started_ = true; screen_ = desired; step_ = 0U; endStep_ = 8U;
       renderTime_ = rtcTime; renderedTimeValid_ = false;
-    } else if (screen_ == Screen::kClock && step_ >= endStep_) {
+    } else if (!customActive_ && screen_ == Screen::kClock && step_ >= endStep_) {
       const uint32_t next = dental_link::rtc::secondsSince2000(rtcTime);
       if (!renderedTimeValid_ || next != renderedSeconds_) {
         renderTime_ = rtcTime;
@@ -191,12 +341,20 @@ class WorkflowScreen {
         endStep_ = 6U; // Update date when needed and time once per RTC second.
       }
     }
-    if (step_ >= endStep_) return;
+    if (step_ >= endStep_) {
+      if (screen_ == Screen::kReset && !startupResetRendered_) {
+        startupResetRendered_ = true;
+        startupResetSince_ = now;
+      }
+      return;
+    }
     const uint8_t row = step_ / 2U;
     if ((step_ & 1U) == 0U) {
       if (display.setCursor(now, 0U, row)) ++step_;
     } else {
-      char text[kColumns]; screenLine(screen_, row, renderTime_, text);
+      char text[kColumns];
+      if (customActive_) memcpy(text, customText_[row], kColumns);
+      else screenLine(screen_, row, renderTime_, text);
       if (display.write(now, text, kColumns)) {
         ++step_;
         if (screen_ == Screen::kClock && step_ >= endStep_) {
@@ -207,13 +365,30 @@ class WorkflowScreen {
     }
   }
  private:
+  void setCustomConstant(uint8_t row, const char* text) {
+    for (uint8_t column = 0U; column < kColumns; ++column) {
+      const char character = dental_link::text::at(text, column);
+      if (!character) break;
+      customText_[row][column] = character;
+    }
+  }
   dental_link::rtc::DateTime renderTime_ = {};
   uint32_t renderedSeconds_ = 0UL;
+  uint32_t feedbackSince_ = 0UL;
+  uint32_t startupResetSince_ = 0UL;
   Screen screen_ = Screen::kRtcUnavailable;
+  Screen feedback_ = Screen::kClock;
   uint8_t step_ = 0U;
   uint8_t endStep_ = 8U;
   bool started_ = false;
   bool renderedTimeValid_ = false;
+  bool feedbackActive_ = false;
+  bool startupResetActive_ = true;
+  bool startupResetRendered_ = false;
+  char customText_[4][kColumns] = {};
+  uint8_t customRows_ = 0U;
+  bool customActive_ = false, customProcessing_ = false;
 };
 } // namespace lcd
 } // namespace dental_atmega
+#undef DENTAL_LCD_LITERAL

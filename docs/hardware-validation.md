@@ -1,6 +1,8 @@
 # Hardware Validation Gate
 
-Status: **unresolved and blocking hardware activation**
+Status: **historical Phase 1 gate; not the current controller pin map**.
+The active migration pin map and remaining acceptance checks are in
+`firmware-atmega/README.md` and `docs/atmega-step5-storage-migration.md`.
 
 This document records what can be read from the supplied final PCB schematic and what must still be proven before Phase 2 firmware may initialize physical hardware. A GPIO appearing in the schematic is not evidence that its voltage, direction, active level, connector orientation, or application meaning is safe or correct.
 
@@ -52,24 +54,27 @@ No `setStockStatus` or `setTransactionStatus` truth table may be finalized until
 
 ## UART / GM65 questions
 
-ATmega migration Step 3C assigns GM65 TX -> Uno A0/PC0 and Uno A1/PC1 -> GM65
-RX, leaving D0/D1 free. A0 reception is physically verified for RESTOCK and
-CHECKOUT using barcode `4806016001569`. A1 transmission is implemented and
-designated by the final schematic, but physical A1 -> scanner RX verification
-is pending. Production sends no GM65 command. The repository still lacks an exact scanner/adapter
+The Step 3C prototype used GM65 TX -> A0/PC0; that receive path was physically
+verified for RESTOCK and CHECKOUT with barcode `4806016001569`. The final PCB
+instead assigns GM65 TX -> D0/PD0 hardware USART RX and D1/PD1 USART TX ->
+GM65 RX. D6/PD6 RX and D7/PD7 TX are the ESP32 controller link. This final
+serial routing is implemented but not yet physically verified on the PCB.
+Production sends no GM65 command. The repository still lacks an exact scanner/adapter
 part revision and a current final schematic/netlist showing UART conditioning.
-Do not infer that the ATmega's 5 V A1 output is safe for scanner RX from the
+Do not infer that the ATmega's 5 V D1 output is safe for scanner RX from the
 generic `TTL` label alone. Confirm the actual module's UART input rating and any
 existing divider/series/level-conversion network before physical connection.
 
 - What is the exact GM65 scanner module and adapter-board part number and datasheet revision?
 - Do the connector labels `TX` and `RX` name signals driven by the scanner, or signals expected from the host?
-- Is the final A1 -> scanner RX electrical interface safe for the exact GM65 adapter revision?
+- Is the final D1 -> scanner RX electrical interface safe for the exact GM65 adapter revision?
 - What voltage levels does the actual scanner use on TX and RX? Are they 3.3 V TTL, 5 V TTL, RS-232, or level-shifted on the module?
 - What supply voltage and peak current does the scanner require?
 - What baud rate, data bits, parity, stop bits, terminator, encoding, and scanner output mode are configured?
 - What maximum barcode length and inter-byte/frame timeout should firmware support?
-- Verify that D0/D1 remain free from GM65 ownership and available to the Uno USART0/bootloader path.
+- D0/D1 belong to GM65; isolate scanner wiring if it interferes with Uno
+  bootloader uploads. D7 -> ESP32 GPIO16 and GPIO17 -> D6 through the level
+  shifter, with common ground.
 
 ## ATmega SW1 / SW2 source of truth
 
@@ -129,6 +134,21 @@ or a level-shifter value without the exact module documentation/final schematic.
 - How will an invalid RTC time be detected, displayed, and corrected without substituting PC time silently?
 
 ## MicroSD / SPI questions
+
+### ATmega Step 5 ownership update
+
+The active software source of truth now assigns MicroSD CS/MOSI/MISO/SCK to
+ATmega PB2/PB3/PB4/PB5 (Uno D10/D11/D12/D13). The ESP32 legacy GPIO5/18/19/23
+SPI path is disabled. The ATmega performs conservative card initialization and
+bufferless sector I/O; FAT/cache/journal coordination remains on the ESP32 over
+the bounded GPIO16/17 controller link. This preserves the established logical
+filenames and recovery formats without allocating a 512-byte sector buffer in
+the ATmega's 2 KB SRAM. Physical acceptance subsequently covered raw card
+readiness, remote sector reads, FAT32 mount, online/offline transactions, and
+exactly-once synchronization.
+
+The original Phase 1 ESP32 table above is historical schematic context, not
+current ownership.
 
 - Is MOD2 a bare socket, a 3.3 V breakout, or a nominal 5 V module with an onboard regulator and level shifting?
 - What voltage is connected to its VCC pin, and are every input/output level and the MISO high level safe for ESP32?

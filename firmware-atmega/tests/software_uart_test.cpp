@@ -16,10 +16,10 @@ soft::SampleResult receiveByte(soft::Receiver& rx, uint8_t byte, bool stop = tru
 }
 void pins() {
   assert(soft::kRxPortBit == 6U && soft::kTxPortBit == 7U);
-  const uint8_t linkMask = (1U << soft::kRxPortBit) | (1U << soft::kTxPortBit);
-  assert((linkMask & dental_atmega::hardware::kSmallMask) == 0U);
-  assert((linkMask & 3U) == 0U); // D0/D1 remain free from both software UARTs.
-  assert(soft::kScannerRxPortBit == 0U && soft::kScannerTxPortBit == 1U);
+  assert(dental_atmega::hardware::kControllerRxBit == 6U);
+  assert(dental_atmega::hardware::kControllerTxBit == 7U);
+  assert(dental_atmega::hardware::kScannerRxBit == 0U);
+  assert(dental_atmega::hardware::kScannerTxBit == 1U);
 }
 void timing() {
   assert(soft::kBitTicks == 208U && soft::kHalfBitTicks == 104U);
@@ -54,9 +54,11 @@ void framing() {
 void boundedQueue() {
   soft::Ring<uint8_t> queue;
   uint8_t byte = 0U; assert(!queue.pop(byte));
+  assert(queue.size() == 0U && queue.usableCapacity() == 15U);
   for (uint8_t i = 0U; i < 15U; ++i) assert(queue.push(i));
-  assert(!queue.push(99U));
+  assert(queue.size() == 15U && !queue.push(99U));
   for (uint8_t i = 0U; i < 15U; ++i) { assert(queue.pop(byte)); assert(byte == i); }
+  assert(queue.size() == 0U);
   assert(!queue.pop(byte));
   for (unsigned i = 0U; i < 4096U; ++i) {
     assert(queue.push(static_cast<uint8_t>(i)) && queue.pop(byte));
@@ -104,5 +106,5 @@ void pingPongPath() {
 int main() {
   pins(); timing(); allByteValues(); falseStart(); framing(); boundedQueue();
   errorQuarantine(); pingPongPath();
-  puts("ATmega D6/D7 software UART: 8 focused scenarios PASSED");
+  puts("ATmega bounded UART primitives: 8 focused scenarios PASSED");
 }

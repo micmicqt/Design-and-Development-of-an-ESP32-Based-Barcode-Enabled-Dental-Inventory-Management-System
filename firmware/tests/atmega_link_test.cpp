@@ -118,11 +118,36 @@ void queuedRtcCommandDoesNotInterleavePong() {
   feed(r, w, "PING\n");
   assert(w.size == strlen("RTC_STATUS?\nPONG\n"));
 }
+void displayFeedbackCannotTriggerControllerActions() {
+  PingResponder responder; Writer wire;
+  dental_link::Frame frame = dental_link::Frame::kNone;
+  for (const char* p = dental_link::kRestockCommittedFeedback; *p; ++p)
+    frame = responder.receive(*p, wire);
+  assert(frame == dental_link::Frame::kRestockCommittedFeedback);
+  assert(wire.size == 0U);
+  assert(dental_link::operationForMode(frame) == dental_link::Frame::kNone);
+  for (const char* p = dental_link::kUnknownBarcodeFeedback; *p; ++p)
+    frame = responder.receive(*p, wire);
+  assert(frame == dental_link::Frame::kUnknownBarcodeFeedback);
+  assert(wire.size == 0U);
+  assert(dental_link::operationForMode(frame) == dental_link::Frame::kNone);
+}
 }
 void scanRecognition() {
   PingResponder r; Writer w; dental_link::Frame result = dental_link::Frame::kNone;
   for (const char* p = "SCAN:4806016001569\n"; *p; ++p) result = r.receive(*p, w);
   assert(result == dental_link::Frame::kScan && strcmp(r.barcode(), "4806016001569") == 0 && w.size == 0U);
+}
+void modeRecognition() {
+  PingResponder r; Writer w; dental_link::Frame result = dental_link::Frame::kNone;
+  for (const char* p = "BTN:RESTOCK\n"; *p; ++p) result = r.receive(*p, w);
+  assert(result == dental_link::Frame::kRestockMode && w.size == 0U);
+  for (const char* p = "BTN:CHECKOUT\n"; *p; ++p) result = r.receive(*p, w);
+  assert(result == dental_link::Frame::kCheckoutMode && w.size == 0U);
+  assert(dental_link::operationForMode(dental_link::Frame::kRestockMode) ==
+         dental_link::Frame::kRestock);
+  assert(dental_link::operationForMode(dental_link::Frame::kCheckoutMode) ==
+         dental_link::Frame::kCheckout);
 }
 void scanZeroes() {
   PingResponder r; Writer w; unsigned scans = 0U;
@@ -161,7 +186,8 @@ void scannerEndToEnd() {
 int main() {
   pingPong(); malformed(); oversized(); busyTx(); fragmentedAndRepeated();
   noTransactionSideEffects(); exchange(); confirmedPins();
-  scanRecognition(); scanZeroes(); badScans(); scanNoSideEffects(); scannerEndToEnd();
+  scanRecognition(); modeRecognition(); scanZeroes(); badScans(); scanNoSideEffects(); scannerEndToEnd();
   rtcFrames(); rtcRequestsAndSync(); queuedRtcCommandDoesNotInterleavePong();
-  puts("ESP32 ATmega responder: 16 focused scenarios PASSED");
+  displayFeedbackCannotTriggerControllerActions();
+  puts("ESP32 ATmega responder: 18 focused scenarios PASSED");
 }

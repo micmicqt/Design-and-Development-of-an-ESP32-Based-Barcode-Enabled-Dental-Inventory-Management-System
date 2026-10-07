@@ -78,9 +78,51 @@ void uartError() {
   assert(c.verifiedCount() == 0U);
   receive(c, "PONG\n", 2002UL); assert(c.verifiedCount() == 1U);
 }
+void modeRepliesAreParsedOutsidePingWait() {
+  PingClient c;
+  dental_link::Frame frame = dental_link::Frame::kNone;
+  for (const char* p = "BTN:OK:RESTOCK\n"; *p; ++p)
+    frame = c.receive(10UL, static_cast<uint8_t>(*p));
+  assert(frame == dental_link::Frame::kRestockAccepted);
+  for (const char* p = "BTN:BUSY\n"; *p; ++p)
+    frame = c.receive(11UL, static_cast<uint8_t>(*p));
+  assert(frame == dental_link::Frame::kModeBusy);
+  assert(c.verifiedCount() == 0U);
+}
+void displayFeedbackIsNotAModeOrPing() {
+  PingClient c;
+  const struct {
+    const char* text;
+    dental_link::Frame frame;
+  } cases[] = {
+      {dental_link::kRestockCommittedFeedback,
+       dental_link::Frame::kRestockCommittedFeedback},
+      {dental_link::kCheckoutCommittedFeedback,
+       dental_link::Frame::kCheckoutCommittedFeedback},
+      {dental_link::kRestockOfflineFeedback,
+       dental_link::Frame::kRestockOfflineFeedback},
+      {dental_link::kCheckoutOfflineFeedback,
+       dental_link::Frame::kCheckoutOfflineFeedback},
+      {dental_link::kScanErrorFeedback,
+       dental_link::Frame::kScanErrorFeedback},
+      {dental_link::kScanDismissedFeedback,
+       dental_link::Frame::kScanDismissedFeedback},
+      {dental_link::kUnknownBarcodeFeedback,
+       dental_link::Frame::kUnknownBarcodeFeedback},
+  };
+  for (const auto& item : cases) {
+    dental_link::Frame result = dental_link::Frame::kNone;
+    for (const char* p = item.text; *p; ++p)
+      result = c.receive(10UL, static_cast<uint8_t>(*p));
+    assert(result == item.frame);
+    assert(dental_link::operationForMode(result) == dental_link::Frame::kNone);
+  }
+  assert(c.verifiedCount() == 0U);
+}
 }
 int main() {
   encoding(); recognition(); malformed(); bounded(); timeoutRetry();
-  stuckTx(); wrap(); uartError();
-  puts("ATmega UART link: 8 focused scenarios PASSED");
+  stuckTx(); wrap(); uartError(); modeRepliesAreParsedOutsidePingWait();
+  displayFeedbackIsNotAModeOrPing();
+  puts("ATmega UART link: 10 focused scenarios PASSED");
 }

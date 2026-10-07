@@ -80,6 +80,13 @@ export function HardwareTransactionDialog({
   const acknowledgementRetryInFlight = useRef(false)
   const lookupTail = useRef<Promise<IpcResult<ProductDto | null> | undefined>>(Promise.resolve(undefined))
 
+  useEffect(() => {
+    if (open && import.meta.env.DEV &&
+        window.sessionStorage.getItem('dentalHardwareTiming') === '1') {
+      console.debug('[hardware timing] transaction modal mounted', new Date().toISOString())
+    }
+  }, [open, event.eventId])
+
   const queueLookup = useCallback((isCurrent: () => boolean) => {
     const request = lookupTail.current.catch(() => undefined).then(() => {
       if (!isCurrent()) return undefined
@@ -237,6 +244,12 @@ export function HardwareTransactionDialog({
 
     processingInFlight.current = true
     setProcessing(true)
+    if (import.meta.env.DEV &&
+        window.sessionStorage.getItem('dentalHardwareTiming') === '1') {
+      console.debug('[hardware event UI]', {
+        operation: 'CONFIRM', expectedEventId: event.eventId, expectedMode: event.mode
+      })
+    }
 
     try {
       const result = await window.desktopApi.hardware.processTransaction({

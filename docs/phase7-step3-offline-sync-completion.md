@@ -40,6 +40,20 @@ A successful response is strictly validated:
 }
 ```
 
+On the current ATmega-backed MicroSD path, the ESP32 first validates the exact
+FIFO head and returns HTTP 202 with
+`{"acknowledged":false,"processing":true,"eventId":"..."}`. This means
+retirement was scheduled, **not** durably completed. One lower-priority worker
+owns the journal and controller UART until the existing rewrite/verification
+finishes. During that work, `/status` and `/desktop/heartbeat` remain served;
+`GET /offline/events/next` returns a fast `offline_ack_in_progress` error
+instead of reading FatFs concurrently. A duplicate ACK for the same ID gets
+the same in-progress response; another ID is rejected. After durable success,
+the normal HTTP 200 acknowledgement and last-retired replay receipt apply.
+Electron confirms an in-progress or response-lost ACK only when the exact FIFO
+head advances (or an empty head agrees with a zero pending count). A failure
+keeps the event pending for ACK-only retry; SQLite is never reapplied.
+
 The firmware accepts only the exact unacknowledged FIFO head. Malformed,
 unknown, or later IDs do not change the journal. Online `/events/ack` and its
 Phase 5 result-before-ACK workflow remain separate.

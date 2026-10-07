@@ -3,6 +3,8 @@ import type {
   HardwareTransactionResult,
   InventoryCategory,
   OfflinePendingEvent,
+  OfflineJournalState,
+  OfflineJournalReason,
   StockStatus
 } from '../../shared/ipc-contract'
 
@@ -22,6 +24,9 @@ export type Esp32RtcReason =
   | 'lost_power'
   | 'invalid_time'
   | 'verification_failed'
+
+export type Esp32OfflineAckState =
+  | 'IDLE' | 'QUEUED' | 'RUNNING' | 'VERIFYING' | 'SUCCEEDED' | 'FAILED'
 
 export interface Esp32HealthResponse {
   status: 'ok'
@@ -47,6 +52,11 @@ export interface Esp32StatusResponse {
   /** Optional for compatibility with firmware predating offline journaling. */
   pendingSyncItems?: number
   offlineReady?: boolean
+  offlineJournalState?: OfflineJournalState
+  offlineJournalReason?: OfflineJournalReason
+  /** Optional bounded diagnostic exposed by firmware with async journal retirement. */
+  offlineAckState?: Esp32OfflineAckState
+  offlineAckEventId?: string | null
 }
 
 /** Narrow status boundary implemented during Phase 4 Step 2. */
@@ -82,7 +92,7 @@ export interface RegistrationBarcodeCaptureGateway {
 export interface HardwareTransactionEventGateway extends HardwareStatusGateway {
   getNextTransactionEvent(): Promise<HardwareTransactionEvent | null>
   deliverTransactionResult(result: HardwareTransactionResult): Promise<void>
-  acknowledgeTransactionEvent(eventId: string): Promise<void>
+  acknowledgeTransactionEvent(eventId: string, reason?: 'unknown_barcode'): Promise<void>
 }
 
 export const OFFLINE_CACHE_GENERATION_PATTERN = /^v1-[0-9a-f]{64}$/

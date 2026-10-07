@@ -1,11 +1,16 @@
 #include "status_outputs.h"
 
 #include <avr/io.h>
+#include <util/atomic.h>
 
 namespace dental_atmega {
 
 void setSmallStatus(SmallStatus status) {
-  PORTD = replaceOwnedBits(PORTD, hardware::kSmallMask, smallPortBits(status));
+  // Timer1's controller TX ISR also changes PD7. Keep this masked PORTD
+  // read/modify/write indivisible so an LED update cannot erase a TX edge.
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    PORTD = replaceOwnedBits(PORTD, hardware::kSmallMask, smallPortBits(status));
+  }
 }
 
 void setBigStatus(BigStatus status) {

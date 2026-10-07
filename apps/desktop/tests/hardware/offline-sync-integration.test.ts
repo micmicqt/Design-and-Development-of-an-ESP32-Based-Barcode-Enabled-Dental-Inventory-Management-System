@@ -17,6 +17,89 @@ import type { OfflinePendingEvent } from '../../src/shared/ipc-contract'
 const generation = `v1-${'c'.repeat(64)}`
 
 describe('offline synchronization end-to-end sequence', () => {
+  it('retires two reused legacy heads after durable fingerprints; lost ACK never reapplies or publishes early', async () => {
+    const database = initializeDatabase({ databasePath: ':memory:' })
+    try {
+      let transaction = 0
+      const inventoryService = createInventoryService(database, { createTransactionId: () => `legacy-${++transaction}` })
+      const product = inventoryService.createProduct({ barcode: '00001234', itemName: 'Synthetic item',
+        category: 'General', initialStock: 10, lowStockThreshold: 3 })
+      const old: OfflinePendingEvent = { eventId: 'off-148CE50D5020-0000000000000001',
+        timestamp: '2026-09-09 20:49:59', productId: String(product.id), barcode: product.barcode,
+        action: 'RESTOCK', delta: 1, resultingStock: 3, stockStatus: 'LOW', cacheGeneration: generation }
+      inventoryService.reconcileOfflineEvent(old)
+      const events = [{ ...old, timestamp: '2026-10-07 01:07:22', resultingStock: 11, stockStatus: 'HIGH' as const },
+        { ...old, eventId: 'off-148CE50D5020-0000000000000002', timestamp: '2026-10-07 01:07:23', resultingStock: 12 }]
+      let head = 0
+      const order: string[] = []
+      const gateway: OfflineSyncGateway & OfflineInventoryCacheGateway = {
+        getNextOfflineEvent: async () => { order.push(`fetch:${head}`); return events[head] ?? null },
+        getStatus: async () => ({ device: 'dental-inventory-esp32', online: true, mode: 'idle',
+          rtc: true, sd: true, pendingSyncItems: 2 - head, offlineAckState: 'IDLE' }),
+        acknowledgeOfflineEvent: async (eventId) => {
+          expect(inventoryService.reconcileOfflineEvent(events[head]!).status).toBe('ALREADY_APPLIED')
+          order.push(`ack:${head}`); head++
+          if (head === 1) throw new Error('lost HTTP ACK response') // committed retirement, ambiguous response
+          return { acknowledged: true, eventId, pendingSyncItems: 2 - head, alreadyAcknowledged: false }
+        },
+        installOfflineInventoryCache: async (snapshot) => {
+          expect(head).toBe(2); order.push('cache')
+          return { generation: snapshot.generation, itemCount: snapshot.products.length, alreadyCurrent: false }
+        },
+      }
+      const cache = createOfflineInventoryCacheCoordinator({ inventoryService, gateway })
+      await expect(cache.refresh()).rejects.toThrow(/deferred/)
+      const coordinator = createOfflineSyncCoordinator({ inventoryService, gateway,
+        offlineInventoryCacheCoordinator: cache, waitForAcknowledgementRecovery: async () => {} })
+      await expect(coordinator.synchronize()).resolves.toMatchObject({ status: 'COMPLETE',
+        counts: { appliedEvents: 2, alreadyAppliedEvents: 0, acknowledgedEvents: 2 } })
+      expect(order.filter((step) => step === 'cache')).toHaveLength(1)
+      expect(order.indexOf('cache')).toBeGreaterThan(order.indexOf('ack:1'))
+      for (const event of [old, ...events]) expect(inventoryService.reconcileOfflineEvent(event).status).toBe('ALREADY_APPLIED')
+      expect(inventoryService.findProductByBarcode(product.barcode)?.currentStock).toBe(13)
+      expect(inventoryService.listMovementHistory()).toHaveLength(3)
+    } finally { database.close() }
+  })
+  it.each([0, 1, 2, 10, 50, 100])('drains %i fixture records exactly once; replay never duplicates SQLite', async (size) => {
+    const database = initializeDatabase({ databasePath: ':memory:' })
+    try {
+      let sequence = 0
+      const inventoryService = createInventoryService(database, { createTransactionId: () => `scale-${++sequence}` })
+      const product = inventoryService.createProduct({ barcode: '00001234', itemName: 'Synthetic item',
+        category: 'Restorative & Esthetic', initialStock: 10, lowStockThreshold: 3 })
+      const events: OfflinePendingEvent[] = Array.from({ length: size }, (_, index) => ({
+        eventId: `off-20500DE58C14-${(index + 1).toString(16).toUpperCase().padStart(16, '0')}`,
+        timestamp: '2026-10-07 01:07:22', productId: String(product.id), barcode: product.barcode,
+        action: 'RESTOCK', delta: 1, resultingStock: 11 + index, stockStatus: 'HIGH', cacheGeneration: generation
+      }))
+      let head = 0
+      const gateway: OfflineSyncGateway = {
+        getNextOfflineEvent: async () => events[head] ?? null,
+        getStatus: async () => ({ device: 'dental-inventory-esp32', online: true, mode: 'idle',
+          rtc: true, sd: true, pendingSyncItems: size - head, offlineReady: true }),
+        acknowledgeOfflineEvent: async (eventId) => {
+          expect(events[head]?.eventId).toBe(eventId)
+          expect(database.prepare('SELECT event_id FROM offline_reconciliation_receipts WHERE event_id=?').get(eventId)).toBeDefined()
+          head += 1
+          return { acknowledged: true, eventId, pendingSyncItems: size - head, alreadyAcknowledged: false }
+        }
+      }
+      const refresh = vi.fn(async () => ({ generation, itemCount: 1, alreadyCurrent: true }))
+      const cacheCoordinator = { refresh, refreshIfNeeded: refresh, markStale: vi.fn() }
+      const coordinator = createOfflineSyncCoordinator({ gateway, inventoryService,
+        offlineInventoryCacheCoordinator: cacheCoordinator })
+      const started = performance.now()
+      await expect(coordinator.synchronize()).resolves.toMatchObject({ status: 'COMPLETE',
+        counts: { appliedEvents: size, alreadyAppliedEvents: 0, acknowledgedEvents: size } })
+      console.info(`SYNC HOST FIXTURE records=${size} totalMs=${(performance.now() - started).toFixed(2)} (mock device, real in-memory SQLite)`)
+      for (const event of events) expect(inventoryService.reconcileOfflineEvent(event).status).toBe('ALREADY_APPLIED')
+      expect(inventoryService.findProductByBarcode(product.barcode)?.currentStock).toBe(10 + size)
+      expect(inventoryService.listMovementHistory()).toHaveLength(size)
+      expect(database.prepare('SELECT COUNT(*) AS count FROM offline_reconciliation_receipts').get()).toEqual({ count: size })
+      await expect(coordinator.synchronize()).resolves.toMatchObject({ status: 'COMPLETE' })
+      expect(inventoryService.listMovementHistory()).toHaveLength(size)
+    } finally { database.close() }
+  })
   it('reconciles and retires six FIFO events exactly once before caching final SQLite stock', async () => {
     const database = initializeDatabase({ databasePath: ':memory:' })
     try {
@@ -116,7 +199,7 @@ describe('offline synchronization end-to-end sequence', () => {
       }
       const cacheCoordinator = createOfflineInventoryCacheCoordinator({
         inventoryService,
-        gateway: cacheGateway
+        gateway: { ...cacheGateway, getStatus: gateway.getStatus }
       })
       const coordinator = createOfflineSyncCoordinator({
         inventoryService,
@@ -142,8 +225,8 @@ describe('offline synchronization end-to-end sequence', () => {
       expect(retiredEventIds).toEqual(journal.map((event) => event.eventId))
       expect(pendingCounts).toEqual([6, 5, 4, 3, 2, 1, 0])
       expect(gateway.acknowledgeOfflineEvent).toHaveBeenCalledTimes(6)
-      expect(gateway.getStatus).toHaveBeenCalledExactlyOnceWith()
-      expect(operations.slice(-3)).toEqual(['next:none', 'status:0', 'cache:10'])
+      expect(gateway.getStatus).toHaveBeenCalledTimes(2)
+      expect(operations.slice(-4)).toEqual(['next:none', 'status:0', 'status:0', 'cache:10'])
 
       const authoritativeProduct = inventoryService.findProductByBarcode(product.barcode)
       expect(authoritativeProduct).toMatchObject({ currentStock: 10, status: 'HIGH' })

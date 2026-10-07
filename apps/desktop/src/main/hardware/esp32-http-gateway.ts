@@ -3,6 +3,7 @@ import {
   ESP32_DEVICE_ID,
   type Esp32HardwareMode,
   type Esp32HealthResponse,
+  type Esp32OfflineAckState,
   type Esp32RtcReason,
   type Esp32RtcState,
   type Esp32StatusResponse,
@@ -23,19 +24,34 @@ import {
   type HardwareTransactionResult,
   type OfflinePendingAction,
   type OfflinePendingEvent,
+  type OfflineJournalState,
+  type OfflineJournalReason,
   type StockStatus
 } from '../../shared/ipc-contract'
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_500
 const REGISTRATION_CAPTURE_TIMEOUT_MS = 13_000
 const REGISTRATION_CAPTURE_POLL_INTERVAL_MS = 125
-// Offline acknowledgement advances a CRC-protected MicroSD journal at the
-// kiosk's conservative 1 MHz SPI speed. It is intentionally allowed longer
-// than lightweight status/event reads, while remaining bounded.
-const DEFAULT_OFFLINE_ACKNOWLEDGEMENT_TIMEOUT_MS = 15_000
+// Offline file operations now cross the 9600-baud ATmega storage bridge. A
+// remote 512-byte sector takes about 1.4 s; journal scans and FatFs metadata
+// can require several sectors. Keep lightweight HTTP requests at 2.5 s.
+const DEFAULT_OFFLINE_PREVIEW_TIMEOUT_MS = 15_000
+const DEFAULT_OFFLINE_CACHE_OPERATION_DEADLINE_MS = 120_000
+const DEFAULT_OFFLINE_CACHE_POLL_INTERVAL_MS = 750
+const DEFAULT_OFFLINE_ACKNOWLEDGEMENT_TIMEOUT_MS = 30_000
 const DEVICE_TOKEN_HEADER = 'X-Device-Token'
 const DEVICE_TOKEN_PLACEHOLDER = 'replace-with-a-random-shared-device-token'
 const RTC_STATES: readonly Esp32RtcState[] = ['unavailable', 'needs_sync', 'ready']
+const JOURNAL_STATES: readonly OfflineJournalState[] = [
+  'ready', 'empty', 'temporarily_unavailable', 'recovering', 'corrupt', 'full', 'generation_mismatch'
+]
+const JOURNAL_REASONS: readonly OfflineJournalReason[] = [
+  'none', 'remote_sector_read_failed', 'not_initialized', 'invalid_header', 'invalid_record',
+  'crc_mismatch', 'write_uncertain', 'capacity_reached', 'cache_generation_mismatch'
+]
+const OFFLINE_ACK_STATES: readonly Esp32OfflineAckState[] = [
+  'IDLE', 'QUEUED', 'RUNNING', 'VERIFYING', 'SUCCEEDED', 'FAILED'
+]
 const RTC_REASONS: readonly Esp32RtcReason[] = [
   'none',
   'communication_failure',
@@ -83,6 +99,10 @@ const CACHE_RESPONSE_KEYS = [
   'receivedItems',
   'alreadyCurrent'
 ] as const
+const CACHE_PROGRESS_KEYS = [
+  'processing', 'jobId', 'operation', 'generation', 'stage', 'elapsedMs',
+  'storageOwner', 'lastFatFsOperation', 'lastFatFsResult', 'failureReason'
+] as const
 const CACHE_SNAPSHOT_KEYS = ['generation', 'products'] as const
 const CACHE_PRODUCT_KEYS = [
   'id',
@@ -118,6 +138,8 @@ export type HardwareGatewayErrorCode = 'UNAVAILABLE' | 'INVALID_RESPONSE' | 'REJ
 export type HardwareGatewayDiagnosticCode =
   | 'REQUEST_TIMEOUT'
   | 'NETWORK_FAILURE'
+  | 'ACK_IN_PROGRESS'
+  | 'offline_ack_in_progress'
   | 'DEVICE_TOKEN_UNCONFIGURED'
   | 'invalid_request'
   | 'no_pending_event'
@@ -133,6 +155,26 @@ export type HardwareGatewayDiagnosticCode =
   | 'scanner_acknowledgement_timeout'
   | 'barcode_timeout'
   | 'invalid_barcode'
+  | 'transaction_active'
+  | 'storage_recovering'
+  | 'foreground_wait'
+  | 'temporarily_unavailable'
+  | 'storage_transport_unavailable'
+  | 'cache_publication_in_progress'
+  | 'controller_busy'
+  | 'storage_unavailable'
+  | 'offline_transaction_active'
+  | 'pending_sync_interlock'
+  | 'no_active_transfer'
+  | 'generation_mismatch'
+  | 'unexpected_index'
+  | 'conflicting_item'
+  | 'cache_write_failed'
+  | 'item_count_mismatch'
+  | 'cache_validation_failed'
+  | 'cache_replacement_failed'
+  | 'pending_journal_compaction_failed'
+  | 'offline_ack_worker_unavailable'
 
 export class HardwareGatewayError extends Error {
   readonly code: HardwareGatewayErrorCode
@@ -141,7 +183,8 @@ export class HardwareGatewayError extends Error {
   constructor(
     code: HardwareGatewayErrorCode,
     message: string,
-    diagnosticCode?: HardwareGatewayDiagnosticCode
+    diagnosticCode?: HardwareGatewayDiagnosticCode,
+    readonly httpStatus?: number
   ) {
     super(message)
     this.name = 'HardwareGatewayError'
@@ -181,6 +224,7 @@ const SAFE_FIRMWARE_DIAGNOSTIC_CODES = new Set<HardwareGatewayDiagnosticCode>([
   'event_id_mismatch',
   'pending_journal_unavailable',
   'pending_journal_invalid',
+  'offline_ack_in_progress',
   'unauthorized',
   'authentication_unconfigured',
   'invalid_timestamp',
@@ -189,7 +233,14 @@ const SAFE_FIRMWARE_DIAGNOSTIC_CODES = new Set<HardwareGatewayDiagnosticCode>([
   'scanner_busy',
   'scanner_acknowledgement_timeout',
   'barcode_timeout',
-  'invalid_barcode'
+  'invalid_barcode',
+  'transaction_active', 'storage_recovering', 'foreground_wait',
+  'temporarily_unavailable', 'storage_transport_unavailable',
+  'cache_publication_in_progress', 'controller_busy', 'storage_unavailable',
+  'offline_transaction_active', 'pending_sync_interlock', 'no_active_transfer',
+  'generation_mismatch', 'unexpected_index', 'conflicting_item', 'cache_write_failed',
+  'item_count_mismatch', 'cache_validation_failed', 'cache_replacement_failed',
+  'pending_journal_compaction_failed', 'offline_ack_worker_unavailable'
 ])
 
 async function readSafeFirmwareDiagnostic(
@@ -331,6 +382,14 @@ function validateHealthResponse(value: unknown): Esp32HealthResponse {
 }
 
 function validateStatusResponse(value: unknown): Esp32StatusResponse {
+  const hasAckState = isRecord(value) &&
+    ('offlineAckState' in value || 'offlineAckEventId' in value)
+  const hasValidAckState = !hasAckState ||
+    (isRecord(value) && typeof value.offlineAckState === 'string' &&
+      OFFLINE_ACK_STATES.includes(value.offlineAckState as Esp32OfflineAckState) &&
+      (value.offlineAckState === 'IDLE'
+        ? value.offlineAckEventId === null
+        : isValidOfflineEventId(value.offlineAckEventId)))
   const hasAnyCacheMetadata =
     isRecord(value) &&
     ('offlineCacheAvailable' in value ||
@@ -360,6 +419,16 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
       typeof value.offlineReady === 'boolean')
   const hasAnyRtcState =
     isRecord(value) && ('rtcState' in value || 'rtcReason' in value)
+  const hasJournalHealth = isRecord(value) &&
+    ('offlineJournalState' in value || 'offlineJournalReason' in value)
+  const hasValidJournalHealth = !hasJournalHealth || (isRecord(value) &&
+    JOURNAL_STATES.includes(value.offlineJournalState as OfflineJournalState) &&
+    JOURNAL_REASONS.includes(value.offlineJournalReason as OfflineJournalReason) &&
+    (value.offlineJournalState !== 'empty' || value.pendingSyncItems === 0) &&
+    (value.offlineJournalState !== 'ready' ||
+      (typeof value.pendingSyncItems === 'number' && value.pendingSyncItems > 0)) &&
+    (!['temporarily_unavailable', 'recovering', 'corrupt'].includes(
+      value.offlineJournalState as string) || value.pendingSyncItems === undefined))
   const hasValidRtcState =
     !hasAnyRtcState ||
     (isRecord(value) &&
@@ -382,7 +451,9 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
     (value.desktopOnline !== undefined && typeof value.desktopOnline !== 'boolean') ||
     !hasValidRtcState ||
     !hasValidCacheMetadata ||
-    !hasValidOfflineJournalMetadata
+    !hasValidOfflineJournalMetadata ||
+    !hasValidJournalHealth ||
+    !hasValidAckState
   ) {
     throw new HardwareGatewayError('INVALID_RESPONSE', 'The ESP32 status response is invalid.')
   }
@@ -412,6 +483,14 @@ function validateStatusResponse(value: unknown): Esp32StatusResponse {
   }
   if (typeof value.offlineReady === 'boolean') {
     status.offlineReady = value.offlineReady
+  }
+  if (hasJournalHealth) {
+    status.offlineJournalState = value.offlineJournalState as OfflineJournalState
+    status.offlineJournalReason = value.offlineJournalReason as OfflineJournalReason
+  }
+  if (typeof value.offlineAckState === 'string') {
+    status.offlineAckState = value.offlineAckState as Esp32OfflineAckState
+    status.offlineAckEventId = value.offlineAckEventId as string | null
   }
   return status
 }
@@ -572,6 +651,30 @@ function validateCacheOperationResponse(
     receivedItems: value.receivedItems as number,
     alreadyCurrent: value.alreadyCurrent
   }
+}
+
+function validateCacheProgressResponse(
+  value: unknown, operation: CacheOperation, generation: string
+): number {
+  if (!isRecord(value) || !hasExactlyKeys(value, CACHE_PROGRESS_KEYS) ||
+      value.processing !== true ||
+      !Number.isSafeInteger(value.jobId) || (value.jobId as number) < 1 ||
+      (value.jobId as number) > 0xFFFFFFFF ||
+      value.operation !== operation || value.generation !== generation ||
+      (value.stage !== 'QUEUED' && value.stage !== 'RUNNING') ||
+      !Number.isSafeInteger(value.elapsedMs) || (value.elapsedMs as number) < 0 ||
+      value.storageOwner !== 'CACHE' ||
+      typeof value.lastFatFsOperation !== 'string' ||
+      !['NONE', 'STAT', 'OPEN_READ', 'READ', 'OPEN_WRITE', 'WRITE', 'SYNC',
+        'CLOSE', 'UNLINK', 'RENAME'].includes(value.lastFatFsOperation) ||
+      !Number.isSafeInteger(value.lastFatFsResult) ||
+      (value.lastFatFsResult as number) < 0 ||
+      (value.lastFatFsResult as number) > 255 ||
+      value.failureReason !== 'NONE') {
+    throw new HardwareGatewayError('INVALID_RESPONSE',
+      'The ESP32 offline cache progress response is invalid.')
+  }
+  return value.jobId as number
 }
 
 function validateTransactionEvent(value: unknown): HardwareTransactionEvent {
@@ -819,14 +922,11 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
     validateCacheSnapshot(snapshot)
     const itemCount = snapshot.products.length
     const beginResponse = validateCacheOperationResponse(
-      await this.request('/offline/cache', {
-        method: 'POST',
-        body: JSON.stringify({
+      await this.completeCacheOperation('begin', snapshot.generation, {
           operation: 'begin',
           generation: snapshot.generation,
           itemCount
-        })
-      }),
+        }),
       'begin',
       snapshot.generation,
       itemCount
@@ -851,15 +951,12 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
     let nextIndex = 0
     while (nextIndex < itemCount) {
       const itemResponse = validateCacheOperationResponse(
-        await this.request('/offline/cache', {
-          method: 'POST',
-          body: JSON.stringify({
+        await this.completeCacheOperation('item', snapshot.generation, {
             operation: 'item',
             generation: snapshot.generation,
             index: nextIndex,
             product: snapshot.products[nextIndex]
-          })
-        }),
+          }),
         'item',
         snapshot.generation,
         itemCount
@@ -874,14 +971,11 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
     }
 
     const commitResponse = validateCacheOperationResponse(
-      await this.request('/offline/cache', {
-        method: 'POST',
-        body: JSON.stringify({
+      await this.completeCacheOperation('commit', snapshot.generation, {
           operation: 'commit',
           generation: snapshot.generation,
           itemCount
-        })
-      }),
+        }),
       'commit',
       snapshot.generation,
       itemCount
@@ -900,13 +994,58 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
     }
   }
 
+  private async completeCacheOperation(
+    operation: CacheOperation, generation: string, body: object
+  ): Promise<unknown> {
+    const deadline = Date.now() + DEFAULT_OFFLINE_CACHE_OPERATION_DEADLINE_MS
+    let jobId: number | null = null
+    const payload = JSON.stringify(body)
+    while (Date.now() < deadline) {
+      let response: unknown
+      try {
+        response = jobId === null
+          ? await this.request('/offline/cache', {
+              method: 'POST', body: payload
+            })
+          : await this.request(`/offline/cache/progress?jobId=${jobId}`, {
+              timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+            })
+      } catch (error) {
+        // A POST response may be lost after enqueue. The identical retry is
+        // classified by the device and cannot start a second storage operation.
+        if (!(error instanceof HardwareGatewayError) ||
+            error.code !== 'UNAVAILABLE' || error.httpStatus !== undefined)
+          throw error
+        if (Date.now() >= deadline) break
+        await new Promise<void>((resolve) => setTimeout(resolve,
+          DEFAULT_OFFLINE_CACHE_POLL_INTERVAL_MS))
+        continue
+      }
+      if (!isRecord(response) || response.processing !== true) return response
+      const reportedId = validateCacheProgressResponse(response, operation, generation)
+      if (jobId !== null && reportedId !== jobId) {
+        throw new HardwareGatewayError('INVALID_RESPONSE',
+          'The ESP32 changed the active offline cache job.')
+      }
+      jobId = reportedId
+      await new Promise<void>((resolve) => setTimeout(resolve,
+        DEFAULT_OFFLINE_CACHE_POLL_INTERVAL_MS))
+    }
+    throw new HardwareGatewayError('UNAVAILABLE',
+      'The ESP32 offline cache operation did not complete in time.',
+      'REQUEST_TIMEOUT')
+  }
+
   async getNextTransactionEvent(): Promise<HardwareTransactionEvent | null> {
     const response = await this.request('/events/next', { allowNoContent: true })
     return response === NO_CONTENT ? null : validateTransactionEvent(response)
   }
 
   async getNextOfflineEvent(): Promise<OfflinePendingEvent | null> {
-    const response = await this.request('/offline/events/next', { allowNoContent: true })
+    const response = await this.request('/offline/events/next', {
+      allowNoContent: true,
+      timeoutMs: DEFAULT_OFFLINE_PREVIEW_TIMEOUT_MS
+    })
     return response === NO_CONTENT ? null : validateOfflinePendingEvent(response)
   }
 
@@ -918,14 +1057,20 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
       )
     }
 
-    return validateOfflineAcknowledgement(
-      await this.request('/offline/events/ack', {
+    const response = await this.request('/offline/events/ack', {
         method: 'POST',
         body: JSON.stringify({ eventId }),
         timeoutMs: this.offlineAcknowledgementTimeoutMs
-      }),
-      eventId
-    )
+      })
+    if (isRecord(response) &&
+        hasExactlyKeys(response, ['acknowledged', 'processing', 'eventId']) &&
+        response.acknowledged === false && response.processing === true &&
+        response.eventId === eventId) {
+      // HTTP 202 schedules a durable rewrite; it is not an ACK receipt.
+      throw new HardwareGatewayError('UNAVAILABLE',
+        'The ESP32 is still retiring the offline event.', 'ACK_IN_PROGRESS')
+    }
+    return validateOfflineAcknowledgement(response, eventId)
   }
 
   async deliverTransactionResult(result: HardwareTransactionResult): Promise<void> {
@@ -937,7 +1082,7 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
     validateResultAcceptance(response, result.eventId)
   }
 
-  async acknowledgeTransactionEvent(eventId: string): Promise<void> {
+  async acknowledgeTransactionEvent(eventId: string, reason?: 'unknown_barcode'): Promise<void> {
     if (!isValidHardwareTransactionEventId(eventId)) {
       throw new HardwareGatewayError(
         'INVALID_RESPONSE',
@@ -947,7 +1092,7 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
 
     const response = await this.request('/events/ack', {
       method: 'POST',
-      body: JSON.stringify({ eventId })
+      body: JSON.stringify(reason === 'unknown_barcode' ? { eventId, reason } : { eventId })
     })
     validateAcknowledgement(response, eventId)
   }
@@ -960,6 +1105,7 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
       | '/rtc/sync'
       | '/barcode/capture'
       | '/offline/cache'
+      | `/offline/cache/progress?jobId=${number}`
       | '/offline/events/next'
       | '/offline/events/ack'
       | '/events/next'
@@ -974,6 +1120,10 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
     } = {}
   ): Promise<unknown> {
     const controller = new AbortController()
+    const started = performance.now()
+    let httpStatus: number | undefined
+    let diagnostic: string | undefined
+    const diagnosticRequest = path.startsWith('/offline/') || path === '/status'
     const timeout = setTimeout(
       () => controller.abort(),
       options.timeoutMs ?? this.requestTimeoutMs
@@ -993,10 +1143,14 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
         signal: controller.signal,
         ...(options.body === undefined ? {} : { body: options.body })
       })
+      httpStatus = response.status
       if (options.allowNoContent === true && response.status === 204) return NO_CONTENT
       if (!response.ok) {
         const diagnosticCode =
-          path === '/offline/events/ack' || path === '/rtc/sync' || path === '/barcode/capture'
+          path === '/offline/events/ack' || path === '/offline/events/next' ||
+          path === '/events/next' || path === '/events/result' ||
+          path === '/events/ack' || path === '/rtc/sync' ||
+          path === '/barcode/capture' || path.startsWith('/offline/cache')
             ? await readSafeFirmwareDiagnostic(response)
             : undefined
         if (method === 'POST' && response.status >= 400 && response.status < 500) {
@@ -1013,13 +1167,15 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
                     : path === '/offline/events/ack'
                       ? 'The ESP32 rejected the offline event acknowledgement.'
                       : 'The ESP32 rejected the transaction acknowledgement.',
-            diagnosticCode
+            diagnosticCode,
+            response.status
           )
         }
         throw new HardwareGatewayError(
           'UNAVAILABLE',
           `The ESP32 returned HTTP ${response.status}.`,
-          diagnosticCode
+          diagnosticCode,
+          response.status
         )
       }
 
@@ -1035,13 +1191,31 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
           'The ESP32 returned an unexpected offline event response status.'
         )
       }
+      if (path === '/offline/events/ack' && response.status === 202) {
+        let pending: unknown
+        try {
+          pending = await response.json()
+        } catch {
+          throw new HardwareGatewayError('INVALID_RESPONSE',
+            'The ESP32 returned malformed offline ACK progress JSON.')
+        }
+        if (!isRecord(pending) ||
+            !hasExactlyKeys(pending, ['acknowledged', 'processing', 'eventId']) ||
+            pending.acknowledged !== false || pending.processing !== true ||
+            typeof pending.eventId !== 'string') {
+          throw new HardwareGatewayError('INVALID_RESPONSE',
+            'The ESP32 returned an invalid offline ACK progress response.')
+        }
+        return pending
+      }
       if (path === '/offline/events/ack' && response.status !== 200) {
         throw new HardwareGatewayError(
           'INVALID_RESPONSE',
           'The ESP32 returned an unexpected offline event acknowledgement status.'
         )
       }
-      if (path === '/offline/cache' && response.status !== 200) {
+      if (path.startsWith('/offline/cache') &&
+          response.status !== 200 && response.status !== 202) {
         throw new HardwareGatewayError(
           'INVALID_RESPONSE',
           'The ESP32 returned an unexpected offline cache response status.'
@@ -1069,6 +1243,9 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
         )
       }
     } catch (error: unknown) {
+      diagnostic = error instanceof HardwareGatewayError
+        ? error.diagnosticCode ?? error.code
+        : controller.signal.aborted ? 'REQUEST_TIMEOUT' : 'NETWORK_FAILURE'
       if (error instanceof HardwareGatewayError) throw error
       throw new HardwareGatewayError(
         'UNAVAILABLE',
@@ -1077,6 +1254,11 @@ export class Esp32HttpGateway implements DesktopHardwareGateway {
       )
     } finally {
       clearTimeout(timeout)
+      if (diagnosticRequest) console.info('[Offline sync HTTP] ' + JSON.stringify({
+        operation: method, endpoint: path, status: httpStatus ?? null,
+        elapsedMs: Math.round(performance.now() - started),
+        timeout: controller.signal.aborted, error: diagnostic ?? null
+      }))
     }
   }
 }

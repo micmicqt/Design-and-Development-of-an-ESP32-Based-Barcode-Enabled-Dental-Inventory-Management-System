@@ -15,6 +15,8 @@ import { createInventoryService } from '../../src/main/inventory'
 
 function createGateway() {
   return {
+    getStatus: vi.fn(async () => ({ device: 'dental-inventory-esp32' as const, online: true as const,
+      mode: 'idle' as const, rtc: true, sd: true, pendingSyncItems: 0 })),
     installOfflineInventoryCache: vi.fn<OfflineInventoryCacheGateway['installOfflineInventoryCache']>(
       async (snapshot) => ({
         generation: snapshot.generation,
@@ -123,6 +125,59 @@ describe('offline inventory cache snapshot', () => {
 })
 
 describe('offline inventory cache coordinator', () => {
+  it('coalesces a heartbeat/final-sync overlap into one identical publication', async () => {
+    const database = initializeDatabase({ databasePath: ':memory:' })
+    try {
+      const gateway = createGateway()
+      let complete!: () => void
+      gateway.installOfflineInventoryCache.mockImplementationOnce(async (snapshot) => {
+        await new Promise<void>((resolve) => { complete = resolve })
+        return { generation: snapshot.generation, itemCount: snapshot.products.length, alreadyCurrent: false }
+      })
+      const coordinator = createOfflineInventoryCacheCoordinator({ gateway, inventoryService: createInventoryService(database) })
+      const heartbeat = coordinator.refreshIfNeeded()
+      await vi.waitFor(() => expect(complete).toBeDefined())
+      const finalSync = coordinator.refresh()
+      complete()
+      await heartbeat; await finalSync
+      expect(gateway.installOfflineInventoryCache).toHaveBeenCalledOnce()
+    } finally { database.close() }
+  })
+  it.each([
+    { pendingSyncItems: 2, offlineAckState: 'IDLE' as const },
+    { pendingSyncItems: undefined, offlineAckState: 'IDLE' as const },
+    { pendingSyncItems: 0, offlineAckState: 'RUNNING' as const },
+    { pendingSyncItems: 0, offlineAckState: 'VERIFYING' as const },
+  ])('defers without any POST while retirement is not confirmed (%j)', async (state) => {
+    const database = initializeDatabase({ databasePath: ':memory:' })
+    try {
+      const gateway = { ...createGateway(), getStatus: vi.fn(async () => ({
+        device: 'dental-inventory-esp32' as const, online: true as const, mode: 'idle' as const,
+        rtc: true, sd: true, ...state,
+      })) }
+      let now = 1000
+      const coordinator = createOfflineInventoryCacheCoordinator({
+        gateway, inventoryService: createInventoryService(database), now: () => now,
+      })
+      await expect(coordinator.refreshIfNeeded()).rejects.toThrow(/deferred/)
+      for (let i = 0; i < 7; ++i) { now += 4000; await coordinator.refreshIfNeeded() }
+      expect(gateway.installOfflineInventoryCache).not.toHaveBeenCalled()
+      expect(gateway.getStatus).toHaveBeenCalledOnce()
+      gateway.getStatus.mockResolvedValue({ device: 'dental-inventory-esp32', online: true,
+        mode: 'idle', rtc: true, sd: true, pendingSyncItems: 0, offlineAckState: 'IDLE' })
+      await coordinator.refresh() // explicit final-sync signal bypasses deferred cooldown
+      expect(gateway.installOfflineInventoryCache).toHaveBeenCalledOnce()
+    } finally { database.close() }
+  })
+  it('does not publish when fresh status retrieval fails', async () => {
+    const database = initializeDatabase({ databasePath: ':memory:' })
+    try {
+      const gateway = { ...createGateway(), getStatus: vi.fn(async () => { throw new Error('status unavailable') }) }
+      await expect(createOfflineInventoryCacheCoordinator({ gateway, inventoryService: createInventoryService(database) }).refresh())
+        .rejects.toThrow('status unavailable')
+      expect(gateway.installOfflineInventoryCache).not.toHaveBeenCalled()
+    } finally { database.close() }
+  })
   it('coalesces overlapping signals and sends one trailing authoritative snapshot', async () => {
     const database = initializeDatabase({ databasePath: ':memory:' })
     const inventory = createInventoryService(database)

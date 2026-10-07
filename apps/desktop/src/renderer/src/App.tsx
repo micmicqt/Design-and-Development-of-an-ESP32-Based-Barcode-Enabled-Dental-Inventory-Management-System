@@ -11,6 +11,7 @@ import staffPhotoOne from './assets/branding/staff-01.jpg'
 import staffPhotoTwo from './assets/branding/staff-02.jpg'
 import staffPhotoThree from './assets/branding/staff-03.jpg'
 import { HardwareTransactionDialog } from './components/HardwareTransactionDialog'
+import { DeviceSetupDialog } from './components/DeviceSetupDialog'
 import { AddItemPage } from './pages/AddItemPage'
 import { InventoryPage } from './pages/InventoryPage'
 import { MovementHistoryPage } from './pages/MovementHistoryPage'
@@ -28,15 +29,9 @@ type NavigationItem = (typeof NAVIGATION_ITEMS)[number]
 const EMPTY_SESSION: AuthSession = { authenticated: false, username: null }
 const HARDWARE_POLL_INTERVAL_MS = 4_000
 const DESKTOP_HEARTBEAT_INTERVAL_MS = 4_000
-const HARDWARE_EVENT_POLL_INTERVAL_MS = 1_000
-const OFFLINE_HARDWARE_STATUS: HardwareStatusDto = {
-  connection: 'OFFLINE',
-  device: null,
-  mode: null,
-  rtc: null,
-  sd: null
-}
-
+// /events/next is a RAM-only FIFO read. Poll promptly without overlapping
+// requests; the scan still needs one authoritative device response.
+const HARDWARE_EVENT_POLL_INTERVAL_MS = 250
 function formatHardwareMode(mode: HardwareMode | null): string {
   if (mode === null) return 'Unavailable'
   return mode.charAt(0).toUpperCase() + mode.slice(1)
@@ -47,10 +42,38 @@ function formatHardwareAvailability(value: boolean | null): string {
   return value ? 'Available' : 'Unavailable'
 }
 
+function formatStaleAvailability(value: boolean | null, checking: boolean): string {
+  if (value === true) return 'Last known: Available'
+  return value === null && checking ? 'Checking…' : 'Status unavailable'
+}
+
 function formatRtcAvailability(status: HardwareStatusDto): string {
   if (status.rtcState === 'needs_sync') return 'Needs synchronization'
-  if (status.rtcState === 'unavailable') return 'Hardware unavailable'
+  if (status.rtcState === 'unavailable') return 'Unavailable'
   return formatHardwareAvailability(status.rtc)
+}
+
+function transportFailureStatus(
+  previous: HardwareStatusDto | null,
+  connection: HardwareStatusDto['connection']
+): HardwareStatusDto {
+  // Keep only stale component observations. Offline journal metadata must not
+  // remain actionable after a failed IPC/status refresh.
+  return {
+    connection,
+    device: previous?.device ?? null,
+    mode: previous?.mode ?? null,
+    rtc: previous?.rtc ?? null,
+    sd: previous?.sd ?? null,
+    ...(previous?.rtcState === undefined
+      ? {}
+      : { rtcState: previous.rtcState, rtcReason: previous.rtcReason })
+  }
+}
+
+function hardwareTimingDebugEnabled(): boolean {
+  return import.meta.env.DEV &&
+    window.sessionStorage.getItem('dentalHardwareTiming') === '1'
 }
 
 const sectionMetadata: Record<
@@ -79,9 +102,20 @@ const sectionMetadata: Record<
   }
 }
 
-function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
+function LoginScreen({
+  setupRequired,
+  setupComplete,
+  onSetupComplete,
+  onAuthenticated
+}: {
+  setupRequired: boolean
+  setupComplete: boolean
+  onSetupComplete: () => void
+  onAuthenticated: (session: AuthSession) => void
+}) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
   const [passwordVisible, setPasswordVisible] = useState(false)
   const [passwordToggleRevision, setPasswordToggleRevision] = useState(0)
   const [error, setError] = useState<string | null>(null)
@@ -95,6 +129,33 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
     setError(null)
 
     try {
+      if (setupRequired) {
+        if (password !== confirmPassword) {
+          setError('Passwords do not match.')
+          return
+        }
+
+        const setupResult = await window.desktopApi.auth.createFirstAdmin({ username, password })
+        if (!setupResult.ok) {
+          if (setupResult.code === 'ALREADY_CONFIGURED') {
+            setPassword('')
+            setConfirmPassword('')
+            onSetupComplete()
+            return
+          }
+          setError(setupResult.code === 'INVALID_CREDENTIALS'
+            ? 'Use a username of up to 100 characters and a password of at least 8 characters.'
+            : 'Administrator setup is unavailable. Please try again.')
+          return
+        }
+
+        setPassword('')
+        setConfirmPassword('')
+        setPasswordVisible(false)
+        onSetupComplete()
+        return
+      }
+
       const result = await window.desktopApi.auth.login({ username, password })
       if (!result.ok) {
         setPassword('')
@@ -108,8 +169,9 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
       onAuthenticated(result.session)
     } catch {
       setPassword('')
+      setConfirmPassword('')
       setPasswordVisible(false)
-      setError('Access Denied')
+      setError(setupRequired ? 'Administrator setup is unavailable. Please try again.' : 'Access Denied')
     } finally {
       setSubmitting(false)
     }
@@ -131,7 +193,13 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
         <div className="login-panel__content">
           <p className="login-panel__kicker">STAFF PORTAL</p>
           <h1 id="login-title">Dental Inventory Management System</h1>
-          <p className="login-panel__intro">Sign in to access and manage clinic inventory.</p>
+          <p className="login-panel__intro">
+            {setupRequired
+              ? 'Create the first administrator account for this installation.'
+              : setupComplete
+                ? 'Administrator account created. Sign in to continue.'
+                : 'Sign in to access and manage clinic inventory.'}
+          </p>
 
           <form className="login-form" onSubmit={submitLogin}>
             <label htmlFor="username">Username</label>
@@ -139,9 +207,9 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
               id="username"
               name="username"
               type="text"
-              autoComplete="username"
+              autoComplete={setupRequired ? 'new-username' : 'username'}
               autoFocus
-              maxLength={128}
+              maxLength={setupRequired ? 100 : 128}
               value={username}
               onChange={(event) => setUsername(event.target.value)}
               disabled={submitting}
@@ -154,7 +222,7 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
                 id="password"
                 name="password"
                 type={passwordVisible ? 'text' : 'password'}
-                autoComplete="current-password"
+                autoComplete={setupRequired ? 'new-password' : 'current-password'}
                 maxLength={1024}
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
@@ -195,6 +263,23 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
               </button>
             </div>
 
+            {setupRequired && (
+              <>
+                <label htmlFor="confirm-password">Confirm password</label>
+                <input
+                  id="confirm-password"
+                  name="confirm-password"
+                  type="password"
+                  autoComplete="new-password"
+                  maxLength={1024}
+                  value={confirmPassword}
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                  disabled={submitting}
+                  required
+                />
+              </>
+            )}
+
             {error !== null && (
               <div className="access-denied" role="alert">
                 {error}
@@ -202,7 +287,9 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessi
             )}
 
             <button className="primary-button" type="submit" disabled={submitting}>
-              {submitting ? 'Signing in…' : 'Sign In'}
+              {submitting
+                ? (setupRequired ? 'Creating account…' : 'Signing in…')
+                : (setupRequired ? 'Create Administrator' : 'Sign In')}
             </button>
           </form>
         </div>
@@ -241,6 +328,8 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
   const [historyRefreshVersion, setHistoryRefreshVersion] = useState(0)
   const [inventoryNotice, setInventoryNotice] = useState<string | null>(null)
   const [hardwareStatus, setHardwareStatus] = useState<HardwareStatusDto | null>(null)
+  const [deviceSetupOpen, setDeviceSetupOpen] = useState(false)
+  const [hardwareConfigVersion, setHardwareConfigVersion] = useState(0)
   const [pendingHardwareEvent, setPendingHardwareEvent] =
     useState<HardwareTransactionEvent | null>(null)
   const [acknowledgingHardwareEvent, setAcknowledgingHardwareEvent] = useState(false)
@@ -251,6 +340,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
   const [hardwareTransactionNotice, setHardwareTransactionNotice] = useState<string | null>(null)
   const hardwareEventRequest = useRef<Promise<HardwareTransactionEvent | null> | null>(null)
   const desktopHeartbeatRequest = useRef<Promise<boolean> | null>(null)
+  const statusIpcFailures = useRef(0)
   const hardwareAcknowledgementInFlight = useRef(false)
   const lastCommittedHardwareEvent = useRef<string | null>(null)
   const hardwareEventPreviousFocus = useRef<HTMLElement | null>(null)
@@ -262,13 +352,18 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       ? 'Checking…'
       : hardwareStatus.connection === 'CONNECTED'
         ? 'Connected'
-        : 'Offline'
+        : hardwareStatus.connection === 'CHECKING'
+          ? 'Checking…'
+          : hardwareStatus.connection === 'NOT_CONFIGURED'
+            ? 'Not configured' : 'Disconnected'
   const hardwareStatusModifier =
     hardwareStatus === null
       ? 'is-checking'
       : hardwareStatus.connection === 'CONNECTED'
         ? 'is-connected'
-        : 'is-offline'
+        : hardwareStatus.connection === 'CHECKING'
+          ? 'is-checking'
+          : 'is-offline'
 
   useEffect(() => {
     if (inventoryNotice === null) return undefined
@@ -321,7 +416,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       active = false
       if (heartbeatTimer !== undefined) window.clearTimeout(heartbeatTimer)
     }
-  }, [loggingOut])
+  }, [loggingOut, hardwareConfigVersion])
 
   useEffect(() => {
     let active = true
@@ -331,9 +426,17 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       const pollStartedAt = Date.now()
       try {
         const status = await window.desktopApi.hardware.getStatus()
+        statusIpcFailures.current = 0
         if (active) setHardwareStatus(status)
       } catch {
-        if (active) setHardwareStatus(OFFLINE_HARDWARE_STATUS)
+        if (active) {
+          statusIpcFailures.current += 1
+          setHardwareStatus((previous) => transportFailureStatus(
+            previous,
+            previous?.connection === 'CONNECTED' && statusIpcFailures.current === 1
+              ? 'CHECKING' : 'OFFLINE'
+          ))
+        }
       } finally {
         if (active) {
           const elapsedMs = Date.now() - pollStartedAt
@@ -350,10 +453,15 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       active = false
       if (pollTimer !== undefined) window.clearTimeout(pollTimer)
     }
-  }, [])
+  }, [hardwareConfigVersion])
 
   useEffect(() => {
-    if (loggingOut || pendingHardwareEvent !== null) return undefined
+    if (loggingOut || pendingHardwareEvent !== null) {
+      if (hardwareTimingDebugEnabled()) {
+        console.debug(`[hardware poll] renderer event skipped=${loggingOut ? 'logout' : 'modal_active'}`)
+      }
+      return undefined
+    }
 
     let active = true
     let pollTimer: number | undefined
@@ -361,6 +469,8 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     async function pollHardwareEvent(): Promise<void> {
       const pollStartedAt = Date.now()
       let eventReceived = false
+      let requestFailed = false
+      if (hardwareTimingDebugEnabled()) console.debug('[hardware poll] renderer event start')
 
       try {
         // Reuse an outstanding request during StrictMode effect replay, too.
@@ -376,8 +486,13 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           setHardwareEventOpen(true)
         }
       } catch {
+        requestFailed = true
         // Event delivery is best-effort while the device is unavailable. Inventory remains usable.
       } finally {
+        if (hardwareTimingDebugEnabled()) {
+          console.debug(`[hardware poll] renderer event end result=${requestFailed ? 'failed' : eventReceived ? 'event' : 'empty'} ` +
+            `elapsedMs=${Date.now() - pollStartedAt}`)
+        }
         hardwareEventRequest.current = null
         if (active && !eventReceived) {
           const elapsedMs = Date.now() - pollStartedAt
@@ -394,7 +509,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
       active = false
       if (pollTimer !== undefined) window.clearTimeout(pollTimer)
     }
-  }, [loggingOut, pendingHardwareEvent])
+  }, [loggingOut, pendingHardwareEvent, hardwareConfigVersion])
 
   useEffect(() => {
     if (hardwareEventVisible) return
@@ -434,6 +549,8 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           <SyncOfflinePage
             pendingCount={hardwareStatus?.pendingSyncItems}
             offlineReady={hardwareStatus?.offlineReady}
+            offlineJournalState={hardwareStatus?.offlineJournalState}
+            offlineAckState={hardwareStatus?.offlineAckState}
           />
         )
     }
@@ -453,6 +570,13 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
     if (pendingHardwareEvent === null || hardwareAcknowledgementInFlight.current) return
 
     const eventId = pendingHardwareEvent.eventId
+    if (import.meta.env.DEV &&
+        window.sessionStorage.getItem('dentalHardwareTiming') === '1') {
+      console.debug('[hardware event UI]', {
+        operation: 'CANCEL', expectedEventId: eventId,
+        expectedMode: pendingHardwareEvent.mode
+      })
+    }
     hardwareAcknowledgementInFlight.current = true
     setAcknowledgingHardwareEvent(true)
     setHardwareEventError(null)
@@ -512,7 +636,7 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
 
   return (
     <div className="app-shell">
-      <aside className="sidebar" inert={hardwareEventVisible}>
+      <aside className="sidebar" inert={hardwareEventVisible || deviceSetupOpen}>
         <div className="sidebar__brand">
           <span className="clinic-logo clinic-logo--sidebar">
             <img src={clinicLogo} alt="" />
@@ -549,45 +673,59 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           className={`sidebar__status ${hardwareStatusModifier}`}
           role="status"
           aria-live="polite"
-          aria-label="ESP32 hardware status"
+          aria-label="Inventory device status"
         >
           <div className="sidebar__status-summary">
             <span className="status-dot" aria-hidden="true" />
             <div>
-              <strong>ESP32</strong>
+              <strong>Inventory Device</strong>
               <small>{hardwareConnectionLabel}</small>
             </div>
           </div>
           <dl className="hardware-status-details">
             <div>
-              <dt>Hardware mode</dt>
+              <dt>Operating Mode</dt>
               <dd>
-                {hardwareStatus === null
+                {hardwareStatus === null || hardwareStatus.connection === 'CHECKING'
                   ? 'Checking…'
-                  : formatHardwareMode(hardwareStatus.mode)}
+                  : hardwareStatus.connection === 'OFFLINE'
+                    ? 'Unavailable'
+                    : formatHardwareMode(hardwareStatus.mode)}
               </dd>
             </div>
             <div>
-              <dt>RTC</dt>
+              <dt>System Clock</dt>
               <dd>
                 {hardwareStatus === null
                   ? 'Checking…'
-                  : formatRtcAvailability(hardwareStatus)}
+                  : hardwareStatus.connection === 'CONNECTED'
+                    ? formatRtcAvailability(hardwareStatus)
+                    : formatStaleAvailability(
+                        hardwareStatus.rtc, hardwareStatus.connection === 'CHECKING'
+                      )}
               </dd>
             </div>
             <div>
-              <dt>MicroSD</dt>
+              <dt>Local Storage</dt>
               <dd>
                 {hardwareStatus === null
                   ? 'Checking…'
-                  : formatHardwareAvailability(hardwareStatus.sd)}
+                  : hardwareStatus.connection === 'CONNECTED'
+                    ? formatHardwareAvailability(hardwareStatus.sd)
+                    : formatStaleAvailability(
+                        hardwareStatus.sd, hardwareStatus.connection === 'CHECKING'
+                      )}
               </dd>
             </div>
           </dl>
+          <button className="sidebar__device-setup" type="button"
+            onClick={() => setDeviceSetupOpen(true)} disabled={pendingHardwareEvent !== null}>
+            {hardwareStatus?.connection === 'NOT_CONFIGURED' ? 'Set Up Device' : 'Device Setup'}
+          </button>
         </div>
       </aside>
 
-      <div className="workspace" inert={hardwareEventVisible}>
+      <div className="workspace" inert={hardwareEventVisible || deviceSetupOpen}>
         <header className="topbar">
           <div className="topbar__location">
             <span>DENTAL INVENTORY MANAGEMENT SYSTEM</span>
@@ -648,6 +786,11 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           <section className="content-card">{renderActiveSection()}</section>
         </main>
       </div>
+      <DeviceSetupDialog open={deviceSetupOpen} onClose={() => setDeviceSetupOpen(false)}
+        onSaved={() => {
+          setHardwareStatus(null)
+          setHardwareConfigVersion((value) => value + 1)
+        }} />
 
       {pendingHardwareEvent !== null && (
         <HardwareTransactionDialog
@@ -660,7 +803,16 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
           onCancel={() => void acknowledgeUncommittedHardwareEvent(
             'Could not cancel this scan. Check the ESP32 connection and try again.'
           )}
-          onReviewLater={() => setHardwareEventOpen(false)}
+          onReviewLater={() => {
+            if (import.meta.env.DEV &&
+                window.sessionStorage.getItem('dentalHardwareTiming') === '1') {
+              console.debug('[hardware event UI]', {
+                operation: 'REVIEW_LATER', expectedEventId: pendingHardwareEvent.eventId,
+                expectedMode: pendingHardwareEvent.mode, deviceRequest: false
+              })
+            }
+            setHardwareEventOpen(false)
+          }}
           onCommitted={handleHardwareTransactionCommitted}
           onCompleted={handleHardwareTransactionCompleted}
         />
@@ -671,6 +823,8 @@ function ApplicationShell({ session, onLogout }: { session: AuthSession; onLogou
 
 export function App() {
   const [session, setSession] = useState<AuthSession | null>(null)
+  const [setupRequired, setSetupRequired] = useState<boolean | null>(null)
+  const [setupComplete, setSetupComplete] = useState(false)
 
   useEffect(() => {
     const preventFileNavigation = (event: DragEvent): void => {
@@ -690,13 +844,18 @@ export function App() {
   useEffect(() => {
     let active = true
 
-    window.desktopApi.auth
-      .getSession()
-      .then((currentSession) => {
-        if (active) setSession(currentSession)
+    Promise.all([window.desktopApi.auth.getSession(), window.desktopApi.auth.needsSetup()])
+      .then(([currentSession, needsSetup]) => {
+        if (active) {
+          setSession(currentSession)
+          setSetupRequired(needsSetup)
+        }
       })
       .catch(() => {
-        if (active) setSession(EMPTY_SESSION)
+        if (active) {
+          setSession(EMPTY_SESSION)
+          setSetupRequired(false)
+        }
       })
 
     return () => {
@@ -704,7 +863,7 @@ export function App() {
     }
   }, [])
 
-  if (session === null) {
+  if (session === null || setupRequired === null) {
     return (
       <main className="startup-screen" aria-live="polite">
         <div className="startup-spinner" aria-hidden="true" />
@@ -714,7 +873,15 @@ export function App() {
   }
 
   if (!session.authenticated) {
-    return <LoginScreen onAuthenticated={setSession} />
+    return <LoginScreen
+      setupRequired={setupRequired}
+      setupComplete={setupComplete}
+      onSetupComplete={() => {
+        setSetupRequired(false)
+        setSetupComplete(true)
+      }}
+      onAuthenticated={setSession}
+    />
   }
 
   return <ApplicationShell session={session} onLogout={() => setSession(EMPTY_SESSION)} />

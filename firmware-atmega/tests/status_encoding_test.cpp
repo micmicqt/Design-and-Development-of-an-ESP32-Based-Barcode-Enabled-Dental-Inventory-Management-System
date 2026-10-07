@@ -17,7 +17,7 @@ int main() {
     assert(smallPortBits(small[i]) == smallBits[i]);
   }
 
-  const BigStatus big[] = {BigStatus::OFF, BigStatus::YELLOW, BigStatus::GREEN};
+  const BigStatus big[] = {BigStatus::OFF, BigStatus::RED, BigStatus::GREEN};
   const bool bigA[] = {false, true, true};
   const bool bigB[] = {false, false, true};
   const uint8_t bigBits[] = {0x00U, 0x01U, 0x03U};

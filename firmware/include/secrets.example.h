@@ -7,4 +7,5 @@
 
 #define WIFI_SSID "replace-with-local-wifi-ssid"
 #define WIFI_PASSWORD "replace-with-local-wifi-password"
+#define DENTAL_AP_PASSWORD "replace-with-local-hotspot-password"
 #define DENTAL_DEVICE_TOKEN "replace-with-a-random-shared-device-token"

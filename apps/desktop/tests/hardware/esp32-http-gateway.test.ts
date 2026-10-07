@@ -79,6 +79,21 @@ function cacheResponse(
   }
 }
 
+function cacheProcessing(operation: 'begin' | 'item' | 'commit', jobId: number) {
+  return {
+    processing: true,
+    jobId,
+    operation,
+    generation: cacheGeneration,
+    stage: 'RUNNING',
+    elapsedMs: 50,
+    storageOwner: 'CACHE',
+    lastFatFsOperation: 'NONE',
+    lastFatFsResult: 0,
+    failureReason: 'NONE'
+  }
+}
+
 describe('ESP32 HTTP hardware gateway', () => {
   afterEach(() => vi.useRealTimers())
 
@@ -125,6 +140,77 @@ describe('ESP32 HTTP hardware gateway', () => {
       'http://esp32.local/status',
       expect.objectContaining({ method: 'GET' })
     )
+  })
+
+  it('does not serialize a RAM event read behind a slow status response', async () => {
+    let completeStatus!: (response: HardwareHttpResponse) => void
+    const fetcher = vi.fn<HardwareFetch>().mockImplementation(async (url) => {
+      if (url.endsWith('/status')) {
+        return new Promise<HardwareHttpResponse>((resolve) => { completeStatus = resolve })
+      }
+      return jsonResponse({}, 204)
+    })
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+
+    const pendingStatus = gateway.getStatus()
+    await expect(gateway.getNextTransactionEvent()).resolves.toBeNull()
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    completeStatus(jsonResponse({
+      device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: true, sd: true
+    }))
+    await expect(pendingStatus).resolves.toMatchObject({ rtc: true, sd: true })
+  })
+
+  it('validates and exposes bounded asynchronous offline ACK status', async () => {
+    const eventId = offlinePendingEvent.eventId
+    const base = {
+      device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: true,
+      sd: true, pendingSyncItems: 1, offlineReady: true
+    }
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse({ ...base,
+        offlineAckState: 'RUNNING', offlineAckEventId: eventId }))
+      .mockResolvedValueOnce(jsonResponse({ ...base,
+        offlineAckState: 'SUCCEEDED', offlineAckEventId: eventId,
+        pendingSyncItems: 0 }))
+      .mockResolvedValueOnce(jsonResponse({ ...base,
+        offlineAckState: 'RUNNING', offlineAckEventId: 'bad-id' }))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+    await expect(gateway.getStatus()).resolves.toMatchObject({
+      offlineAckState: 'RUNNING', offlineAckEventId: eventId
+    })
+    await expect(gateway.getStatus()).resolves.toMatchObject({
+      offlineAckState: 'SUCCEEDED', offlineAckEventId: eventId,
+      pendingSyncItems: 0
+    })
+    await expect(gateway.getStatus()).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+  })
+
+  it.each([
+    { offlineJournalState: 'empty', offlineJournalReason: 'none', pendingSyncItems: 0, offlineReady: true },
+    { offlineJournalState: 'ready', offlineJournalReason: 'none', pendingSyncItems: 2, offlineReady: true },
+    { offlineJournalState: 'temporarily_unavailable', offlineJournalReason: 'remote_sector_read_failed' },
+    { offlineJournalState: 'recovering', offlineJournalReason: 'remote_sector_read_failed' },
+    { offlineJournalState: 'corrupt', offlineJournalReason: 'crc_mismatch' }
+  ])('preserves trustworthy journal health without inventing a count: $offlineJournalState', async (health) => {
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local',
+      fetcher: vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse({
+        device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: true, sd: true, ...health
+      })) })
+    await expect(gateway.getStatus()).resolves.toMatchObject(health)
+  })
+
+  it.each([
+    { offlineJournalState: 'guess', offlineJournalReason: 'none' },
+    { offlineJournalState: 'empty', offlineJournalReason: 'none', pendingSyncItems: 1, offlineReady: true },
+    { offlineJournalState: 'recovering', offlineJournalReason: 'none', pendingSyncItems: 0, offlineReady: false },
+    { offlineJournalState: 'corrupt', offlineJournalReason: 'arbitrary' }
+  ])('rejects inconsistent or unknown journal health', async (health) => {
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local',
+      fetcher: vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse({
+        device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: true, sd: true, ...health
+      })) })
+    await expect(gateway.getStatus()).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
   })
 
   it('distinguishes RTC ready, needs-sync, and unavailable status from legacy rtc compatibility', async () => {
@@ -520,6 +606,101 @@ describe('ESP32 HTTP hardware gateway', () => {
     }
   })
 
+  it('monitors asynchronous cache work without resending an in-progress POST', async () => {
+    vi.useFakeTimers()
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse(cacheProcessing('begin', 41), 202))
+      .mockResolvedValueOnce(jsonResponse(cacheProcessing('begin', 41), 202))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('begin', 0)))
+      .mockResolvedValueOnce(jsonResponse(cacheProcessing('commit', 42), 202))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('commit', 0)))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+    const install = gateway.installOfflineInventoryCache({
+      generation: cacheGeneration, products: []
+    })
+    const assertion = expect(install).resolves.toMatchObject({ itemCount: 0 })
+    await vi.advanceTimersByTimeAsync(3_000)
+    await assertion
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      'http://esp32.local/offline/cache',
+      'http://esp32.local/offline/cache/progress?jobId=41',
+      'http://esp32.local/offline/cache/progress?jobId=41',
+      'http://esp32.local/offline/cache',
+      'http://esp32.local/offline/cache/progress?jobId=42'
+    ])
+    expect(fetcher.mock.calls.filter(([, options]) => options.method === 'POST')).toHaveLength(2)
+  })
+
+  it('retries an identical cache POST if its enqueue response is lost', async () => {
+    vi.useFakeTimers()
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockRejectedValueOnce(new Error('lost response'))
+      .mockResolvedValueOnce(jsonResponse(cacheProcessing('begin', 51), 202))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('begin', 0)))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('commit', 0)))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+    const install = gateway.installOfflineInventoryCache({
+      generation: cacheGeneration, products: []
+    })
+    const assertion = expect(install).resolves.toMatchObject({ itemCount: 0 })
+    await vi.advanceTimersByTimeAsync(2_250)
+    await assertion
+    expect(fetcher.mock.calls[0]?.[1].body).toBe(fetcher.mock.calls[1]?.[1].body)
+    expect(fetcher.mock.calls[2]?.[0]).toContain('/offline/cache/progress?jobId=51')
+  })
+
+  it('rejects malformed asynchronous cache progress', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValueOnce(
+      jsonResponse({ ...cacheProcessing('begin', 2), extra: true }, 202)
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+    await expect(gateway.installOfflineInventoryCache({
+      generation: cacheGeneration, products: []
+    })).rejects.toMatchObject({ code: 'INVALID_RESPONSE' })
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it('surfaces a failed cache job without restarting the publication', async () => {
+    vi.useFakeTimers()
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse(cacheProcessing('begin', 71), 202))
+      .mockResolvedValueOnce(jsonResponse({ accepted: false,
+        error: 'cache_write_failed' }, 500))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://esp32.local', fetcher })
+    const install = gateway.installOfflineInventoryCache({
+      generation: cacheGeneration, products: []
+    })
+    const assertion = expect(install).rejects.toMatchObject({
+      code: 'UNAVAILABLE', httpStatus: 500
+    })
+    await vi.advanceTimersByTimeAsync(750)
+    await assertion
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(fetcher.mock.calls[1]?.[0]).toContain('/offline/cache/progress?jobId=71')
+  })
+
+  it('allows an SD-backed cache operation beyond the lightweight HTTP timeout', async () => {
+    vi.useFakeTimers()
+    const fetcher = vi.fn<HardwareFetch>()
+      .mockResolvedValueOnce(jsonResponse(cacheProcessing('begin', 61), 202))
+      .mockResolvedValueOnce(jsonResponse(cacheProcessing('begin', 61), 202))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('begin', 0)))
+      .mockResolvedValueOnce(jsonResponse(cacheResponse('commit', 0)))
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://esp32.local',
+      requestTimeoutMs: 2_500,
+      fetcher
+    })
+
+    const install = gateway.installOfflineInventoryCache({
+      generation: cacheGeneration,
+      products: []
+    })
+    await vi.advanceTimersByTimeAsync(4_200)
+    await expect(install).resolves.toMatchObject({ itemCount: 0 })
+    expect(fetcher).toHaveBeenCalledTimes(4)
+  })
+
   it('rejects a non-current begin response that claims a trusted staged prefix', async () => {
     const fetcher = vi.fn<HardwareFetch>().mockResolvedValueOnce(
       jsonResponse(cacheResponse('begin', 1))
@@ -823,6 +1004,50 @@ describe('ESP32 HTTP hardware gateway', () => {
     expect(response.json).not.toHaveBeenCalled()
   })
 
+  it('preserves a CHECKOUT preview without acknowledging the pending journal', async () => {
+    const checkout = {
+      ...offlinePendingEvent,
+      timestamp: '2026-09-23 02:50:56',
+      barcode: '9556006060346',
+      action: 'CHECKOUT',
+      delta: -1
+    } as const
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(jsonResponse(checkout))
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.getNextOfflineEvent()).resolves.toEqual(checkout)
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(fetcher.mock.calls[0]?.[1].method).toBe('GET')
+  })
+
+  it('allows a multi-sector offline preview beyond the lightweight HTTP timeout', async () => {
+    vi.useFakeTimers()
+    const fetcher = vi.fn<HardwareFetch>().mockImplementation(
+      (_url, options) =>
+        new Promise((resolve, reject) => {
+          const completion = setTimeout(() => resolve(jsonResponse(offlinePendingEvent)), 4_200)
+          options.signal.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(completion)
+              reject(new Error('aborted'))
+            },
+            { once: true }
+          )
+        })
+    )
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://192.0.2.10',
+      requestTimeoutMs: 2_500,
+      fetcher
+    })
+
+    const preview = gateway.getNextOfflineEvent()
+    await vi.advanceTimersByTimeAsync(4_200)
+    await expect(preview).resolves.toEqual(offlinePendingEvent)
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
   it.each([
     null,
     [],
@@ -910,14 +1135,13 @@ describe('ESP32 HTTP hardware gateway', () => {
     )
     const gateway = new Esp32HttpGateway({
       baseUrl: 'http://192.0.2.10',
-      requestTimeoutMs: 25,
       fetcher
     })
     const expectation = expect(gateway.getNextOfflineEvent()).rejects.toMatchObject({
       code: 'UNAVAILABLE'
     })
 
-    await vi.advanceTimersByTimeAsync(25)
+    await vi.advanceTimersByTimeAsync(15_000)
     await expectation
     expect(fetcher).toHaveBeenCalledOnce()
   })
@@ -959,7 +1183,7 @@ describe('ESP32 HTTP hardware gateway', () => {
     const fetcher = vi.fn<HardwareFetch>().mockImplementation(
       (_url, options) =>
         new Promise((resolve, reject) => {
-          const completion = setTimeout(() => resolve(jsonResponse(acknowledgement)), 3_000)
+          const completion = setTimeout(() => resolve(jsonResponse(acknowledgement)), 18_000)
           options.signal.addEventListener(
             'abort',
             () => {
@@ -977,9 +1201,58 @@ describe('ESP32 HTTP hardware gateway', () => {
     })
 
     const acknowledgementRequest = gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId)
-    await vi.advanceTimersByTimeAsync(3_000)
+    await vi.advanceTimersByTimeAsync(18_000)
 
     await expect(acknowledgementRequest).resolves.toEqual(acknowledgement)
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it('bounds an ambiguous offline ACK at 30 seconds without implicitly sending it again', async () => {
+    vi.useFakeTimers()
+    const fetcher = vi.fn<HardwareFetch>().mockImplementation((_url, options) =>
+      new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+      })
+    )
+    const gateway = new Esp32HttpGateway({
+      baseUrl: 'http://192.0.2.10',
+      requestTimeoutMs: 2_500,
+      fetcher
+    })
+    const expectation = expect(gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId))
+      .rejects.toMatchObject({ code: 'UNAVAILABLE', diagnosticCode: 'REQUEST_TIMEOUT' })
+
+    await vi.advanceTimersByTimeAsync(2_500)
+    expect(fetcher).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(27_500)
+    await expectation
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it('treats HTTP 202 as in progress, never as a durable offline ACK', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+      jsonResponse({
+        acknowledged: false,
+        processing: true,
+        eventId: offlinePendingEvent.eventId
+      }, 202)
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.acknowledgeOfflineEvent(offlinePendingEvent.eventId))
+      .rejects.toMatchObject({ code: 'UNAVAILABLE', diagnosticCode: 'ACK_IN_PROGRESS' })
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it('classifies a fast head-read busy response without mistaking it for lost network', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+      jsonResponse({ error: 'offline_ack_in_progress' }, 409)
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.getNextOfflineEvent()).rejects.toMatchObject({
+      code: 'UNAVAILABLE', diagnosticCode: 'offline_ack_in_progress'
+    })
     expect(fetcher).toHaveBeenCalledOnce()
   })
 
@@ -1225,6 +1498,21 @@ describe('ESP32 HTTP hardware gateway', () => {
     )
   })
 
+  it('marks an unknown-barcode rejection for LCD feedback without changing the ACK identity', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+      jsonResponse({ acknowledged: true, eventId: transactionEvent.eventId })
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await gateway.acknowledgeTransactionEvent(transactionEvent.eventId, 'unknown_barcode')
+    expect(fetcher).toHaveBeenCalledWith(
+      'http://192.0.2.10/events/ack',
+      expect.objectContaining({
+        body: JSON.stringify({ eventId: transactionEvent.eventId, reason: 'unknown_barcode' })
+      })
+    )
+  })
+
   it.each(['', ' event', 'event id', '../event', 'A'.repeat(64)])(
     'rejects invalid outgoing ACK IDs before HTTP: %s',
     async (eventId) => {
@@ -1264,7 +1552,19 @@ describe('ESP32 HTTP hardware gateway', () => {
     await expect(gateway.acknowledgeTransactionEvent(transactionEvent.eventId)).rejects.toMatchObject({
       code: 'REJECTED'
     })
-    expect(response.json).not.toHaveBeenCalled()
+    expect(response.json).toHaveBeenCalledOnce()
+  })
+
+  it('preserves only an allowlisted online ACK failure category and HTTP status', async () => {
+    const fetcher = vi.fn<HardwareFetch>().mockResolvedValue(
+      jsonResponse({ error: 'offline_ack_in_progress', secret: 'must-not-leak' }, 409)
+    )
+    const gateway = new Esp32HttpGateway({ baseUrl: 'http://192.0.2.10', fetcher })
+
+    await expect(gateway.acknowledgeTransactionEvent(transactionEvent.eventId))
+      .rejects.toMatchObject({
+        code: 'REJECTED', diagnosticCode: 'offline_ack_in_progress', httpStatus: 409
+      })
   })
 
   it.each([201, 202, 206])('rejects HTTP %s as an unexpected event success status', async (status) => {

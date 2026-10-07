@@ -2,10 +2,9 @@
 
 #include <stdint.h>
 
-// IMPORTANT: These constants record nets visible in the final PCB schematic.
-// They are not approval to initialize, read, or drive any of the pins. Several
-// electrical and semantic mappings remain unresolved; see
-// docs/hardware-validation.md before enabling hardware in a later phase.
+// Active controller-link ownership is GPIO16/17. LCD, RTC, scanner, buttons,
+// and MicroSD are ATmega-owned; retained legacy ESP32 net constants below are
+// not permission to re-enable their peripheral drivers.
 namespace dental {
 namespace hardware {
 
@@ -15,12 +14,10 @@ static constexpr bool kEsp32RtcEnabled = false;
 static_assert(!kEsp32LcdEnabled, "LCD is ATmega-owned");
 static_assert(!kEsp32RtcEnabled, "RTC is ATmega-owned");
 
-// Verified Phase 3 breadboard MicroSD SPI nets. The tested module is powered
-// from 5 V and provides its own regulation/logic buffering.
-static constexpr uint8_t kMicroSdChipSelectGpio = 5;
-static constexpr uint8_t kMicroSdClockGpio = 18;
-static constexpr uint8_t kMicroSdMosiGpio = 23;
-static constexpr uint8_t kMicroSdMisoGpio = 19;
+// MicroSD SPI is ATmega-owned on D10-D13. ESP32 accesses only the bounded
+// controller-link storage protocol and must never drive the legacy SPI nets.
+static constexpr bool kEsp32MicroSdEnabled = false;
+static_assert(!kEsp32MicroSdEnabled, "MicroSD is ATmega-owned");
 
 // Switch nets only. SW1/SW2 meanings, safe voltage, active level, pulls, and
 // boot-time behavior are unconfirmed. Do not configure these as inputs yet.
@@ -42,15 +39,15 @@ static constexpr uint8_t kThreeIndicatorControlBGpio = 27;
 static constexpr uint8_t kScannerSchematicU0TxdNetGpio = 1;
 static constexpr uint8_t kScannerSchematicU0RxdNetGpio = 3;
 
-// GM65 migration pending: no ESP32 scanner UART/GPIO assignment is active.
-// Legacy GPIO16/17 ownership is removed; these belong to the ATmega link only.
+// GM65 is on ATmega A0/A1; no ESP32 scanner UART/GPIO assignment is active.
+// GPIO16/17 belong to the ATmega link only.
 static constexpr bool kScannerUartEnabled = false;
 
 // Physical buttons now belong to ATmega PD2/PD3, not ESP32 GPIO13/14.
 static constexpr bool kLegacyTransactionButtonsEnabled = false;
 
 // FINAL UART1 ownership: RX GPIO16 / TX GPIO17, through the level interface.
-// GPIO34/25 are no longer used for this link; GM65 migration is pending.
+// GPIO34/25 are no longer used for this link.
 // Build overrides must pass the conflict guard below; BOTH -1 disable the link.
 #ifndef DENTAL_ATMEGA_LINK_RX_GPIO
 #define DENTAL_ATMEGA_LINK_RX_GPIO 16
@@ -69,9 +66,7 @@ constexpr bool isControllerLinkGpio(int pin) {
 constexpr bool isExistingPeripheralGpio(int pin) {
   return pin == 0 || pin == 1 || pin == 3 || (pin >= 6 && pin <= 11) ||
       pin == 12 || pin == 13 || pin == 14 ||
-      pin == kMicroSdChipSelectGpio ||
-      pin == kMicroSdClockGpio || pin == kMicroSdMosiGpio ||
-      pin == kMicroSdMisoGpio || pin == kTwoIndicatorControlAGpio ||
+      pin == kTwoIndicatorControlAGpio ||
       pin == kTwoIndicatorControlBGpio || pin == kThreeIndicatorControlAGpio ||
       pin == kThreeIndicatorControlBGpio;
 }

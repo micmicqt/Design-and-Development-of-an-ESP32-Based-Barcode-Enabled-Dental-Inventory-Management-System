@@ -58,7 +58,7 @@ class ScannerTransport {
     if (!prefix) return ScanOutcome::kRejected;
     if (active_) { ++dropped_; return ScanOutcome::kRejected; }
     frame_ = frame;
-    prefixLength_ = static_cast<uint8_t>(strlen(prefix));
+    prefixLength_ = static_cast<uint8_t>(dental_link::text::length(prefix));
     const size_t length = strlen(capture_.barcode());
     memcpy(barcode_, capture_.barcode(), length + 1U);
     length_ = static_cast<uint8_t>(length);
@@ -69,6 +69,10 @@ class ScannerTransport {
     return ScanOutcome::kBarcode;
   }
   void rejectPartialScan() { capture_.rejectPartialInput(); }
+  void cancelPending() {
+    active_ = false;
+    capture_.rejectPartialInput();
+  }
   template <typename Transmitter>
   void service(uint32_t now, PingClient& ping, Transmitter& tx) {
     capture_.service(now);
@@ -86,7 +90,8 @@ class ScannerTransport {
     }
     // Leading LF resynchronizes after any earlier incomplete PING/frame.
     const uint8_t byte = position_ == 0U ? '\n' : position_ <= prefixLength_ ?
-        static_cast<uint8_t>(dental_link::barcodePrefix(frame_)[position_ - 1U]) :
+        static_cast<uint8_t>(dental_link::text::at(
+            dental_link::barcodePrefix(frame_), position_ - 1U)) :
         position_ <= prefixLength_ + length_ ?
         static_cast<uint8_t>(barcode_[position_ - prefixLength_ - 1U]) : '\n';
     if (tx.tryWrite(byte) && ++position_ == length_ + prefixLength_ + 2U) active_ = false;

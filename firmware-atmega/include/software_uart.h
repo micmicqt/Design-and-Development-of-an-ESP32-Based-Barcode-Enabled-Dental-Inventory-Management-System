@@ -7,8 +7,7 @@ namespace software_uart {
 
 constexpr uint8_t kRxPortBit = 6U;  // Controller RX: PD6 / Uno D6.
 constexpr uint8_t kTxPortBit = 7U;  // Controller TX: PD7 / Uno D7.
-constexpr uint8_t kScannerRxPortBit = 0U;  // Scanner RX: PC0 / Uno A0.
-constexpr uint8_t kScannerTxPortBit = 1U;  // Scanner TX: PC1 / Uno A1.
+// Reuse the Step 2 Timer1/PCINT2 software-UART timing for the controller link.
 constexpr uint16_t kBitTicks = 208U;  // Timer1: 16 MHz / 8 / 9600, rounded.
 constexpr uint16_t kHalfBitTicks = 104U;
 
@@ -123,6 +122,10 @@ class Ring {
     return true;
   }
   void clear() { tail_ = head_; }
+  uint8_t size() const {
+    return static_cast<uint8_t>((head_ - tail_) & (Capacity - 1U));
+  }
+  static constexpr uint8_t usableCapacity() { return Capacity - 1U; }
  private:
   T entries_[Capacity] = {};
   volatile uint8_t head_ = 0U;

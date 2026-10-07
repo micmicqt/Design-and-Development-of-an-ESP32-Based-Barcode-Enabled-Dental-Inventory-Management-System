@@ -3,7 +3,6 @@
 #include "../../firmware-common/include/controller_link_protocol.h"
 #include "../../firmware-common/include/rtc_link_protocol.h"
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 namespace dental_atmega {
@@ -52,11 +51,10 @@ class RtcLink {
     } else if (reply_ == RtcReply::kTime) {
       if (rtc.readSequence() != sequence_) {
         if (rtc.lastReadSucceeded()) {
-          char timestamp[20];
-          if (dental_link::rtc::formatDateTime(rtc.time(), timestamp,
-                                               sizeof(timestamp))) {
-            queuePayload(dental_link::kRtcTimePrefix, timestamp);
-          } else queueState(dental_link::kRtcStatusPrefix, rtc.state(), rtc.reason());
+          // The reply slot is idle and exclusively owned by this main-loop
+          // client. Format directly into it; no temporary timestamp escapes.
+          if (!queueTime(rtc.time()))
+            queueState(dental_link::kRtcStatusPrefix, rtc.state(), rtc.reason());
         } else queueState(dental_link::kRtcStatusPrefix, rtc.state(), rtc.reason());
         reply_ = RtcReply::kNone;
       } else if (rtc.idle()) {
@@ -82,24 +80,47 @@ class RtcLink {
   bool pending() const { return reply_ != RtcReply::kNone || transmitting(); }
 
  private:
-  void queuePayload(const char* prefix, const char* payload) {
-    if (txLength_ != 0U) return;
-    const int written = snprintf(tx_, sizeof(tx_), "%s%s\n", prefix, payload);
-    if (written > 0 && written < static_cast<int>(sizeof(tx_))) {
-      txLength_ = static_cast<uint8_t>(written); txPosition_ = 0U;
-    }
+  bool queueTime(const dental_link::rtc::DateTime& time) {
+    if (txLength_ != 0U) return false;
+    constexpr uint8_t prefixLength = sizeof(dental_link::kRtcTimePrefix) - 1U;
+    if (!dental_link::rtc::formatDateTime(
+            time, tx_ + prefixLength, sizeof(tx_) - prefixLength)) return false;
+    dental_link::text::copy(tx_, dental_link::kRtcTimePrefix, prefixLength);
+    tx_[prefixLength + 19U] = '\n'; tx_[prefixLength + 20U] = '\0';
+    txLength_ = prefixLength + 20U; txPosition_ = 0U;
+    return true;
   }
   void queueState(const char* prefix, dental_link::rtc::State state,
                   dental_link::rtc::Reason reason) {
-    char value[40];
-    const int written = snprintf(value, sizeof(value), "%s:%s",
-        dental_link::rtc::stateName(state), dental_link::rtc::reasonName(reason));
-    if (written > 0 && written < static_cast<int>(sizeof(value)))
-      queuePayload(prefix, value);
+    queueParts(prefix, dental_link::rtc::stateName(state),
+               dental_link::rtc::reasonName(reason));
+  }
+  void queueParts(const char* prefix, const char* first, const char* second) {
+    if (txLength_ != 0U || !prefix || !first) return;
+    const size_t prefixLength = dental_link::text::length(prefix);
+    const size_t firstLength = dental_link::text::length(first);
+    const size_t secondLength = second ? dental_link::text::length(second) : 0U;
+    const size_t total = prefixLength + firstLength +
+        (second ? 1U + secondLength : 0U) + 1U;
+    if (total >= sizeof(tx_)) return;
+    size_t position = 0U;
+    dental_link::text::copy(tx_ + position, prefix, prefixLength); position += prefixLength;
+    dental_link::text::copy(tx_ + position, first, firstLength); position += firstLength;
+    if (second) {
+      tx_[position++] = ':';
+      dental_link::text::copy(tx_ + position, second, secondLength); position += secondLength;
+    }
+    tx_[position++] = '\n';
+    tx_[position] = '\0';
+    txLength_ = static_cast<uint8_t>(position); txPosition_ = 0U;
   }
 
-  dental_link::LineParser parser_;
-  char tx_[64] = {};
+  // RTC requests/sync are shorter than barcode frames. A smaller parser
+  // leaves stack headroom on the ATmega's 2 KB SRAM during SD initialization.
+  dental_link::BasicLineParser<30U> parser_;
+  // Longest state reply is RTC_STATUS:unavailable:communication_failure\n
+  // (45 bytes plus NUL); 48 avoids an unused 16-byte reserve in SRAM.
+  char tx_[48] = {};
   uint16_t sequence_ = 0U;
   uint8_t txLength_ = 0U;
   uint8_t txPosition_ = 0U;

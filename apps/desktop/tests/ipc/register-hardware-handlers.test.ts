@@ -11,6 +11,7 @@ import type {
 } from '../../src/main/hardware/hardware-gateway'
 import {
   Esp32HttpGateway,
+  HardwareGatewayError,
   type HardwareFetch,
   type HardwareHttpResponse
 } from '../../src/main/hardware/esp32-http-gateway'
@@ -22,6 +23,7 @@ import {
 } from '../../src/main/hardware/rtc-recovery-coordinator'
 import {
   createHardwareTransactionCoordinator,
+  HardwareTransactionCoordinatorError,
   type HardwareTransactionCoordinator
 } from '../../src/main/hardware/hardware-transaction-coordinator'
 import {
@@ -131,7 +133,8 @@ describe('authenticated hardware IPC boundary', () => {
     transactionCoordinator: HardwareTransactionCoordinator = createTransactionCoordinator(),
     offlineInventoryCacheCoordinator: OfflineInventoryCacheCoordinator | null = null,
     offlineSyncCoordinator: OfflineSyncCoordinator | null = null,
-    rtcRecoveryCoordinator: RtcRecoveryCoordinator | null = null
+    rtcRecoveryCoordinator: RtcRecoveryCoordinator | null = null,
+    unconfigured = false
   ) {
     const authSession = createAuthSessionController()
     const mainFrame = {}
@@ -152,7 +155,8 @@ describe('authenticated hardware IPC boundary', () => {
       getMainWindow: () => mainWindow,
       offlineInventoryCacheCoordinator,
       offlineSyncCoordinator,
-      rtcRecoveryCoordinator
+      rtcRecoveryCoordinator,
+      unconfigured
     })
     const handler = electronMock.handlers.get(IPC_CHANNELS.hardwareGetStatus)
     if (handler === undefined) throw new Error('Hardware status handler was not registered.')
@@ -340,6 +344,40 @@ describe('authenticated hardware IPC boundary', () => {
     dispose()
   })
 
+  it('forwards only the bounded ACK state through authenticated status IPC', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getStatus).mockResolvedValueOnce({
+      device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: true,
+      sd: true, pendingSyncItems: 1, offlineReady: true,
+      offlineAckState: 'RUNNING',
+      offlineAckEventId: offlinePendingEvent.eventId
+    })
+    const { authSession, trustedEvent, handler, dispose } = setup(gateway)
+    authSession.signIn('admin')
+    await expect(handler(trustedEvent)).resolves.toMatchObject({
+      connection: 'CONNECTED', offlineAckState: 'RUNNING',
+      offlineAckEventId: offlinePendingEvent.eventId
+    })
+    dispose()
+  })
+
+  it('forwards explicit journal health without inventing pending counts after transport loss', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getStatus).mockResolvedValueOnce({
+      device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: true,
+      sd: false, offlineJournalState: 'temporarily_unavailable',
+      offlineJournalReason: 'remote_sector_read_failed'
+    })
+    const { authSession, trustedEvent, handler, dispose } = setup(gateway)
+    authSession.signIn('admin')
+    const status = await handler(trustedEvent)
+    expect(status).toMatchObject({ connection: 'CONNECTED', sd: false,
+      offlineJournalState: 'temporarily_unavailable',
+      offlineJournalReason: 'remote_sector_read_failed' })
+    expect(status).not.toHaveProperty('pendingSyncItems')
+    dispose()
+  })
+
   it('returns a clean offline state for unavailable hardware', async () => {
     const gateway = createGateway()
     vi.mocked(gateway.getStatus).mockRejectedValue(new Error('connection refused'))
@@ -354,6 +392,97 @@ describe('authenticated hardware IPC boundary', () => {
       sd: null
     })
     dispose()
+  })
+
+  it('reports not configured when no device address exists', async () => {
+    const { authSession, trustedEvent, handler, dispose } = setup(
+      null, createInventoryService(), createTransactionCoordinator(),
+      null, null, null, true
+    )
+    authSession.signIn('admin')
+    await expect(handler(trustedEvent)).resolves.toMatchObject({
+      connection: 'NOT_CONFIGURED', device: null, rtc: null, sd: null
+    })
+    dispose()
+  })
+
+  it('distinguishes one unconfirmed status poll from a sustained disconnect', async () => {
+    const gateway = createGateway()
+    const { authSession, trustedEvent, handler, next } = setup(gateway)
+    authSession.signIn('admin')
+    await expect(handler(trustedEvent)).resolves.toMatchObject({ connection: 'CONNECTED' })
+
+    vi.mocked(gateway.getStatus).mockRejectedValue(new Error('status request timed out'))
+    await expect(handler(trustedEvent)).resolves.toEqual<HardwareStatusDto>({
+      connection: 'CHECKING', device: 'dental-inventory-esp32', mode: 'restock',
+      rtc: true, sd: true
+    })
+    // The RAM event endpoint is independent of a failed status refresh and
+    // stale offline-sync metadata is never carried into a retry decision.
+    await expect(next(trustedEvent)).resolves.toEqual(hardwareEvent)
+    await expect(handler(trustedEvent)).resolves.toEqual<HardwareStatusDto>({
+      connection: 'OFFLINE', device: 'dental-inventory-esp32', mode: 'restock',
+      rtc: true, sd: true
+    })
+    vi.mocked(gateway.getStatus).mockResolvedValueOnce({
+      device: 'dental-inventory-esp32', online: true, mode: 'idle', rtc: false, sd: false,
+      rtcState: 'unavailable', rtcReason: 'communication_failure', offlineReady: false,
+      pendingSyncItems: 0
+    })
+    await expect(handler(trustedEvent)).resolves.toMatchObject({
+      connection: 'CONNECTED', rtc: false, sd: false, offlineReady: false
+    })
+    await expect(next(trustedEvent)).resolves.toEqual(hardwareEvent)
+  })
+  it('does not let an older status failure erase a newer authoritative count', async () => {
+    const gateway = createGateway()
+    let rejectOlder!: (reason: Error) => void
+    vi.mocked(gateway.getStatus).mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectOlder = reject
+    })).mockResolvedValueOnce({ device: 'dental-inventory-esp32', online: true,
+      mode: 'idle', rtc: true, sd: true, pendingSyncItems: 2, offlineReady: true,
+      offlineJournalState: 'ready', offlineJournalReason: 'none' })
+    const { authSession, trustedEvent, handler } = setup(gateway)
+    authSession.signIn('admin')
+    const old = handler(trustedEvent)
+    await expect(handler(trustedEvent)).resolves.toMatchObject({ connection: 'CONNECTED', pendingSyncItems: 2 })
+    rejectOlder(new Error('older timeout'))
+    await expect(old).resolves.toMatchObject({ connection: 'CONNECTED', pendingSyncItems: 2 })
+  })
+
+  it('continues RAM event retrieval when fresh offline storage readiness is false', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getStatus).mockResolvedValue({
+      device: 'dental-inventory-esp32', online: true, mode: 'idle',
+      rtc: true, sd: false, offlineReady: false, pendingSyncItems: 0
+    })
+    const { authSession, trustedEvent, handler, next } = setup(gateway)
+    authSession.signIn('admin')
+    await expect(handler(trustedEvent)).resolves.toMatchObject({
+      connection: 'CONNECTED', sd: false, offlineReady: false
+    })
+    await expect(next(trustedEvent)).resolves.toEqual(hardwareEvent)
+    expect(gateway.getNextTransactionEvent).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['timeout', new HardwareGatewayError('UNAVAILABLE', 'Timed out.', 'REQUEST_TIMEOUT')],
+    ['network failure', new HardwareGatewayError('UNAVAILABLE', 'Connection failed.', 'NETWORK_FAILURE')],
+    ['malformed status', new HardwareGatewayError('INVALID_RESPONSE', 'Malformed status.')],
+    ['HTTP error', new HardwareGatewayError('UNAVAILABLE', 'HTTP failed.', undefined, 503)]
+  ])('treats one %s as unconfirmed transport, not failed components', async (_name, error) => {
+    const gateway = createGateway()
+    const { authSession, trustedEvent, handler, next } = setup(gateway)
+    authSession.signIn('admin')
+    await expect(handler(trustedEvent)).resolves.toMatchObject({
+      connection: 'CONNECTED', rtc: true, sd: true
+    })
+    vi.mocked(gateway.getStatus).mockRejectedValueOnce(error)
+    await expect(handler(trustedEvent)).resolves.toEqual<HardwareStatusDto>({
+      connection: 'CHECKING', device: 'dental-inventory-esp32',
+      mode: 'restock', rtc: true, sd: true
+    })
+    await expect(next(trustedEvent)).resolves.toEqual(hardwareEvent)
   })
 
   it('omits offline journal metadata when older firmware does not report it', async () => {
@@ -735,7 +864,7 @@ describe('authenticated hardware IPC boundary', () => {
       ok: false,
       error: {
         code: 'INTERNAL_ERROR',
-        message: 'Unable to synchronize offline transactions. Check the ESP32 and retry.'
+        message: 'Unable to synchronize offline transactions. No completion was assumed; retry is safe.'
       }
     })
     await expect(synchronizeOffline(trustedEvent)).resolves.toEqual({
@@ -922,7 +1051,7 @@ describe('authenticated hardware IPC boundary', () => {
       ok: false,
       error: {
         code: 'INTERNAL_ERROR',
-        message: 'Unable to read pending offline transactions. Check the ESP32 and retry.'
+        message: 'The offline operation could not be confirmed. It is safe to retry.'
       }
     })
     await expect(offlineNext(trustedEvent)).resolves.toEqual({
@@ -1040,7 +1169,10 @@ describe('authenticated hardware IPC boundary', () => {
     expect(inventoryService.findProductByBarcode).toHaveBeenCalledExactlyOnceWith(
       hardwareEvent.barcode
     )
-    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(hardwareEvent.eventId)
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(
+      hardwareEvent.eventId,
+      'unknown_barcode'
+    )
   })
 
   it('acknowledges an explicitly cancelled registered event before any commit', async () => {
@@ -1304,7 +1436,8 @@ describe('authenticated hardware IPC boundary', () => {
       eventId: 'evt-other'
     })
     vi.mocked(gateway.acknowledgeTransactionEvent).mockRejectedValueOnce(
-      new Error('The old event ID is not in the recent-ACK receipt.')
+      new HardwareGatewayError('REJECTED', 'Old event ID was not acknowledged.',
+        'event_id_mismatch', 409)
     )
     const { authSession, trustedEvent, acknowledge } = setup(gateway)
     authSession.signIn('admin')
@@ -1320,6 +1453,71 @@ describe('authenticated hardware IPC boundary', () => {
       hardwareEvent.eventId
     )
     expect(gateway.getNextTransactionEvent).toHaveBeenCalledExactlyOnceWith()
+  })
+
+  it('does not misreport an ACK transport timeout as a different event', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextTransactionEvent).mockResolvedValueOnce({
+      ...hardwareEvent, eventId: 'evt-other'
+    })
+    vi.mocked(gateway.acknowledgeTransactionEvent).mockRejectedValueOnce(
+      new HardwareGatewayError('UNAVAILABLE', 'private URL', 'REQUEST_TIMEOUT')
+    )
+    const { authSession, trustedEvent, acknowledge } = setup(gateway)
+    authSession.signIn('admin')
+
+    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
+      ok: false,
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: 'The ESP32 acknowledgement timed out. The scan remains recoverable; please retry or choose Review later.'
+      }
+    })
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(
+      hardwareEvent.eventId
+    )
+  })
+
+  it('retries a transient cancellation preflight read without ACKing a different head', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.getNextTransactionEvent)
+      .mockRejectedValueOnce(new HardwareGatewayError(
+        'UNAVAILABLE', 'response delayed', 'REQUEST_TIMEOUT'
+      ))
+      .mockResolvedValueOnce(hardwareEvent)
+    const { authSession, trustedEvent, acknowledge } = setup(gateway)
+    authSession.signIn('admin')
+
+    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
+      ok: true, value: { eventId: hardwareEvent.eventId }
+    })
+    expect(gateway.getNextTransactionEvent).toHaveBeenCalledTimes(2)
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(
+      hardwareEvent.eventId, 'unknown_barcode'
+    )
+  })
+
+  it('retries only the exact event ID after an ambiguous cancellation timeout', async () => {
+    const gateway = createGateway()
+    vi.mocked(gateway.acknowledgeTransactionEvent)
+      .mockRejectedValueOnce(new HardwareGatewayError(
+        'UNAVAILABLE', 'response lost', 'REQUEST_TIMEOUT'
+      ))
+      .mockResolvedValueOnce(undefined)
+    const { authSession, trustedEvent, acknowledge } = setup(gateway)
+    authSession.signIn('admin')
+
+    await expect(acknowledge(trustedEvent, hardwareEvent.eventId)).resolves.toEqual({
+      ok: true, value: { eventId: hardwareEvent.eventId }
+    })
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledTimes(2)
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenNthCalledWith(
+      1, hardwareEvent.eventId, 'unknown_barcode'
+    )
+    expect(gateway.acknowledgeTransactionEvent).toHaveBeenNthCalledWith(
+      2, hardwareEvent.eventId, 'unknown_barcode'
+    )
+    expect(gateway.getNextTransactionEvent).toHaveBeenCalledOnce()
   })
 
   it('treats an already-empty uncommitted queue as idempotent cancellation success', async () => {
@@ -1376,7 +1574,8 @@ describe('authenticated hardware IPC boundary', () => {
       value: { eventId: hardwareEvent.eventId }
     })
     expect(gateway.acknowledgeTransactionEvent).toHaveBeenCalledExactlyOnceWith(
-      hardwareEvent.eventId
+      hardwareEvent.eventId,
+      'unknown_barcode'
     )
     expect(gateway.getNextTransactionEvent).toHaveBeenCalledTimes(2)
   })
@@ -1432,7 +1631,9 @@ describe('authenticated hardware IPC boundary', () => {
       ok: true,
       value: { receipt: transactionReceipt, acknowledged: true }
     })
-    expect(coordinator.getTransactionReceipt).toHaveBeenCalledExactlyOnceWith(hardwareEvent.eventId)
+    expect(coordinator.getTransactionReceipt).toHaveBeenCalledTimes(2)
+    expect(coordinator.getTransactionReceipt).toHaveBeenNthCalledWith(1, hardwareEvent.eventId)
+    expect(coordinator.getTransactionReceipt).toHaveBeenNthCalledWith(2, hardwareEvent.eventId)
     expect(coordinator.processTransaction).toHaveBeenCalledExactlyOnceWith({
       eventId: hardwareEvent.eventId,
       quantity: 2
@@ -1471,7 +1672,7 @@ describe('authenticated hardware IPC boundary', () => {
       ok: true,
       value: { receipt: transactionReceipt, acknowledged: true }
     })
-    expect(cacheCoordinator.refresh).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(cacheCoordinator.refresh).toHaveBeenCalledOnce())
   })
 
   it('keeps a committed hardware outcome successful when pending records defer cache refresh', async () => {
@@ -1494,10 +1695,24 @@ describe('authenticated hardware IPC boundary', () => {
       ok: true,
       value: { receipt: transactionReceipt, acknowledged: true }
     })
-    expect(cacheCoordinator.refresh).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(cacheCoordinator.refresh).toHaveBeenCalledOnce())
   })
 
-  it('refreshes after successful result and acknowledgement recovery', async () => {
+  it('returns committed success without waiting for a slow post-commit cache transfer', async () => {
+    const cacheCoordinator = createOfflineInventoryCacheCoordinator()
+    vi.mocked(cacheCoordinator.refresh).mockReturnValue(new Promise(() => undefined))
+    const { authSession, trustedEvent, process } = setup(
+      createGateway(), createInventoryService(), createTransactionCoordinator(), cacheCoordinator
+    )
+    authSession.signIn('admin')
+
+    await expect(process(trustedEvent, {
+      eventId: hardwareEvent.eventId, quantity: 2
+    })).resolves.toMatchObject({ ok: true, value: { acknowledged: true } })
+    await vi.waitFor(() => expect(cacheCoordinator.refresh).toHaveBeenCalledOnce())
+  })
+
+  it('reuses pending cache maintenance instead of forcing duplicate refreshes on result and ACK retry', async () => {
     const cacheCoordinator = createOfflineInventoryCacheCoordinator()
     const coordinator = createTransactionCoordinator()
     const { authSession, trustedEvent, retryResult, retryAck } = setup(
@@ -1514,7 +1729,8 @@ describe('authenticated hardware IPC boundary', () => {
     const resultRecoveryOrder = vi.mocked(
       coordinator.retryTransactionResultDelivery
     ).mock.invocationCallOrder[0]
-    const resultRefreshOrder = vi.mocked(cacheCoordinator.refresh).mock.invocationCallOrder[0]
+    await vi.waitFor(() => expect(cacheCoordinator.refreshIfNeeded).toHaveBeenCalledOnce())
+    const resultRefreshOrder = vi.mocked(cacheCoordinator.refreshIfNeeded).mock.invocationCallOrder[0]
     expect(resultRecoveryOrder).toBeLessThan(resultRefreshOrder as number)
 
     await expect(retryAck(trustedEvent, hardwareEvent.eventId)).resolves.toMatchObject({
@@ -1523,9 +1739,10 @@ describe('authenticated hardware IPC boundary', () => {
     const ackRecoveryOrder = vi.mocked(
       coordinator.retryTransactionAcknowledgement
     ).mock.invocationCallOrder[0]
-    const ackRefreshOrder = vi.mocked(cacheCoordinator.refresh).mock.invocationCallOrder[1]
+    await vi.waitFor(() => expect(cacheCoordinator.refreshIfNeeded).toHaveBeenCalledTimes(2))
+    const ackRefreshOrder = vi.mocked(cacheCoordinator.refreshIfNeeded).mock.invocationCallOrder[1]
     expect(ackRecoveryOrder).toBeLessThan(ackRefreshOrder as number)
-    expect(cacheCoordinator.refresh).toHaveBeenCalledTimes(2)
+    expect(cacheCoordinator.refresh).not.toHaveBeenCalled()
   })
 
   it('does not refresh after unauthorized, invalid, or failed hardware processing', async () => {
@@ -1553,6 +1770,38 @@ describe('authenticated hardware IPC boundary', () => {
       quantity: 2
     })).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } })
 
+    expect(cacheCoordinator.refresh).not.toHaveBeenCalled()
+  })
+
+  it('reports a pre-commit ESP32 verification failure without exposing transport details', async () => {
+    const coordinator = createTransactionCoordinator()
+    vi.mocked(coordinator.processTransaction).mockRejectedValueOnce(
+      new HardwareTransactionCoordinatorError('HARDWARE_UNAVAILABLE', 'private LAN URL')
+    )
+    const { authSession, trustedEvent, process } = setup(
+      createGateway(), createInventoryService(), coordinator
+    )
+    authSession.signIn('admin')
+    await expect(process(trustedEvent, {
+      eventId: hardwareEvent.eventId, quantity: 2
+    })).resolves.toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining('Inventory was not updated') }
+    })
+  })
+
+  it('does not force another cache transfer for a previously committed event ID', async () => {
+    const coordinator = createTransactionCoordinator()
+    vi.mocked(coordinator.getTransactionReceipt).mockReturnValue(transactionReceipt)
+    const cacheCoordinator = createOfflineInventoryCacheCoordinator()
+    const { authSession, trustedEvent, process } = setup(
+      createGateway(), createInventoryService(), coordinator, cacheCoordinator
+    )
+    authSession.signIn('admin')
+    await expect(process(trustedEvent, {
+      eventId: hardwareEvent.eventId, quantity: 2
+    })).resolves.toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(cacheCoordinator.refreshIfNeeded).toHaveBeenCalledOnce())
     expect(cacheCoordinator.refresh).not.toHaveBeenCalled()
   })
 

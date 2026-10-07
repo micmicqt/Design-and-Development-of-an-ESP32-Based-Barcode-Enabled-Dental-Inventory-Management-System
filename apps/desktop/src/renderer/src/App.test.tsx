@@ -4,10 +4,12 @@ import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   DesktopApi,
+  DiscoveredInventoryDevice,
   HardwareStatusDto,
   HardwareTransactionEvent,
   HardwareTransactionReceipt,
   InventoryCategory,
+  IpcResult,
   MovementHistoryDto,
   OfflinePendingEvent,
   ProductDto,
@@ -45,12 +47,16 @@ function installDesktopApi(api: DesktopApi): void {
 
 function createDesktopApi({
   authenticated = true,
+  setupRequired = false,
   inventory = {},
-  hardware = {}
+  hardware = {},
+  deviceSetup = {}
 }: {
   authenticated?: boolean
+  setupRequired?: boolean
   inventory?: Partial<DesktopApi['inventory']>
   hardware?: Partial<DesktopApi['hardware']>
+  deviceSetup?: Partial<DesktopApi['deviceSetup']>
 } = {}): DesktopApi {
   return {
     auth: {
@@ -59,6 +65,8 @@ function createDesktopApi({
           ? { authenticated: true, username: 'admin' }
           : { authenticated: false, username: null }
       ),
+      needsSetup: vi.fn().mockResolvedValue(setupRequired),
+      createFirstAdmin: vi.fn().mockResolvedValue({ ok: false, code: 'UNAVAILABLE' }),
       login: vi.fn().mockResolvedValue({
         ok: false,
         message: 'Access Denied',
@@ -88,6 +96,24 @@ function createDesktopApi({
       }),
       listMovementHistory: vi.fn().mockResolvedValue({ ok: true, value: [] }),
       ...inventory
+    },
+    deviceSetup: {
+      getConfiguration: vi.fn().mockResolvedValue({ ok: true, value: {
+        address: null, tokenConfigured: false, source: 'none'
+      } }),
+      testConnection: vi.fn().mockResolvedValue({ ok: true, value: { status: 'CONNECTED' } }),
+      saveConfiguration: vi.fn().mockResolvedValue({ ok: true, value: {
+        address: 'http://device', tokenConfigured: true, source: 'saved'
+      } }),
+      listSerialPorts: vi.fn().mockResolvedValue({ ok: true, value: [] }),
+      identifyUsbDevice: vi.fn().mockResolvedValue({ ok: false, error: {
+        code: 'DEVICE_DISCOVERY_FAILED', message: 'Not configured for this test.'
+      } }),
+      scanBluetooth: vi.fn().mockResolvedValue({ ok: false, error: {
+        code: 'DEVICE_DISCOVERY_FAILED', message: 'Not configured for this test.'
+      } }),
+      selectBluetoothDevice: vi.fn().mockResolvedValue(undefined),
+      ...deviceSetup
     },
     hardware: {
       sendDesktopHeartbeat: vi.fn().mockResolvedValue(true),
@@ -143,6 +169,131 @@ function createDesktopApi({
   }
 }
 
+describe('clinic device setup', () => {
+  it('uses a USB-discovered Wi-Fi IP only after an explicit click and never auto-saves', async () => {
+    const user = userEvent.setup()
+    const saveConfiguration = vi.fn()
+    installDesktopApi(createDesktopApi({ deviceSetup: {
+      listSerialPorts: vi.fn().mockResolvedValue({ ok: true, value: [{
+        path: 'COM5', manufacturer: 'USB Bridge', product: 'USB Serial Device'
+      }] }),
+      identifyUsbDevice: vi.fn().mockResolvedValue({ ok: true, value: {
+        deviceId: 'ATD-1234ABCD', name: 'Any Time Dental Inventory Device',
+        firmware: '0.1.0', wifiConnected: true, ipAddress: '192.168.1.105'
+      } }),
+      saveConfiguration
+    } }))
+    render(<App />)
+    await user.click(await screen.findByRole('button', { name: 'Device Setup' }))
+    await user.click(screen.getByRole('button', { name: 'Refresh Ports' }))
+    await user.click(await screen.findByRole('button', { name: 'Identify Device' }))
+    expect(await screen.findByText('IP Address: 192.168.1.105')).toBeVisible()
+    expect(screen.getByLabelText('Device Address')).toHaveValue('')
+    expect(saveConfiguration).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Use This Address' }))
+    expect(screen.getByLabelText('Device Address')).toHaveValue('http://192.168.1.105')
+    expect(saveConfiguration).not.toHaveBeenCalled()
+  })
+
+  it('does not offer an invented address for a discovered device without Wi-Fi', async () => {
+    const user = userEvent.setup()
+    installDesktopApi(createDesktopApi({ deviceSetup: {
+      listSerialPorts: vi.fn().mockResolvedValue({ ok: true, value: [{
+        path: 'COM5', manufacturer: null, product: null
+      }] }),
+      identifyUsbDevice: vi.fn().mockResolvedValue({ ok: true, value: {
+        deviceId: 'ATD-1234ABCD', name: 'Any Time Dental Inventory Device',
+        firmware: '0.1.0', wifiConnected: false, ipAddress: null
+      } })
+    } }))
+    render(<App />)
+    await user.click(await screen.findByRole('button', { name: 'Device Setup' }))
+    await user.click(screen.getByRole('button', { name: 'Refresh Ports' }))
+    await user.click(await screen.findByRole('button', { name: 'Identify Device' }))
+    expect(await screen.findByText('The device is not currently connected to Wi-Fi.')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Use This Address' })).not.toBeInTheDocument()
+  })
+
+  it('lets an operator choose among multiple BLE candidates before filling the address', async () => {
+    const user = userEvent.setup()
+    let finishScan: ((result: IpcResult<DiscoveredInventoryDevice>) => void) | null = null
+    const scanBluetooth = vi.fn((onCandidates: (items: { id: string; name: string }[]) => void) => {
+      onCandidates([
+        { id: 'first', name: 'AnyTimeDental-Inventory' },
+        { id: 'second', name: 'AnyTimeDental-Inventory 2' }
+      ])
+      return new Promise<IpcResult<DiscoveredInventoryDevice>>((resolve) => { finishScan = resolve })
+    })
+    const selectBluetoothDevice = vi.fn().mockImplementation(async (id: string) => {
+      if (id === 'second') finishScan?.({ ok: true, value: {
+        deviceId: 'ATD-1234ABCD', name: 'Any Time Dental Inventory Device',
+        firmware: '0.1.0', wifiConnected: true, ipAddress: '192.168.1.105'
+      } })
+    })
+    installDesktopApi(createDesktopApi({ deviceSetup: { scanBluetooth, selectBluetoothDevice } }))
+    render(<App />)
+    await user.click(await screen.findByRole('button', { name: 'Device Setup' }))
+    await user.click(screen.getByRole('button', { name: 'Scan for Inventory Device' }))
+    await user.click(await screen.findByRole('button', { name: 'AnyTimeDental-Inventory 2' }))
+    expect(selectBluetoothDevice).toHaveBeenCalledWith('second')
+    expect(await screen.findByText('IP Address: 192.168.1.105')).toBeVisible()
+    expect(screen.getByLabelText('Device Address')).toHaveValue('')
+  })
+  it('explains when no device is configured and opens the setup form', async () => {
+    const user = userEvent.setup()
+    installDesktopApi(createDesktopApi({ hardware: { getStatus: vi.fn().mockResolvedValue({
+      connection: 'NOT_CONFIGURED', device: null, mode: null, rtc: null, sd: null
+    }) } }))
+    render(<App />)
+    expect(await screen.findByText('Not configured')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Set Up Device' }))
+    expect(screen.getByRole('dialog', { name: 'Device Setup' })).toBeVisible()
+    expect(screen.getByLabelText('Device Address')).toHaveAttribute('placeholder', 'http://192.168.1.105')
+    expect(screen.getByLabelText('Device Token')).toHaveAttribute('type', 'password')
+  })
+
+  it('tests the unsaved entered address and saves without exposing the token again', async () => {
+    const user = userEvent.setup()
+    const testConnection = vi.fn().mockResolvedValue({ ok: true, value: { status: 'CONNECTED' } })
+    const saveConfiguration = vi.fn().mockResolvedValue({ ok: true, value: {
+      address: 'http://192.168.1.106', tokenConfigured: true, source: 'saved'
+    } })
+    installDesktopApi(createDesktopApi({ deviceSetup: { testConnection, saveConfiguration } }))
+    render(<App />)
+    await user.click(await screen.findByRole('button', { name: 'Device Setup' }))
+    await user.type(screen.getByLabelText('Device Address'), 'http://192.168.1.106')
+    await user.type(screen.getByLabelText('Device Token'), 'a-token-with-more-than-thirty-two-characters')
+    await user.click(screen.getByRole('button', { name: 'Test Connection' }))
+    expect(testConnection).toHaveBeenCalledWith('http://192.168.1.106')
+    expect(await screen.findByText(/This test does not validate the token/)).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(saveConfiguration).toHaveBeenCalledWith(
+      'http://192.168.1.106', 'a-token-with-more-than-thirty-two-characters'
+    ))
+    expect(screen.queryByRole('dialog', { name: 'Device Setup' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Device Setup' }))
+    expect(screen.getByLabelText('Device Token')).toHaveValue('')
+  })
+
+  it('keeps a saved token masked and lets the operator replace it', async () => {
+    const user = userEvent.setup()
+    installDesktopApi(createDesktopApi({ deviceSetup: {
+      getConfiguration: vi.fn().mockResolvedValue({ ok: true, value: {
+        address: 'http://device', tokenConfigured: true, source: 'saved'
+      } })
+    } }))
+    render(<App />)
+    await user.click(await screen.findByRole('button', { name: 'Device Setup' }))
+    expect(await screen.findByDisplayValue('http://device')).toBeVisible()
+    const input = screen.getByLabelText('Device Token')
+    expect(input).toHaveAttribute('type', 'password')
+    expect(input).toHaveValue('')
+    expect(input).toHaveAttribute('placeholder', 'Token configured — leave blank to keep it')
+    await user.click(screen.getByRole('button', { name: 'Show device token' }))
+    expect(input).toHaveAttribute('type', 'text')
+  })
+})
+
 describe('Phase 6 Step 1 desktop presence heartbeat', () => {
   async function settle(): Promise<void> {
     await act(async () => {
@@ -160,6 +311,33 @@ describe('Phase 6 Step 1 desktop presence heartbeat', () => {
 
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
+
+  it('restarts one heartbeat and status poll after saving a new device address', async () => {
+    const sendDesktopHeartbeat = vi.fn().mockResolvedValue(true)
+    const getStatus = vi.fn().mockResolvedValue({
+      connection: 'OFFLINE', device: null, mode: null, rtc: null, sd: null
+    })
+    installDesktopApi(createDesktopApi({ hardware: { sendDesktopHeartbeat, getStatus } }))
+    const view = render(<App />)
+    await settle()
+    expect(sendDesktopHeartbeat).toHaveBeenCalledTimes(1)
+    expect(getStatus).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Device Setup' }))
+    await settle()
+    fireEvent.change(screen.getByLabelText('Device Address'), { target: { value: 'http://new-device' } })
+    fireEvent.change(screen.getByLabelText('Device Token'), {
+      target: { value: 'a-token-with-more-than-thirty-two-characters' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await settle()
+    expect(sendDesktopHeartbeat).toHaveBeenCalledTimes(2)
+    expect(getStatus).toHaveBeenCalledTimes(2)
+    await advance(4_000)
+    expect(sendDesktopHeartbeat).toHaveBeenCalledTimes(3)
+    expect(getStatus).toHaveBeenCalledTimes(3)
+    view.unmount()
+  })
 
   it('sends immediately and approximately every four seconds while the authenticated shell is active', async () => {
     const sendDesktopHeartbeat = vi.fn().mockResolvedValue(true)
@@ -365,7 +543,7 @@ describe('Phase 4 hardware transaction event delivery', () => {
     }
   )
 
-  it('polls empty results once per second and cancels its timer on unmount', async () => {
+  it('polls empty RAM event results every 250 ms and cancels its timer on unmount', async () => {
     const getNextTransactionEvent = vi.fn().mockResolvedValue(null)
     installDesktopApi(createDesktopApi({ hardware: { getNextTransactionEvent } }))
     const view = render(<App />)
@@ -373,13 +551,40 @@ describe('Phase 4 hardware transaction event delivery', () => {
     expect(getNextTransactionEvent).toHaveBeenCalledOnce()
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
 
-    await advance(999)
+    await advance(249)
     expect(getNextTransactionEvent).toHaveBeenCalledOnce()
     await advance(1)
     expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
     view.unmount()
     await advance(5_000)
     expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
+  })
+
+  it('mounts the identified scan before local receipt and product lookup settle', async () => {
+    let resolveReceipt!: (result: { ok: true; value: null }) => void
+    const getTransactionReceipt = vi.fn().mockReturnValue(
+      new Promise((resolve) => { resolveReceipt = resolve })
+    )
+    const findProductByBarcode = vi.fn().mockResolvedValue({
+      ok: true, value: product({ barcode: restockEvent.barcode })
+    })
+    const getNextTransactionEvent = vi.fn().mockResolvedValue(restockEvent)
+    installDesktopApi(createDesktopApi({
+      hardware: { getNextTransactionEvent, getTransactionReceipt },
+      inventory: { findProductByBarcode }
+    }))
+
+    render(<App />)
+    await settle()
+    const dialog = screen.getByRole('dialog', { name: 'RESTOCK TRANSACTION' })
+    expect(within(dialog).getByText(restockEvent.barcode)).toBeVisible()
+    expect(within(dialog).getByText('Checking transaction state…')).toBeVisible()
+    expect(findProductByBarcode).not.toHaveBeenCalled()
+    expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+
+    await act(async () => resolveReceipt({ ok: true, value: null }))
+    expect(findProductByBarcode).toHaveBeenCalledExactlyOnceWith(restockEvent.barcode)
+    expect(within(dialog).getByText('Composite Resin')).toBeVisible()
   })
 
   it('shares an in-flight poll during StrictMode replay and never overlaps slow requests', async () => {
@@ -417,10 +622,10 @@ describe('Phase 4 hardware transaction event delivery', () => {
     await settle()
     expect(screen.getByRole('heading', { name: 'Movement History' })).toBeVisible()
 
-    await advance(1_000)
+    await advance(250)
     expect(getNextTransactionEvent).toHaveBeenCalledTimes(2)
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-    await advance(1_000)
+    await advance(250)
     expect(getNextTransactionEvent).toHaveBeenCalledTimes(3)
     expect(screen.getByRole('dialog', { name: 'RESTOCK TRANSACTION' })).toBeVisible()
   })
@@ -1385,6 +1590,17 @@ describe('Phase 5 Step 2 hardware inventory transaction', () => {
 })
 
 describe('Phase 2 desktop application', () => {
+  const statusTestEvent: HardwareTransactionEvent = {
+    eventId: 'device-status-0001', mode: 'restock',
+    barcode: '0001234500123', timestamp: '2026-09-04 12:34:56'
+  }
+
+  async function settle(): Promise<void> {
+    await act(async () => {
+      for (let turn = 0; turn < 8; turn += 1) await Promise.resolve()
+    })
+  }
+
   beforeEach(() => {
     installDesktopApi(createDesktopApi({ authenticated: false }))
   })
@@ -1496,6 +1712,45 @@ describe('Phase 2 desktop application', () => {
       .querySelector('[data-icon="eye-off"]')).toBeInTheDocument()
   })
 
+  it('shows first-run setup only for a database without an administrator', async () => {
+    const user = userEvent.setup()
+    const api = createDesktopApi({ authenticated: false, setupRequired: true })
+    const createFirstAdmin = vi.fn().mockResolvedValue({ ok: true })
+    api.auth.createFirstAdmin = createFirstAdmin
+    installDesktopApi(api)
+    render(<App />)
+
+    expect(await screen.findByRole('button', { name: 'Create Administrator' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Sign In' })).not.toBeInTheDocument()
+    await user.type(screen.getByLabelText('Username'), 'clinic-admin')
+    await user.type(screen.getByLabelText('Password'), 'new secure password')
+    await user.type(screen.getByLabelText('Confirm password'), 'different password')
+    await user.click(screen.getByRole('button', { name: 'Create Administrator' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Passwords do not match')
+    expect(createFirstAdmin).not.toHaveBeenCalled()
+
+    await user.clear(screen.getByLabelText('Confirm password'))
+    await user.type(screen.getByLabelText('Confirm password'), 'new secure password')
+    await user.click(screen.getByRole('button', { name: 'Create Administrator' }))
+    expect(await screen.findByRole('button', { name: 'Sign In' })).toBeVisible()
+    expect(screen.queryByLabelText('Confirm password')).not.toBeInTheDocument()
+    expect(createFirstAdmin).toHaveBeenCalledExactlyOnceWith({
+      username: 'clinic-admin',
+      password: 'new secure password'
+    })
+    expect(api.auth.login).not.toHaveBeenCalled()
+  })
+
+  it('does not offer administrator setup when one is already configured', async () => {
+    const api = createDesktopApi({ authenticated: false, setupRequired: false })
+    installDesktopApi(api)
+    render(<App />)
+
+    expect(await screen.findByRole('button', { name: 'Sign In' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Create Administrator' })).not.toBeInTheDocument()
+    expect(api.auth.createFirstAdmin).not.toHaveBeenCalled()
+  })
+
   it('opens the shell, changes sections, and logs out', async () => {
     const user = userEvent.setup()
     const login = vi.fn().mockResolvedValue({
@@ -1541,7 +1796,7 @@ describe('Phase 2 desktop application', () => {
     expect(logout).toHaveBeenCalledOnce()
   })
 
-  it('shows connected ESP32, mode, RTC, and MicroSD status in the shell', async () => {
+  it('shows clinic-friendly connected device, mode, clock, and storage status', async () => {
     installDesktopApi(
       createDesktopApi({
         hardware: {
@@ -1557,11 +1812,32 @@ describe('Phase 2 desktop application', () => {
     )
 
     render(<App />)
-    const status = await screen.findByRole('status', { name: 'ESP32 hardware status' })
+    const status = await screen.findByRole('status', { name: 'Inventory device status' })
 
     expect(await within(status).findByText('Connected')).toBeVisible()
+    expect(within(status).getByText('Inventory Device')).toBeVisible()
+    expect(within(status).getByText('Operating Mode')).toBeVisible()
+    expect(within(status).getByText('System Clock')).toBeVisible()
+    expect(within(status).getByText('Local Storage')).toBeVisible()
     expect(within(status).getByText('Restock')).toBeVisible()
     expect(within(status).getAllByText('Available')).toHaveLength(2)
+    expect(within(status).queryByText('ESP32')).not.toBeInTheDocument()
+  })
+
+  it('shows unconfirmed hardware as checking without claiming clock or storage availability', async () => {
+    installDesktopApi(
+      createDesktopApi({
+        hardware: {
+          getStatus: vi.fn().mockResolvedValue({
+            connection: 'CHECKING', device: null, mode: null, rtc: null, sd: null
+          })
+        }
+      })
+    )
+    render(<App />)
+    const status = await screen.findByRole('status', { name: 'Inventory device status' })
+    expect(await within(status).findAllByText('Checking…')).toHaveLength(4)
+    expect(within(status).queryByText('Offline')).not.toBeInTheDocument()
   })
 
   it('surfaces an RTC that needs synchronization without exposing a clock control', async () => {
@@ -1582,7 +1858,7 @@ describe('Phase 2 desktop application', () => {
     )
 
     render(<App />)
-    const status = await screen.findByRole('status', { name: 'ESP32 hardware status' })
+    const status = await screen.findByRole('status', { name: 'Inventory device status' })
     expect(await within(status).findByText('Needs synchronization')).toBeVisible()
     expect(screen.queryByRole('button', { name: /sync rtc|set time/i })).not.toBeInTheDocument()
   })
@@ -1597,11 +1873,96 @@ describe('Phase 2 desktop application', () => {
     )
 
     render(<App />)
-    const status = await screen.findByRole('status', { name: 'ESP32 hardware status' })
+    const status = await screen.findByRole('status', { name: 'Inventory device status' })
 
-    expect(await within(status).findByText('Offline')).toBeVisible()
-    expect(within(status).getAllByText('Unavailable')).toHaveLength(3)
+    expect(await within(status).findByText('Disconnected')).toBeVisible()
+    expect(within(status).getByText('Unavailable')).toBeVisible()
+    expect(within(status).getAllByText('Status unavailable')).toHaveLength(2)
     expect(screen.getByRole('heading', { name: 'Item Inventory' })).toBeVisible()
+  })
+
+  it('marks a transient IPC status failure stale without hiding a RAM event', async () => {
+    vi.useFakeTimers()
+    const getStatus = vi.fn()
+      .mockResolvedValueOnce({
+        connection: 'CONNECTED', device: 'dental-inventory-esp32',
+        mode: 'idle', rtc: true, sd: false
+      })
+      .mockRejectedValueOnce(new Error('temporary IPC failure'))
+      .mockResolvedValue({
+        connection: 'CONNECTED', device: 'dental-inventory-esp32',
+        mode: 'idle', rtc: false, sd: false
+      })
+    const getNextTransactionEvent = vi.fn().mockResolvedValue(null)
+    installDesktopApi(createDesktopApi({
+      hardware: { getStatus, getNextTransactionEvent }
+    }))
+
+    try {
+      render(<App />)
+      await settle()
+      const status = screen.getByRole('status', { name: 'Inventory device status' })
+      expect(within(status).getByText('Connected')).toBeVisible()
+
+      await act(async () => vi.advanceTimersByTimeAsync(4_000))
+      expect(within(status).getByText('Last known: Available')).toBeVisible()
+      expect(within(status).getByText('Status unavailable')).toBeVisible()
+      expect(within(status).queryByText('Unavailable')).not.toBeInTheDocument()
+
+      getNextTransactionEvent.mockResolvedValue(statusTestEvent)
+      await act(async () => vi.advanceTimersByTimeAsync(250))
+      expect(screen.getByRole('dialog', { name: 'RESTOCK TRANSACTION' })).toBeVisible()
+
+      await act(async () => vi.advanceTimersByTimeAsync(3_750))
+      expect(within(status).getAllByText('Unavailable')).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retrieves a RAM event while a status request is still pending', async () => {
+    let resolveStatus!: (value: HardwareStatusDto) => void
+    const getStatus = vi.fn().mockReturnValue(new Promise<HardwareStatusDto>((resolve) => {
+      resolveStatus = resolve
+    }))
+    const getNextTransactionEvent = vi.fn().mockResolvedValue(statusTestEvent)
+    installDesktopApi(createDesktopApi({
+      hardware: { getStatus, getNextTransactionEvent }
+    }))
+
+    const view = render(<App />)
+    await settle()
+    expect(getStatus).toHaveBeenCalledOnce()
+    expect(getNextTransactionEvent).toHaveBeenCalledOnce()
+    expect(screen.getByRole('dialog', { name: 'RESTOCK TRANSACTION' })).toBeVisible()
+    view.unmount()
+    resolveStatus({ connection: 'CONNECTED', device: 'dental-inventory-esp32',
+      mode: 'idle', rtc: true, sd: true })
+  })
+
+  it('enters Offline after repeated IPC transport failures without claiming component failure', async () => {
+    vi.useFakeTimers()
+    const getStatus = vi.fn()
+      .mockResolvedValueOnce({
+        connection: 'CONNECTED', device: 'dental-inventory-esp32',
+        mode: 'idle', rtc: true, sd: true
+      })
+      .mockRejectedValue(new Error('IPC unavailable'))
+    installDesktopApi(createDesktopApi({ hardware: { getStatus } }))
+
+    try {
+      render(<App />)
+      await settle()
+      const status = screen.getByRole('status', { name: 'Inventory device status' })
+      await act(async () => vi.advanceTimersByTimeAsync(4_000))
+      expect(within(status).getAllByText('Checking…')).toHaveLength(2)
+      await act(async () => vi.advanceTimersByTimeAsync(4_000))
+      expect(within(status).getByText('Disconnected')).toBeVisible()
+      expect(within(status).getAllByText('Last known: Available')).toHaveLength(2)
+      expect(within(status).getByText('Unavailable')).toBeVisible()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('polls every four seconds without continuing after the shell unmounts', async () => {
@@ -2009,6 +2370,44 @@ describe('Phase 2 desktop application', () => {
     expect(synchronizeOfflineInventory).toHaveBeenCalledExactlyOnceWith()
   })
 
+  it('shows the kiosk journal finishing state rather than a reconnect warning while ACK runs', async () => {
+    let ackRunning = false
+    const event: OfflinePendingEvent = {
+      eventId: 'off-A1B2C3D4E5F6-0000000000000001',
+      timestamp: '2026-09-09 09:08:07', productId: '42', barcode: '000012340005',
+      action: 'RESTOCK', delta: 1, resultingStock: 4, stockStatus: 'LOW',
+      cacheGeneration: `v1-${'a'.repeat(64)}`
+    }
+    let complete!: (value: Awaited<ReturnType<DesktopApi['hardware']['synchronizeOfflineInventory']>>) => void
+    const synchronizeOfflineInventory = vi.fn<DesktopApi['hardware']['synchronizeOfflineInventory']>(
+      () => new Promise((resolve) => { complete = resolve })
+    )
+    installDesktopApi(createDesktopApi({ hardware: {
+      getNextOfflineEvent: vi.fn().mockResolvedValue({ ok: true, value: event }),
+      getStatus: vi.fn().mockImplementation(async () => ({
+        connection: 'CONNECTED', device: 'dental-inventory-esp32', mode: 'idle',
+        rtc: true, sd: true, pendingSyncItems: 1,
+        offlineAckState: ackRunning ? 'RUNNING' : undefined,
+        offlineAckEventId: ackRunning ? event.eventId : undefined
+      })),
+      synchronizeOfflineInventory
+    } }))
+
+    render(<App />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
+    ackRunning = true
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Synchronize offline transactions'
+    }))
+    expect(await screen.findByText('Finishing device acknowledgement')).toBeVisible()
+    expect(screen.getByText(/inventory change is saved/i)).toBeVisible()
+    expect(screen.queryByText('Reconnect the kiosk and retry.')).not.toBeInTheDocument()
+    await act(async () => complete({ ok: true, value: {
+      status: 'ACKNOWLEDGEMENT_PENDING', eventId: event.eventId,
+      counts: { appliedEvents: 1, alreadyAppliedEvents: 0, acknowledgedEvents: 0 }
+    } }))
+  })
+
   it('reports a retryable pending-preview failure without implying any record changed', async () => {
     const user = userEvent.setup()
     installDesktopApi(
@@ -2028,6 +2427,24 @@ describe('Phase 2 desktop application', () => {
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('Pending transaction preview is unavailable.')
     expect(alert).toHaveTextContent('No pending record is acknowledged by this preview.')
+  })
+
+  it('does not call a running ACK job disconnected when its FIFO preview is unavailable', async () => {
+    installDesktopApi(createDesktopApi({ hardware: {
+      getStatus: vi.fn().mockResolvedValue({
+        connection: 'CONNECTED', device: 'dental-inventory-esp32', mode: 'idle',
+        rtc: true, sd: true, pendingSyncItems: 1, offlineAckState: 'RUNNING',
+        offlineAckEventId: 'off-A1B2C3D4E5F6-0000000000000001'
+      }),
+      getNextOfflineEvent: vi.fn().mockResolvedValue({
+        ok: false, error: { code: 'UNAVAILABLE', message: 'ACK in progress' }
+      })
+    } }))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'SYNC OFFLINE' }))
+    expect(await screen.findByText(/kiosk is finishing device acknowledgement/i)).toBeVisible()
+    expect(screen.queryByText(/Reconnect the kiosk and retry/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Synchronize offline transactions' })).toBeDisabled()
   })
 
   it('renders database products, image fallbacks, and all stock statuses', async () => {
